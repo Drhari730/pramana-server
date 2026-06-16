@@ -78,6 +78,30 @@ function getMailer() {
   });
   return mailer;
 }
+function emailFrame({ pretitle, title, body, ctaLabel, ctaLink, note }) {
+  return `<!doctype html>
+  <html><body style="margin:0;padding:0;background:#f4f7fb;font-family:Segoe UI,Arial,sans-serif;color:#10213a">
+    <div style="max-width:640px;margin:0 auto;padding:28px 16px">
+      <div style="background:#ffffff;border:1px solid #d9e3f1;border-radius:18px;overflow:hidden;box-shadow:0 14px 40px rgba(16,33,58,.08)">
+        <div style="padding:22px 24px;background:linear-gradient(135deg,#0f8b8d,#3657d6);color:#fff">
+          <div style="display:flex;align-items:center;gap:12px">
+            <div style="width:42px;height:42px;border-radius:12px;background:rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:700">P</div>
+            <div>
+              <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;opacity:.82">${pretitle}</div>
+              <div style="font-size:24px;font-weight:800;line-height:1.15;margin-top:2px">${title}</div>
+            </div>
+          </div>
+        </div>
+        <div style="padding:24px">
+          <div style="font-size:15px;line-height:1.65;color:#24384f">${body}</div>
+          ${ctaLink ? `<div style="margin:22px 0 10px"><a href="${ctaLink}" style="display:inline-block;background:#3657d6;color:#fff;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:700">${ctaLabel}</a></div>
+          <div style="font-size:12px;line-height:1.5;color:#60748a;word-break:break-all">${ctaLink}</div>` : ''}
+          ${note ? `<div style="margin-top:18px;font-size:12px;line-height:1.6;color:#60748a">${note}</div>` : ''}
+        </div>
+      </div>
+    </div>
+  </body></html>`;
+}
 async function sendInviteEmail(to, project, link, inviter) {
   const m = getMailer();
   if (!m) return { sent: false, reason: 'email-not-configured' };
@@ -85,9 +109,15 @@ async function sendInviteEmail(to, project, link, inviter) {
     from: process.env.SMTP_FROM || 'Pramana <no-reply@pramana.app>',
     to,
     subject: `${inviter} invited you to a Pramana review: ${project}`,
-    html: `<p>${inviter} has invited you to collaborate on the systematic review <b>${project}</b> in Pramana.</p>
-           <p><a href="${link}" style="background:#4f46e5;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Open the review</a></p>
-           <p>Or paste this link: ${link}</p>`
+    html: emailFrame({
+      pretitle: 'Pramana Evidence Synthesis',
+      title: 'You have been invited',
+      body: `<p>${inviter} has invited you to collaborate on the systematic review <b>${project}</b>.</p>
+             <p>Open the shared workspace below to join the review, screen studies, and work with the same live data.</p>`,
+      ctaLabel: 'Open the review',
+      ctaLink: link,
+      note: 'If the button does not open, paste the link above into your browser.'
+    })
   });
   return { sent: true };
 }
@@ -98,10 +128,35 @@ async function sendResetEmail(to, link) {
     from: process.env.SMTP_FROM || 'Pramana <no-reply@pramana.app>',
     to,
     subject: 'Reset your Pramana password',
-    html: `<p>You asked to reset your Pramana password.</p>
-           <p><a href="${link}" style="background:#4f46e5;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Choose a new password</a></p>
-           <p>Or paste this link: ${link}</p>
-           <p>This link expires in 1 hour. If you didn't request this, you can ignore this email.</p>`
+    html: emailFrame({
+      pretitle: 'Pramana Evidence Synthesis',
+      title: 'Reset your password',
+      body: `<p>You asked to reset your Pramana password.</p>
+             <p>This link will let you choose a new password and expires in 1 hour.</p>`,
+      ctaLabel: 'Choose a new password',
+      ctaLink: link,
+      note: 'If you did not request this, you can ignore this email.'
+    })
+  });
+  return { sent: true };
+}
+async function sendWelcomeEmail(to, name) {
+  const m = getMailer();
+  if (!m) return { sent: false, reason: 'email-not-configured' };
+  await m.sendMail({
+    from: process.env.SMTP_FROM || 'Pramana <no-reply@pramana.app>',
+    to,
+    subject: 'Welcome to Pramana',
+    html: emailFrame({
+      pretitle: 'Pramana Evidence Synthesis',
+      title: 'Your account is ready',
+      body: `<p>Hello ${name || 'there'},</p>
+             <p>Your Pramana account has been created successfully.</p>
+             <p>You can now create reviews, invite collaborators, screen studies, extract data, and run meta-analysis from the same workspace.</p>`,
+      ctaLabel: 'Open Pramana',
+      ctaLink: APP_URL,
+      note: 'This email confirms that account creation was successful.'
+    })
   });
   return { sent: true };
 }
@@ -129,6 +184,7 @@ app.post('/api/auth/register', async (req, res) => {
   await db.q('INSERT INTO users (id,email,name,password_hash) VALUES ($1,$2,$3,$4)', [id, email.toLowerCase(), name || email.split('@')[0], hash]);
   const user = { id, email: email.toLowerCase(), name: name || email.split('@')[0] };
   await autoAcceptInvites(user);
+  try { await sendWelcomeEmail(user.email, user.name); } catch (e) { console.error('Welcome email failed:', e.message); }
   setAuthCookie(res, user);
   res.json({ user });
 });
@@ -189,7 +245,7 @@ app.post('/api/auth/forgot', async (req, res) => {
     const expires = new Date(Date.now() + 60 * 60 * 1000).toISOString();
     await db.q('INSERT INTO password_resets (token,user_id,expires_at) VALUES ($1,$2,$3)', [token, u.id, expires]);
     link = `${APP_URL}/?reset=${token}`;
-    try { await sendResetEmail(email, link); } catch (e) {}
+    try { await sendResetEmail(email, link); } catch (e) { console.error('Reset email failed:', e.message); }
   }
   // If email isn't configured, return the link so it can be shown on screen (testing/no-Brevo case).
   const emailEnabled = !!process.env.SMTP_HOST;
@@ -277,7 +333,15 @@ app.get('/api/projects/:id/members', requireAuth(async (req, res) => {
   if (!(await memberRole(req.params.id, req.user.id))) return res.status(403).json({ error: 'Not a member' });
   const rows = await db.q(
     `SELECT u.id,u.email,u.name,m.role FROM members m JOIN users u ON u.id=m.user_id WHERE m.project_id=$1`, [req.params.id]);
-  const pend = await db.q('SELECT email,role FROM invites WHERE project_id=$1 AND accepted=false', [req.params.id]);
+  const rawPending = await db.q('SELECT email,role FROM invites WHERE project_id=$1 AND accepted=false', [req.params.id]);
+  const seenPending = new Set();
+  const pend = [];
+  for (const invite of rawPending) {
+    const key = `${invite.email}|${invite.role}`;
+    if (seenPending.has(key)) continue;
+    seenPending.add(key);
+    pend.push(invite);
+  }
   res.json({ members: rows, pending: pend });
 }));
 
@@ -286,21 +350,40 @@ app.post('/api/projects/:id/invite', requireAuth(async (req, res) => {
   if (role !== 'owner' && role !== 'editor') return res.status(403).json({ error: 'Only owner/editor can invite' });
   const { email, role: inviteRole } = req.body || {};
   if (!email) return res.status(400).json({ error: 'Email required' });
+  const normalizedEmail = email.toLowerCase();
+  const normalizedRole = inviteRole || 'reviewer';
   const proj = await db.q('SELECT title FROM projects WHERE id=$1', [req.params.id]);
-  // if the user already exists, add directly; also create an invite token for the link/email
-  const token = uid('inv_');
-  await db.q('INSERT INTO invites (token,project_id,email,role,invited_by) VALUES ($1,$2,$3,$4,$5)',
-    [token, req.params.id, email.toLowerCase(), inviteRole || 'reviewer', req.user.id]);
-  const existing = await db.q('SELECT id FROM users WHERE email=$1', [email.toLowerCase()]);
+  const existingPending = await db.q('SELECT token FROM invites WHERE project_id=$1 AND email=$2 AND accepted=false', [req.params.id, normalizedEmail]);
+  let token = existingPending[0] && existingPending[0].token;
+  if (!token) {
+    token = uid('inv_');
+    await db.q('INSERT INTO invites (token,project_id,email,role,invited_by) VALUES ($1,$2,$3,$4,$5)',
+      [token, req.params.id, normalizedEmail, normalizedRole, req.user.id]);
+  }
+  const existing = await db.q('SELECT id FROM users WHERE email=$1', [normalizedEmail]);
   if (existing[0]) {
     await db.q('INSERT INTO members (project_id,user_id,role) VALUES ($1,$2,$3) ON CONFLICT (project_id,user_id) DO NOTHING',
-      [req.params.id, existing[0].id, inviteRole || 'reviewer']);
+      [req.params.id, existing[0].id, normalizedRole]);
     await db.q('UPDATE invites SET accepted=true WHERE token=$1', [token]);
   }
   const link = `${APP_URL}/?invite=${token}`;
   let mail = { sent: false };
-  try { mail = await sendInviteEmail(email, (proj[0]||{}).title || 'review', link, req.user.name || req.user.email); } catch (e) { mail = { sent:false, reason:e.message }; }
-  res.json({ ok: true, link, emailed: mail.sent, alreadyUser: !!existing[0] });
+  if (!existing[0]) {
+    try {
+      mail = await sendInviteEmail(normalizedEmail, (proj[0]||{}).title || 'review', link, req.user.name || req.user.email);
+    } catch (e) {
+      console.error('Invite email failed:', e.message);
+      mail = { sent: false, reason: e.message };
+    }
+  }
+  res.json({
+    ok: true,
+    link,
+    emailed: mail.sent,
+    alreadyUser: !!existing[0],
+    pendingAlreadyExists: !!existingPending[0],
+    emailError: mail.sent ? undefined : mail.reason
+  });
 }));
 
 app.post('/api/invites/accept', requireAuth(async (req, res) => {

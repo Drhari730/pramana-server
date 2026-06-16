@@ -78,6 +78,8 @@ async function mockQuery(text, params=[]) {
   // invites
   if (s==='SELECT token,project_id,role FROM invites WHERE email=$1 AND accepted=false')
     return T.invites.filter(i=>i.email===params[0]&&!i.accepted).map(clone);
+  if (s==='SELECT token FROM invites WHERE project_id=$1 AND email=$2 AND accepted=false')
+    return T.invites.filter(i=>i.project_id===params[0]&&i.email===params[1]&&!i.accepted).map(i=>({token:i.token}));
   if (s.startsWith('INSERT INTO invites')) {
     T.invites.push({token:params[0],project_id:params[1],email:params[2],role:params[3],invited_by:params[4],accepted:false}); return [];
   }
@@ -204,6 +206,16 @@ async function run() {
   const tok2 = r.body.link.split('invite=')[1];
   r = await linkUser('POST','/api/invites/accept',{token:tok2});
   ok('accept invite by token joins project', r.status===200 && r.body.projectId===pid);
+
+  console.log('\n=== INVITE DEDUPE ===');
+  r = await lead('POST','/api/projects/'+pid+'/invite',{email:'repeat@uni.edu',role:'reviewer'});
+  ok('first invite for pending reviewer created', r.status===200 && /invite=/.test(r.body.link));
+  const firstRepeatLink = r.body.link;
+  r = await lead('POST','/api/projects/'+pid+'/invite',{email:'repeat@uni.edu',role:'reviewer'});
+  ok('second invite reuses existing pending invite', r.status===200 && r.body.pendingAlreadyExists===true && r.body.link===firstRepeatLink);
+  r = await lead('GET','/api/projects/'+pid+'/members');
+  const repeatPending = (r.body.pending||[]).filter(p => p.email==='repeat@uni.edu');
+  ok('pending members list stays deduplicated', repeatPending.length===1);
 
   console.log('\n=== PASSWORD RESET ===');
   // forgot for a real user — email not configured in test, so devLink is returned
