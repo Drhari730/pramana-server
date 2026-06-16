@@ -610,7 +610,7 @@ const ASRMA={
 window.ASRMA=ASRMA;
 
 /* ===================== MODAL ===================== */
-function modal(html){document.getElementById('modal').innerHTML=html;document.getElementById('modal-bg').classList.add('on');}
+function modal(html){const m=document.getElementById('modal');m.style.maxWidth='';m.innerHTML=html;document.getElementById('modal-bg').classList.add('on');}
 function closeModal(){document.getElementById('modal-bg').classList.remove('on');}
 document.getElementById('modal-bg').addEventListener('click',e=>{if(e.target.id==='modal-bg')closeModal()});
 
@@ -3629,44 +3629,146 @@ function showAuthScreen(){
   el.innerHTML = renderAuthMarkup(g);
   if(g) initGoogle();
 }
+const PRAMANA_CREDIT='Developed by Dr G. Hari Prakash and Team · Stat Studio India · MDASH Innovations LLP';
+const PRAMANA_CREDIT_SHORT='Dr G. Hari Prakash & Team — Stat Studio India · MDASH Innovations LLP';
+const PRAMANA_CONTACT='statstudioin@gmail.com';
+function pramanaFooter(){
+  return `<footer style="width:100%;border-top:1px solid rgba(161,177,205,.42);padding:18px 0 0;margin-top:24px;color:#526881;font-size:12px">
+    <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start;justify-content:space-between">
+      <div><b style="color:#10213a">Pramāṇa — Evidence Synthesis</b><br>${PRAMANA_CREDIT}<br><span style="color:#0f8b8d;font-weight:800">🇮🇳 Proudly Made in India</span></div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;font-weight:700">
+        <a href="#" onclick="showPramanaPage('about');return false" style="color:#3657d6;text-decoration:none">About</a>
+        <a href="#" onclick="showPramanaPage('terms');return false" style="color:#3657d6;text-decoration:none">Terms of Use</a>
+        <a href="#" onclick="showPramanaPage('privacy');return false" style="color:#3657d6;text-decoration:none">Privacy Policy</a>
+        <a href="#" onclick="showPramanaPage('contact');return false" style="color:#3657d6;text-decoration:none">Contact (${PRAMANA_CONTACT})</a>
+      </div>
+    </div>
+    <div style="margin-top:12px;color:#7c8da6">© 2026 Stat Studio India / MDASH Innovations LLP. All rights reserved.</div>
+  </footer>`;
+}
+function pagePara(s){return '<p style="margin:0 0 14px;line-height:1.7;color:#32445b">'+s+'</p>';}
+function showPramanaPage(kind){
+  const common='<div class="modal-h">'+(kind==='about'?'About Pramāṇa':kind==='terms'?'Terms of Use — Pramāṇa':kind==='privacy'?'Privacy Policy — Pramāṇa':'Contact')+'<button class="x" onclick="closeModal()">×</button></div>';
+  let body='';
+  if(kind==='about'){
+    body=`<div class="modal-b" style="max-width:780px">
+      ${pagePara('<i>Pramāṇa</i> (प्रमाण) is a Sanskrit word for a valid means of knowledge — a fitting name for a tool built to make trustworthy evidence easier to produce.')}
+      ${pagePara('Pramāṇa is an end-to-end platform for evidence synthesis. It carries a review team through the full systematic-review journey in one shared workspace: defining the protocol and PICO, searching and importing studies, de-duplicating, title/abstract and full-text screening, risk-of-bias assessment, data extraction, meta-analysis with forest and funnel plots, GRADE certainty ratings, and a PRISMA-ready flow — without juggling spreadsheets, email chains, or expensive licences.')}
+      ${pagePara('It is designed first for the people who do this work in India: medical postgraduates, MPH students, biostatisticians, and institutional research teams who need a rigorous, affordable, and accessible way to synthesise evidence.')}
+      <h3 style="margin:18px 0 8px;color:#10213a">Our mission</h3>
+      ${pagePara("To make evidence-based synthesis affordable and accessible across India — and beyond — so that good methodology isn't gated behind costly software. Built by a team of public-health researchers and biostatisticians, Pramāṇa puts a complete, transparent review workflow within reach of every department, every student, and every small research group.")}
+      <h3 style="margin:18px 0 8px;color:#10213a">Who builds it</h3>
+      ${pagePara('Pramāṇa is developed by <b>Dr G. Hari Prakash and Team</b>, under <b>Stat Studio India</b> and <b>MDASH Innovations LLP</b> — a health-research technology unit building statistical and digital-health tools for researchers. The team brings together public-health research and biostatistics with a simple goal: rigorous methods, made usable.')}
+      ${pagePara('🇮🇳 <b>Proudly Made in India.</b>')}
+      ${pagePara('<b>Contact:</b> '+PRAMANA_CONTACT)}
+      ${pramanaFooter()}
+    </div>`;
+  }else if(kind==='terms'){
+    body=`<div class="modal-b" style="max-width:820px"><div class="muted" style="margin-bottom:14px">This is a strong plain-language draft — have a qualified professional review before relying on it. It is not legal advice.</div>
+      ${pagePara('<b>Last updated: 16 June 2026</b>')}
+      ${pagePara('<b>1. Who we are.</b> Pramāṇa ("the Service") is an evidence-synthesis platform operated by Stat Studio India and MDASH Innovations LLP ("we", "us", "our"). By creating an account or using the Service, you agree to these Terms. If you do not agree, please do not use the Service.')}
+      ${pagePara('<b>2. Accounts.</b> You must provide a valid email address and keep your login credentials confidential. You are responsible for activity under your account. You must be capable of entering into a binding agreement to use the Service; if you are using it as part of an institution, you confirm you are authorised to do so.')}
+      ${pagePara("<b>3. Acceptable use.</b> You agree to use Pramāṇa only for lawful, legitimate research and academic purposes. You will not: upload unlawful, infringing, or harmful content; attempt to breach security or access other users' data without authorisation; misuse invitations or collaboration features; or use the Service to violate any applicable law or third-party right.")}
+      ${pagePara('<b>4. Your content and data.</b> You retain ownership of the review content, study records, and data you create or upload ("Your Content"). You grant us only the limited permission needed to store, process, and display Your Content so the Service can function and so that collaborators you invite can access shared projects. You are responsible for ensuring you have the right to upload and process any data you put into the Service, including any data governed by your institution\'s ethics or data-sharing rules.')}
+      ${pagePara('<b>5. Collaboration.</b> When you invite collaborators to a project, they can view and edit the shared project according to the role you assign. You are responsible for whom you invite and for the appropriateness of sharing data with them.')}
+      ${pagePara('<b>6. Research-tool disclaimer.</b> Pramāṇa assists with evidence synthesis but does not replace methodological expertise or professional judgement. Automated and AI-assisted features (such as screening suggestions and effect-size calculations) are aids, not authorities. You are responsible for verifying results, statistics, and conclusions. The Service must not be used as the sole basis for any clinical, diagnostic, or treatment decision.')}
+      ${pagePara('<b>7. Availability.</b> We aim to keep the Service available and your data safe, but we provide it "as is" and "as available", without warranties of uninterrupted or error-free operation. We may update, suspend, or discontinue features. We strongly recommend you export and keep your own backups of important reviews.')}
+      ${pagePara('<b>8. Limitation of liability.</b> To the extent permitted by law, we are not liable for indirect, incidental, or consequential damages, or for loss of data, arising from your use of the Service. Nothing in these Terms excludes liability that cannot be excluded by law.')}
+      ${pagePara('<b>9. Termination.</b> You may stop using the Service and request deletion of your account at any time. We may suspend or terminate accounts that breach these Terms.')}
+      ${pagePara('<b>10. Changes.</b> We may update these Terms; material changes will be reflected by the "Last updated" date. Continued use after changes means you accept them.')}
+      ${pagePara('<b>11. Governing law.</b> These Terms are governed by the laws of India, and disputes are subject to the courts of competent jurisdiction in India.')}
+      ${pagePara('<b>12. Contact.</b> Questions about these Terms: <b>'+PRAMANA_CONTACT+'</b>')}
+      ${pramanaFooter()}
+    </div>`;
+  }else if(kind==='privacy'){
+    body=`<div class="modal-b" style="max-width:820px"><div class="muted" style="margin-bottom:14px">Strong plain-language draft — have a qualified professional review it against the Indian Digital Personal Data Protection Act, 2023 and any institutional requirements before relying on it. Not legal advice.</div>
+      ${pagePara('<b>Last updated: 16 June 2026</b>')}
+      ${pagePara('<b>1. Scope.</b> This policy explains what information Pramāṇa (operated by Stat Studio India / MDASH Innovations LLP) collects, why, and your choices.')}
+      ${pagePara('<b>2. What we collect.</b>')}
+      <ul style="margin:0 0 14px 18px;line-height:1.7;color:#32445b">
+        <li><b>Account information:</b> your name, email address, and a securely hashed password (we never store passwords in plain text). If you sign in with Google, we receive your basic Google profile (name, email) to create your account.</li>
+        <li><b>Project data:</b> the reviews, study records, screening decisions, extractions, and analyses you create or upload.</li>
+        <li><b>Collaboration data:</b> invitations you send, and the membership and roles of projects you belong to.</li>
+        <li><b>Basic technical data:</b> standard information needed to operate and secure the Service (for example, session cookies for keeping you logged in, and limited request data used to prevent abuse such as repeated failed logins).</li>
+      </ul>
+      ${pagePara('<b>3. How we use it.</b> To provide the Service, authenticate you, enable collaboration on shared projects, send transactional emails (such as invitations and password-reset links), and keep the Service secure and working.')}
+      ${pagePara('<b>4. Cookies.</b> We use a single secure, http-only session cookie to keep you logged in. We do not use advertising or third-party tracking cookies.')}
+      ${pagePara('<b>5. Email.</b> Transactional emails (invites, password resets) may be sent via a third-party email provider (Brevo) acting on our behalf. We do not send marketing email unless you opt in.')}
+      ${pagePara('<b>6. Sharing.</b> We do not sell your data or use it for advertising. Project data is visible only to you and the collaborators you invite. We use service providers (hosting and email) solely to operate the Service, under their respective terms.')}
+      ${pagePara('<b>7. Storage and security.</b> Your data is stored in our hosted database. Passwords are hashed with bcrypt; sessions use signed tokens; password resets use single-use, time-limited links; and we apply rate-limiting to reduce abuse. No system is perfectly secure, but we take reasonable measures to protect your information.')}
+      ${pagePara('<b>8. Your data, your control.</b> You own your project content. You can export your reviews from within the app, and you can request correction or deletion of your account and associated data by contacting us.')}
+      ${pagePara("<b>9. Your rights.</b> Subject to applicable law (including India's Digital Personal Data Protection Act, 2023), you may have rights to access, correct, or delete your personal data and to withdraw consent. To exercise these, contact us at the address below.")}
+      ${pagePara('<b>10. Research data responsibility.</b> Pramāṇa is a tool for research teams. You are responsible for ensuring that any personal or sensitive data you enter complies with your institution\'s ethics approvals and applicable data-protection rules. Where possible, avoid entering identifiable patient data into review records.')}
+      ${pagePara('<b>11. Children.</b> The Service is intended for researchers and students and is not directed at children under the age at which consent is required under applicable law.')}
+      ${pagePara('<b>12. Changes.</b> We may update this policy; the "Last updated" date will reflect changes.')}
+      ${pagePara('<b>13. Contact / Grievances.</b> For privacy questions or requests, contact <b>'+PRAMANA_CONTACT+'</b>.')}
+      ${pramanaFooter()}
+    </div>`;
+  }else{
+    body=`<div class="modal-b" style="max-width:680px">
+      ${pagePara('<b>Email:</b> <a href="mailto:'+PRAMANA_CONTACT+'" style="color:#3657d6">'+PRAMANA_CONTACT+'</a>')}
+      ${pagePara(PRAMANA_CREDIT)}
+      ${pagePara('A team of public-health researchers and biostatisticians on a mission to make evidence-based synthesis affordable and accessible across India. Rigorous methods, made usable. 🇮🇳 Proudly Made in India.')}
+      ${pramanaFooter()}
+    </div>`;
+  }
+  modal(common+body);
+  const pageModal=document.getElementById('modal');
+  if(pageModal)pageModal.style.maxWidth=kind==='contact'?'720px':'920px';
+}
 function renderAuthMarkup(g){
-  return `<div style="width:100%;max-width:1080px;display:grid;grid-template-columns:minmax(0,1.15fr) minmax(360px,430px);gap:28px;align-items:center">
-    <section style="padding-right:8px">
-      <div style="display:inline-flex;align-items:center;gap:10px;padding:8px 14px;border-radius:999px;background:rgba(255,255,255,.78);border:1px solid #dbe4f2;color:#3657d6;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase">Pramana Evidence Synthesis</div>
-      <h1 style="font-size:52px;line-height:1.02;letter-spacing:-.04em;margin:18px 0 14px;color:#10213a;max-width:640px">Systematic reviews, screening, extraction, and meta-analysis in one shared workspace.</h1>
-      <p style="font-size:18px;line-height:1.65;color:#4d627c;max-width:650px;margin:0 0 20px">Built for review teams who need a practical workflow from protocol to PRISMA. Create a review, invite collaborators, screen studies live, extract data, and keep one current version of the evidence.</p>
-      <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;max-width:720px;margin:22px 0 20px">
-        <div style="background:rgba(255,255,255,.82);border:1px solid #dbe4f2;border-radius:16px;padding:18px">
-          <div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">How to use</div>
-          <div style="font-size:14px;line-height:1.6;color:#24384f">Create an account, open a review, import studies, screen records, extract outcomes, run the synthesis, and share the same project with your team.</div>
+  return `<div style="width:100%;max-width:1180px;margin:auto">
+    <style>
+      @keyframes prFlow{0%{transform:translateX(-10%);opacity:.45}50%{opacity:1}100%{transform:translateX(10%);opacity:.45}}
+      @keyframes prFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
+      .pr-auth-shell{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(360px,430px);gap:36px;align-items:center}
+      .pr-info-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;max-width:720px;margin:22px 0 20px}
+      .pr-info-card{background:rgba(255,255,255,.82);border:1px solid #dbe4f2;border-radius:14px;padding:18px;box-shadow:0 12px 32px rgba(33,48,77,.06)}
+      .pr-nav{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+      .pr-nav a,.pr-badge{display:inline-flex;align-items:center;gap:8px;padding:8px 13px;border-radius:999px;background:rgba(255,255,255,.78);border:1px solid #dbe4f2;text-decoration:none;color:#3657d6;font-size:11px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
+      .pr-flow{overflow:hidden;border:1px solid #dbe4f2;background:rgba(255,255,255,.66);border-radius:999px;max-width:700px;padding:10px 12px;margin:12px 0 18px;color:#526881;font-size:12px;font-weight:800;white-space:nowrap}
+      .pr-flow span{display:inline-block;animation:prFlow 7s ease-in-out infinite}
+      @media(max-width:900px){.pr-auth-shell{grid-template-columns:1fr}.pr-info-grid{grid-template-columns:1fr}#auth-screen{align-items:flex-start!important}.pr-hero h1{font-size:38px!important}}
+    </style>
+    <div class="pr-auth-shell">
+      <section class="pr-hero" style="padding-right:8px">
+        <div class="pr-nav">
+          <span class="pr-badge">PRAMĀṆA · EVIDENCE SYNTHESIS</span>
+          <a href="#" onclick="showPramanaPage('about');return false">About</a>
+          <a href="#" onclick="showPramanaPage('privacy');return false">Privacy</a>
+          <a href="#" onclick="showPramanaPage('contact');return false">Contact</a>
         </div>
-        <div style="background:rgba(255,255,255,.82);border:1px solid #dbe4f2;border-radius:16px;padding:18px">
-          <div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Privacy</div>
-          <div style="font-size:14px;line-height:1.6;color:#24384f">Project data stays inside your hosted workspace. Team access is controlled by invites, and password resets use one-time links.</div>
+        <div class="pr-badge" style="color:#0f8b8d;margin-bottom:4px;animation:prFloat 4.8s ease-in-out infinite">🇮🇳 Proudly Made in India</div>
+        <h1 style="font-size:54px;line-height:1.02;letter-spacing:-.04em;margin:18px 0 14px;color:#10213a;max-width:680px">Systematic reviews, screening, extraction, and meta-analysis in one shared workspace.</h1>
+        <p style="font-size:18px;line-height:1.65;color:#4d627c;max-width:690px;margin:0 0 16px">Built for review teams who need a practical workflow from protocol to PRISMA. Create a review, invite collaborators, screen studies live, extract data, run the synthesis, and keep one current version of the evidence — together, in your browser.</p>
+        <div class="pr-flow"><span>Protocol → Search → Import → De-duplicate → Screen → Extract → Meta-analysis → GRADE → PRISMA → Shared report</span></div>
+        <div class="pr-info-grid">
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">How to use</div><div style="font-size:14px;line-height:1.6;color:#24384f">Create an account, open a review, import studies, screen records, extract outcomes, run the synthesis, and share the same project with your team. Everything stays in one place, always up to date.</div></div>
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Privacy</div><div style="font-size:14px;line-height:1.6;color:#24384f">Your project data stays inside your hosted workspace. Team access is controlled by invites, and password resets use secure one-time links. We don't sell data or run ads.</div></div>
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Developed by</div><div style="font-size:16px;font-weight:800;color:#10213a">Dr G. Hari Prakash and Team</div></div>
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Team</div><div style="font-size:16px;font-weight:800;color:#10213a">Stat Studio India · MDASH Innovations LLP</div></div>
         </div>
-      </div>
-      <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:18px">
-        <div style="padding:12px 14px;border-radius:14px;background:#fff;border:1px solid #dbe4f2;min-width:180px"><div style="font-size:12px;color:#73859d;text-transform:uppercase;letter-spacing:.08em;font-weight:700">Developed by</div><div style="font-size:16px;font-weight:800;color:#10213a;margin-top:4px">Dr G Hari Prakash</div></div>
-        <div style="padding:12px 14px;border-radius:14px;background:#fff;border:1px solid #dbe4f2;min-width:180px"><div style="font-size:12px;color:#73859d;text-transform:uppercase;letter-spacing:.08em;font-weight:700">Team</div><div style="font-size:16px;font-weight:800;color:#10213a;margin-top:4px">Stat Studio India</div></div>
-      </div>
-    </section>
-    <section>
-      <div style="text-align:center;margin-bottom:18px">
-        <img src="/pramana-logo.png" alt="Pramana logo" style="width:min(100%,280px);height:auto;display:block;margin:0 auto 6px;filter:drop-shadow(0 16px 38px rgba(16,33,58,.12))">
-        <div class="muted" style="font-size:14px">Secure account access for live review collaboration</div>
-      </div>
-      <div class="card" style="margin:0;padding:26px;border-radius:20px">
-        <div class="seg" style="width:100%;margin-bottom:16px"><button id="au-tl" class="on" style="flex:1" onclick="authTab('login')">Log in</button><button id="au-tr" style="flex:1" onclick="authTab('reg')">Create account</button></div>
-        <div id="au-err" class="banner warn" style="display:none;margin-bottom:12px"><span class="bi">!</span><div id="au-err-t"></div></div>
-        <div class="fg" id="au-name-fg" style="display:none"><label class="fl">Name</label><input class="inp" id="au-name" placeholder="Dr G Hari Prakash"></div>
-        <div class="fg"><label class="fl">Email</label><input class="inp" id="au-email" type="email" placeholder="you@institution.edu"></div>
-        <div class="fg"><label class="fl">Password</label><input class="inp" id="au-pass" type="password" placeholder="At least 6 characters" onkeydown="if(event.key==='Enter')authSubmit()"></div>
-        <div id="au-forgot" style="text-align:right;margin:-6px 0 10px"><a href="#" onclick="showForgot();return false" style="font-size:11.5px;color:var(--syn);text-decoration:none">Forgot password?</a></div>
-        <button class="btn" style="width:100%;justify-content:center" id="au-submit" onclick="authSubmit()">Log in</button>
-        ${g?`<div style="text-align:center;margin:14px 0;color:var(--t3);font-size:12px">or</div><div id="gbtn"></div>`:''}
-      </div>
-      <div class="muted" style="text-align:center;margin-top:14px;font-size:12px">${BK._pendingInvite?'You were invited to a review. Log in or create an account to join it.':'Your reviews are stored in your account and shared only with collaborators you invite.'}</div>
-    </section>
+        <div style="max-width:720px;border:1px solid #dbe4f2;background:rgba(255,255,255,.58);border-radius:14px;padding:14px 16px;color:#40566f;line-height:1.55">A team of public-health researchers and biostatisticians on a mission to make evidence-based synthesis affordable and accessible across India. Rigorous methods, made usable. 🇮🇳 Proudly Made in India.</div>
+      </section>
+      <section>
+        <div style="text-align:center;margin-bottom:18px">
+          <img src="/pramana-logo.png" alt="Pramana logo" style="width:min(100%,280px);height:auto;display:block;margin:0 auto 6px;filter:drop-shadow(0 16px 38px rgba(16,33,58,.12))">
+          <div class="muted" style="font-size:14px">Secure account access for live review collaboration</div>
+        </div>
+        <div class="card" style="margin:0;padding:26px;border-radius:20px">
+          <div class="seg" style="width:100%;margin-bottom:16px"><button id="au-tl" class="on" style="flex:1" onclick="authTab('login')">Log in</button><button id="au-tr" style="flex:1" onclick="authTab('reg')">Create account</button></div>
+          <div id="au-err" class="banner warn" style="display:none;margin-bottom:12px"><span class="bi">!</span><div id="au-err-t"></div></div>
+          <div class="fg" id="au-name-fg" style="display:none"><label class="fl">Name</label><input class="inp" id="au-name" placeholder="Dr G Hari Prakash"></div>
+          <div class="fg"><label class="fl">Email</label><input class="inp" id="au-email" type="email" placeholder="you@institution.edu"></div>
+          <div class="fg"><label class="fl">Password</label><input class="inp" id="au-pass" type="password" placeholder="At least 6 characters" onkeydown="if(event.key==='Enter')authSubmit()"></div>
+          <div id="au-forgot" style="text-align:right;margin:-6px 0 10px"><a href="#" onclick="showForgot();return false" style="font-size:11.5px;color:var(--syn);text-decoration:none">Forgot password?</a></div>
+          <button class="btn" style="width:100%;justify-content:center" id="au-submit" onclick="authSubmit()">Log in</button>
+          ${g?`<div style="text-align:center;margin:14px 0;color:var(--t3);font-size:12px">or</div><div id="gbtn"></div>`:''}
+        </div>
+        <div class="muted" style="text-align:center;margin-top:14px;font-size:12px">${BK._pendingInvite?'You were invited to a review. Log in or create an account to join it.':'Your reviews are stored in your account and shared only with collaborators you invite.'}</div>
+      </section>
+    </div>
+    ${pramanaFooter()}
   </div>`;
 }
 let AUTH_TAB='login';
