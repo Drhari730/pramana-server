@@ -3629,9 +3629,9 @@ function showAuthScreen(){
   el.innerHTML = renderAuthMarkup(g);
   if(g) initGoogle();
 }
-const PRAMANA_CREDIT='Developed by Dr G. Hari Prakash and Team · Stat Studio India · MDASH Innovations LLP';
-const PRAMANA_CREDIT_SHORT='Dr G. Hari Prakash & Team — Stat Studio India · MDASH Innovations LLP';
-const PRAMANA_CONTACT='statstudioin@gmail.com';
+const PRAMANA_CREDIT='Developed by Dr G. Hari Prakash';
+const PRAMANA_CREDIT_SHORT='Developed by Dr G. Hari Prakash';
+const PRAMANA_CONTACT='pramana.ai.srma@gmail.com';
 function pramanaFooter(){
   return `<footer style="width:100%;border-top:1px solid rgba(161,177,205,.42);padding:18px 0 0;margin-top:24px;color:#526881;font-size:12px">
     <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start;justify-content:space-between">
@@ -3643,7 +3643,7 @@ function pramanaFooter(){
         <a href="#" onclick="showPramanaPage('contact');return false" style="color:#3657d6;text-decoration:none">Contact (${PRAMANA_CONTACT})</a>
       </div>
     </div>
-    <div style="margin-top:12px;color:#7c8da6">© 2026 Stat Studio India / MDASH Innovations LLP. All rights reserved.</div>
+    <div style="margin-top:12px;color:#7c8da6">© 2026 Dr G. Hari Prakash. All rights reserved.</div>
   </footer>`;
 }
 function pagePara(s){return '<p style="margin:0 0 14px;line-height:1.7;color:#32445b">'+s+'</p>';}
@@ -3658,7 +3658,7 @@ function showPramanaPage(kind){
       <h3 style="margin:18px 0 8px;color:#10213a">Our mission</h3>
       ${pagePara("To make evidence-based synthesis affordable and accessible across India — and beyond — so that good methodology isn't gated behind costly software. Built by a team of public-health researchers and biostatisticians, Pramāṇa puts a complete, transparent review workflow within reach of every department, every student, and every small research group.")}
       <h3 style="margin:18px 0 8px;color:#10213a">Who builds it</h3>
-      ${pagePara('Pramāṇa is developed by <b>Dr G. Hari Prakash and Team</b>, under <b>Stat Studio India</b> and <b>MDASH Innovations LLP</b> — a health-research technology unit building statistical and digital-health tools for researchers. The team brings together public-health research and biostatistics with a simple goal: rigorous methods, made usable.')}
+      ${pagePara('Pramāṇa is developed by <b>Dr G. Hari Prakash</b>. The work brings together public-health research and biostatistics with a simple goal: rigorous methods, made usable.')}
       ${pagePara('🇮🇳 <b>Proudly Made in India.</b>')}
       ${pagePara('<b>Contact:</b> '+PRAMANA_CONTACT)}
       ${pramanaFooter()}
@@ -3666,7 +3666,7 @@ function showPramanaPage(kind){
   }else if(kind==='terms'){
     body=`<div class="modal-b" style="max-width:820px"><div class="muted" style="margin-bottom:14px">This is a strong plain-language draft — have a qualified professional review before relying on it. It is not legal advice.</div>
       ${pagePara('<b>Last updated: 16 June 2026</b>')}
-      ${pagePara('<b>1. Who we are.</b> Pramāṇa ("the Service") is an evidence-synthesis platform operated by Stat Studio India and MDASH Innovations LLP ("we", "us", "our"). By creating an account or using the Service, you agree to these Terms. If you do not agree, please do not use the Service.')}
+      ${pagePara('<b>1. Who we are.</b> Pramāṇa ("the Service") is an evidence-synthesis platform developed by Dr G. Hari Prakash ("we", "us", "our"). By creating an account or using the Service, you agree to these Terms. If you do not agree, please do not use the Service.')}
       ${pagePara('<b>2. Accounts.</b> You must provide a valid email address and keep your login credentials confidential. You are responsible for activity under your account. You must be capable of entering into a binding agreement to use the Service; if you are using it as part of an institution, you confirm you are authorised to do so.')}
       ${pagePara("<b>3. Acceptable use.</b> You agree to use Pramāṇa only for lawful, legitimate research and academic purposes. You will not: upload unlawful, infringing, or harmful content; attempt to breach security or access other users' data without authorisation; misuse invitations or collaboration features; or use the Service to violate any applicable law or third-party right.")}
       ${pagePara('<b>4. Your content and data.</b> You retain ownership of the review content, study records, and data you create or upload ("Your Content"). You grant us only the limited permission needed to store, process, and display Your Content so the Service can function and so that collaborators you invite can access shared projects. You are responsible for ensuring you have the right to upload and process any data you put into the Service, including any data governed by your institution\'s ethics or data-sharing rules.')}
@@ -3683,7 +3683,7 @@ function showPramanaPage(kind){
   }else if(kind==='privacy'){
     body=`<div class="modal-b" style="max-width:820px"><div class="muted" style="margin-bottom:14px">Strong plain-language draft — have a qualified professional review it against the Indian Digital Personal Data Protection Act, 2023 and any institutional requirements before relying on it. Not legal advice.</div>
       ${pagePara('<b>Last updated: 16 June 2026</b>')}
-      ${pagePara('<b>1. Scope.</b> This policy explains what information Pramāṇa (operated by Stat Studio India / MDASH Innovations LLP) collects, why, and your choices.')}
+      ${pagePara('<b>1. Scope.</b> This policy explains what information Pramāṇa (developed by Dr G. Hari Prakash) collects, why, and your choices.')}
       ${pagePara('<b>2. What we collect.</b>')}
       <ul style="margin:0 0 14px 18px;line-height:1.7;color:#32445b">
         <li><b>Account information:</b> your name, email address, and a securely hashed password (we never store passwords in plain text). If you sign in with Google, we receive your basic Google profile (name, email) to create your account.</li>
@@ -3745,8 +3745,8 @@ function renderAuthMarkup(g){
         <div class="pr-info-grid">
           <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">How to use</div><div style="font-size:14px;line-height:1.6;color:#24384f">Create an account, open a review, import studies, screen records, extract outcomes, run the synthesis, and share the same project with your team. Everything stays in one place, always up to date.</div></div>
           <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Privacy</div><div style="font-size:14px;line-height:1.6;color:#24384f">Your project data stays inside your hosted workspace. Team access is controlled by invites, and password resets use secure one-time links. We don't sell data or run ads.</div></div>
-          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Developed by</div><div style="font-size:16px;font-weight:800;color:#10213a">Dr G. Hari Prakash and Team</div></div>
-          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Team</div><div style="font-size:16px;font-weight:800;color:#10213a">Stat Studio India · MDASH Innovations LLP</div></div>
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Developed by</div><div style="font-size:16px;font-weight:800;color:#10213a">Dr G. Hari Prakash</div></div>
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Contact</div><div style="font-size:16px;font-weight:800;color:#10213a">pramana.ai.srma@gmail.com</div></div>
         </div>
         <div style="max-width:720px;border:1px solid #dbe4f2;background:rgba(255,255,255,.58);border-radius:14px;padding:14px 16px;color:#40566f;line-height:1.55">A team of public-health researchers and biostatisticians on a mission to make evidence-based synthesis affordable and accessible across India. Rigorous methods, made usable. 🇮🇳 Proudly Made in India.</div>
       </section>
