@@ -334,7 +334,7 @@ svg text{font-family:var(--ff)}
 
 /* ===================== STATE ===================== */
 const ST = {
-  project:{title:'',question:'',type:'Intervention review',p:'',i:'',c:'',o:'',inc:'',exc:''},
+  project:{title:'',question:'',type:'Systematic Review (PICO)',reviewTypeId:'sr-pico',framework:'PICO',focus:'',registration:'',p:'',i:'',c:'',o:'',inc:'',exc:''},
   agent:{trained:false,persona:'',glossary:[],rubric:[],synonyms:[],calibration:null,
          model:'gemini-flash',advModel:'gemini-flash',trainedAt:null},
   refs:[], team:[], effects:[],
@@ -344,9 +344,118 @@ const ST = {
 const IDX='asrma_index';            // [{id,title,question,updatedAt,counts}]
 const PKEY=id=>'asrma_p_'+id;       // full project blob
 const ACTIVE='asrma_active';        // active project id
+const REVIEW_TYPE_GROUPS=[
+  {label:'Intervention reviews',items:[
+    {id:'sr-pico',label:'Systematic Review (PICO)',framework:'PICO',legacy:'Intervention review',
+      fields:{p:'Population',i:'Intervention',c:'Comparator',o:'Outcome'},
+      placeholders:{p:'Adults with hypertension in LMICs',i:'mHealth or app-based self-management',c:'Usual care or no digital support',o:'Systolic BP, diastolic BP, adherence'},
+      focusLabel:'Primary outcome / focus',focusPlaceholder:'e.g. HbA1c reduction, blood-pressure control, quality of life',
+      note:'Use PRISMA 2020 with intervention-style PICO eligibility.'},
+    {id:'srma-pico',label:'Systematic Review + Meta-analysis (PICO)',framework:'PICO',
+      fields:{p:'Population',i:'Intervention',c:'Comparator',o:'Outcome'},
+      placeholders:{p:'Adults with hypertension in LMICs',i:'mHealth or app-based self-management',c:'Usual care or no digital support',o:'Continuous or dichotomous outcomes suitable for pooling'},
+      focusLabel:'Primary pooled outcome',focusPlaceholder:'e.g. mean change in systolic BP, risk ratio for control',
+      note:'Use PRISMA 2020 and plan effect sizes, heterogeneity, and subgroup analyses.'},
+    {id:'rapid-pico',label:'Rapid Review (PICO)',framework:'PICO',
+      fields:{p:'Population',i:'Intervention',c:'Comparator',o:'Outcome'},
+      placeholders:{p:'Target population',i:'Index intervention',c:'Comparator',o:'Most decision-critical outcomes'},
+      focusLabel:'Decision focus',focusPlaceholder:'e.g. interventions needed for service planning within 3 months',
+      note:'Use a narrowed PICO and explicitly justify streamlining choices.'}
+  ]},
+  {label:'Prevalence / epidemiology',items:[
+    {id:'prev-cocopop',label:'Prevalence / Incidence Review (CoCoPop)',framework:'CoCoPop',
+      fields:{p:'Condition',i:'Context',c:'Population',o:'Prevalence / incidence outcome'},
+      placeholders:{p:'Hypertension or uncontrolled hypertension',i:'Primary care, community, or hospital settings',c:'Adults in LMICs',o:'Prevalence, incidence, awareness, control'},
+      focusLabel:'Primary epidemiologic estimate',focusPlaceholder:'e.g. prevalence of uncontrolled hypertension',
+      note:'Use JBI prevalence review logic with CoCoPop framing.'},
+    {id:'burden-cocopop',label:'Disease Burden Review (CoCoPop)',framework:'CoCoPop',
+      fields:{p:'Condition',i:'Context',c:'Population',o:'Burden outcome'},
+      placeholders:{p:'Stroke, diabetes, hypertension',i:'National or regional health systems',c:'Adults or children in target region',o:'Incidence, mortality, DALYs, utilisation'},
+      focusLabel:'Primary burden metric',focusPlaceholder:'e.g. DALYs, hospitalisation rate, annual mortality',
+      note:'Use CoCoPop and keep outcomes centered on burden estimates.'}
+  ]},
+  {label:'Qualitative / mixed methods',items:[
+    {id:'qual-pico',label:'Qualitative Synthesis (PICo)',framework:'PICo',
+      fields:{p:'Population',i:'Phenomenon of interest',c:'Context',o:'Themes / synthesis output'},
+      placeholders:{p:'Patients, carers, clinicians',i:'Experience of using mHealth for hypertension care',c:'Primary care, community, rural LMIC settings',o:'Barriers, facilitators, perceived value'},
+      focusLabel:'Synthesis focus',focusPlaceholder:'e.g. lived experience, implementation barriers, user acceptability',
+      note:'Use qualitative review logic and train the reviewer for relevance rather than treatment effect.'},
+    {id:'mixed-pico',label:'Mixed-Methods Review (PICO + PICo)',framework:'PICO + PICo',
+      fields:{p:'Population',i:'Intervention / phenomenon',c:'Comparator / context',o:'Outcomes + themes'},
+      placeholders:{p:'Target population',i:'Intervention plus experiential component',c:'Comparator or implementation context',o:'Quantitative outcomes and qualitative themes'},
+      focusLabel:'Integration focus',focusPlaceholder:'e.g. effectiveness plus implementation experience',
+      note:'Keep quantitative and qualitative eligibility aligned from the start.'}
+  ]},
+  {label:'Diagnostic / prognostic',items:[
+    {id:'dta-pird',label:'Diagnostic Test Accuracy (PIRD)',framework:'PIRD',
+      fields:{p:'Population',i:'Index test',c:'Reference standard',o:'Diagnostic accuracy outcome'},
+      placeholders:{p:'Adults being screened for diabetic retinopathy',i:'AI-enabled retinal image test',c:'Ophthalmologist assessment or gold standard',o:'Sensitivity, specificity, AUC'},
+      focusLabel:'Primary diagnostic metric',focusPlaceholder:'e.g. sensitivity and specificity',
+      note:'Use PRISMA-DTA / Cochrane DTA logic with explicit index and reference standard.'},
+    {id:'prog-picot',label:'Prognostic / Prediction Review (PICOT)',framework:'PICOT',
+      fields:{p:'Population',i:'Index prognostic factor / model',c:'Comparator',o:'Outcome / time horizon'},
+      placeholders:{p:'Adults with sepsis in ICU',i:'Risk score or prognostic biomarker',c:'Alternative model or standard care',o:'Mortality at 30 days / 1 year'},
+      focusLabel:'Primary prognostic endpoint',focusPlaceholder:'e.g. mortality prediction at 30 days',
+      note:'Keep time horizon explicit and assess model calibration and discrimination.'}
+  ]},
+  {label:'Etiology / risk factors',items:[
+    {id:'eti-peo',label:'Etiology / Risk Factors (PEO)',framework:'PEO',
+      fields:{p:'Population',i:'Exposure',c:'Context / comparator',o:'Outcome'},
+      placeholders:{p:'Adults with or without disease',i:'Lifestyle, environmental, or clinical exposure',c:'Healthcare or community setting',o:'Disease occurrence or adverse event'},
+      focusLabel:'Primary association outcome',focusPlaceholder:'e.g. odds ratio for disease risk',
+      note:'Use exposure-oriented logic and keep confounding concerns visible.'},
+    {id:'obs-peo',label:'Observational / Association Studies (PEO)',framework:'PEO',
+      fields:{p:'Population',i:'Exposure',c:'Context / comparator',o:'Outcome'},
+      placeholders:{p:'Defined cohort or case-control population',i:'Exposure of interest',c:'Setting or comparator group',o:'Association measure or event rate'},
+      focusLabel:'Primary association metric',focusPlaceholder:'e.g. hazard ratio, odds ratio, incidence rate ratio',
+      note:'Prefer explicit comparator/context rules for observational literature.'}
+  ]},
+  {label:'Scoping / mapping',items:[
+    {id:'scoping-pcc',label:'Scoping Review (PCC)',framework:'PCC',
+      fields:{p:'Population',i:'Concept',c:'Context',o:'Mapping objective'},
+      placeholders:{p:'Patients, clinicians, services, or policy populations',i:'Concept to map across the literature',c:'Clinical, community, digital, or policy context',o:'What the evidence landscape looks like'},
+      focusLabel:'Scoping objective',focusPlaceholder:'e.g. map intervention types, outcomes, and evidence gaps',
+      note:'Use PRISMA-ScR logic and frame eligibility with PCC, not intervention-only PICO.'},
+    {id:'map-pcc',label:'Evidence Map (PCC)',framework:'PCC',
+      fields:{p:'Population',i:'Concept',c:'Context',o:'Map output'},
+      placeholders:{p:'Target population',i:'Broad intervention or concept area',c:'Service or policy context',o:'Heatmap of evidence volume and gaps'},
+      focusLabel:'Mapping output',focusPlaceholder:'e.g. intervention-outcome evidence map',
+      note:'Bias the workflow toward mapping and evidence-gap description rather than pooling.'}
+  ]},
+  {label:'Other review types',items:[
+    {id:'narrative-general',label:'Narrative Review',framework:'Flexible',
+      fields:{p:'Population / topic',i:'Core concept',c:'Context / comparator',o:'Key questions / outcomes'},
+      placeholders:{p:'Topic population',i:'Main concept',c:'Context',o:'Main issues addressed'},
+      focusLabel:'Review focus',focusPlaceholder:'e.g. narrative synthesis aim',
+      note:'Flexible setup; keep eligibility explicit so screening remains reproducible.'}
+  ]}
+];
+const REVIEW_TYPE_INDEX={};
+REVIEW_TYPE_GROUPS.forEach(group=>group.items.forEach(item=>{REVIEW_TYPE_INDEX[item.id]=item;}));
+function getReviewTypeMeta(id){return REVIEW_TYPE_INDEX[id]||REVIEW_TYPE_INDEX['sr-pico'];}
+function ensureProjectTypeDefaults(p){
+  p=p||ST.project;
+  if(!p.reviewTypeId){
+    const match=Object.values(REVIEW_TYPE_INDEX).find(x=>x.label===p.type||x.legacy===p.type);
+    p.reviewTypeId=(match||getReviewTypeMeta('sr-pico')).id;
+  }
+  const meta=getReviewTypeMeta(p.reviewTypeId);
+  p.type=meta.label;
+  p.framework=meta.framework;
+  return meta;
+}
+function protocolFieldMeta(p){return ensureProjectTypeDefaults(p).fields||{p:'Population',i:'Intervention',c:'Comparator',o:'Outcome'};}
+function protocolPlaceholders(p){return ensureProjectTypeDefaults(p).placeholders||{};}
+function protocolSummary(p){const meta=ensureProjectTypeDefaults(p);return `${meta.label} · ${meta.framework}`;}
+function buildReviewContext(p){
+  const meta=ensureProjectTypeDefaults(p);
+  return `REVIEW TYPE: ${meta.label}
+FRAMEWORK: ${meta.framework}
+FRAMEWORK AXES: ${meta.fields.p}; ${meta.fields.i}; ${meta.fields.c}; ${meta.fields.o}`;
+}
 function blankState(){return{
   id:uid(),
-  project:{title:'',question:'',type:'Intervention review',p:'',i:'',c:'',o:'',inc:'',exc:''},
+  project:{title:'',question:'',type:'Systematic Review (PICO)',reviewTypeId:'sr-pico',framework:'PICO',focus:'',registration:'',p:'',i:'',c:'',o:'',inc:'',exc:''},
   agent:{trained:false,persona:'',glossary:[],rubric:[],synonyms:[],calibration:null,model:'gemini-flash',advModel:'gemini-flash',trainedAt:null},
   refs:[], team:[], effects:[], engine:null,
   prisma:{}, settings:{strictness:'balanced',screenMode:null,localThr:0.5},
@@ -652,6 +761,7 @@ window.saveKeys=saveKeys;
 /* ===================== AGENT TRAINING (headline feature) ===================== */
 async function trainAgents(){
   const p=ST.project;
+  const reviewCtx=buildReviewContext(p);
   if(!p.question){toast('Define your protocol & PICO first','err');ASRMA.go('protocol');return;}
   if(!Object.keys(MODELS).some(id=>getKey(id))){keyModal();return;}
   const btn=document.getElementById('train-btn');if(btn){btn.disabled=true;btn.innerHTML='⊹ Training…';}
@@ -663,8 +773,9 @@ async function trainAgents(){
     setStep(0,'run');
     const dPrompt=`You are a methodology trainer building an expert screening agent for a systematic review.
 REVIEW TITLE: ${p.title||p.question}
+${reviewCtx}
 QUESTION: ${p.question}
-PICO — P:${p.p} | I:${p.i} | C:${p.c} | O:${p.o}
+FRAMEWORK VALUES — 1:${p.p} | 2:${p.i} | 3:${p.c} | 4:${p.o}
 Return ONLY JSON:
 {"domain":"<one-line description of the clinical/research domain>",
  "glossary":[{"term":"...","meaning":"short"}],   // 6-8 key domain terms a screener must know
@@ -677,8 +788,9 @@ Return ONLY JSON:
     // 2. Reviewer persona
     setStep(1,'run');
     const persPrompt=`Write a concise expert-reviewer PERSONA + standing instructions for an AI agent that will screen titles/abstracts for THIS review, as if it were a senior systematic reviewer specialised in: ${dom.domain}.
+${reviewCtx}
 QUESTION: ${p.question}
-PICO — P:${p.p}|I:${p.i}|C:${p.c}|O:${p.o}
+FRAMEWORK VALUES — 1:${p.p}|2:${p.i}|3:${p.c}|4:${p.o}
 INCLUSION: ${p.inc||'must match PICO'}
 EXCLUSION: ${p.exc||'outside PICO'}
 Return ONLY JSON: {"persona":"<120-180 words, second person, methodologically rigorous, Cochrane/JBI-aligned, names the specific expertise needed and the default behaviour on uncertainty>"}`;
@@ -688,7 +800,8 @@ Return ONLY JSON: {"persona":"<120-180 words, second person, methodologically ri
     // 3. Decision rubric
     setStep(2,'run');
     const rubPrompt=`Create a precise INCLUDE/EXCLUDE decision rubric for screeners of this review. 
-QUESTION:${p.question}; PICO P:${p.p}|I:${p.i}|C:${p.c}|O:${p.o}; INC:${p.inc}; EXC:${p.exc}
+${reviewCtx}
+QUESTION:${p.question}; FRAMEWORK 1:${p.p}|2:${p.i}|3:${p.c}|4:${p.o}; INC:${p.inc}; EXC:${p.exc}
 Return ONLY JSON: {"rubric":[ "<6-9 short, testable decision rules; each starts with INCLUDE if / EXCLUDE if / MAYBE if>" ]}`;
     ST.agent.rubric=(parseJSON(await LLM(rubPrompt,800)).rubric)||[];
     setStep(2,'done');await sleep(150);
@@ -696,7 +809,8 @@ Return ONLY JSON: {"rubric":[ "<6-9 short, testable decision rules; each starts 
     // 4. Synthetic gold standard
     setStep(3,'run');
     const goldPrompt=`Generate a calibration test set of 8 realistic study ABSTRACTS for this review — a mix that a careful reviewer would clearly INCLUDE or EXCLUDE, plus 2 genuinely borderline ones, with the correct label.
-QUESTION:${p.question}; PICO P:${p.p}|I:${p.i}|C:${p.c}|O:${p.o}; INC:${p.inc}; EXC:${p.exc}
+${reviewCtx}
+QUESTION:${p.question}; FRAMEWORK 1:${p.p}|2:${p.i}|3:${p.c}|4:${p.o}; INC:${p.inc}; EXC:${p.exc}
 Return ONLY JSON: {"cases":[{"title":"...","abstract":"2-3 sentences","gold":"include|exclude","why":"short"}]}`;
     const gold=(parseJSON(await LLM(goldPrompt,1600)).cases)||[];
     setStep(3,'done');await sleep(150);
@@ -733,30 +847,35 @@ window.saveKeys=saveKeys;
 
 /* ===================== PROTOCOL PANE ===================== */
 function renderProtocol(){
-  const p=ST.project;
+  const p=ST.project;const meta=ensureProjectTypeDefaults(p);const labels=protocolFieldMeta(p);const ph=protocolPlaceholders(p);
   document.getElementById('pane-protocol').innerHTML=`
   <div class="pane-h"><div class="eyebrow">Phase 01 — define the question</div>
-    <h1>◈ Protocol & PICO</h1>
-    <p>Everything downstream is trained from this. A precise question and crisp inclusion/exclusion criteria are what let the agent behave like a domain expert instead of a generic classifier.</p></div>
+    <h1>◈ Protocol & framework</h1>
+    <p>Everything downstream is trained from this. Choose the right review design first, then define the framework and criteria that your reviewer should follow.</p></div>
 
   <div class="card">
     <div class="card-h">Review identity</div>
     <div class="grid2">
       <div class="fg"><label class="fl">Working title</label><input class="inp" id="p-title" value="${esc(p.title)}" placeholder="e.g. mHealth interventions for hypertension control in LMICs"></div>
-      <div class="fg"><label class="fl">Review type</label><select class="inp" id="p-type">
-        ${['Intervention review','Diagnostic accuracy','Prognostic / risk','Prevalence','Qualitative / mixed','Scoping review','Economic evaluation'].map(t=>`<option ${p.type===t?'selected':''}>${t}</option>`).join('')}</select></div>
+      <div class="fg"><label class="fl">Review type</label><select class="inp" id="p-type" onchange="protocolTypeChanged(this.value)">
+        ${REVIEW_TYPE_GROUPS.map(group=>`<optgroup label="${esc(group.label)}">${group.items.map(item=>`<option value="${item.id}" ${meta.id===item.id?'selected':''}>${esc(item.label)}</option>`).join('')}</optgroup>`).join('')}</select></div>
+    </div>
+    <div class="grid2">
+      <div class="fg"><label class="fl">Registration (PROSPERO / OSF)</label><input class="inp" id="p-registration" value="${esc(p.registration||'')}" placeholder="e.g. CRD4202xxxxxxx or OSF.io/xxxxx"></div>
+      <div class="fg"><label class="fl">${esc(meta.focusLabel||'Primary outcome / focus')}</label><input class="inp" id="p-focus" value="${esc(p.focus||'')}" placeholder="${esc(meta.focusPlaceholder||'e.g. primary outcome, mapping objective, or diagnostic endpoint')}"></div>
     </div>
     <div class="fg"><label class="fl">Research question</label>
       <textarea class="inp" id="p-question" placeholder="In [population], does [intervention] compared with [comparator] affect [outcomes]?">${esc(p.question)}</textarea></div>
+    <div class="banner info"><span class="bi">ⓘ</span><div><b>${esc(protocolSummary(p))}</b><br>${esc(meta.note||'')}</div></div>
   </div>
 
   <div class="card">
-    <div class="card-h">PICO framework <span class="tag">drives the agent</span></div>
+    <div class="card-h">${esc(meta.framework)} framework <span class="tag">drives the reviewer</span></div>
     <div class="grid2">
-      <div class="fg"><label class="fl">P — Population</label><textarea class="inp" id="p-p" placeholder="Adults with hypertension in low/middle-income countries">${esc(p.p)}</textarea></div>
-      <div class="fg"><label class="fl">I — Intervention / exposure</label><textarea class="inp" id="p-i" placeholder="mHealth / mobile app-based interventions">${esc(p.i)}</textarea></div>
-      <div class="fg"><label class="fl">C — Comparator</label><textarea class="inp" id="p-c" placeholder="Usual care / no app / standard follow-up">${esc(p.c)}</textarea></div>
-      <div class="fg"><label class="fl">O — Outcomes</label><textarea class="inp" id="p-o" placeholder="Systolic/diastolic BP, adherence, BP control rate">${esc(p.o)}</textarea></div>
+      <div class="fg"><label class="fl">1 — ${esc(labels.p)}</label><textarea class="inp" id="p-p" placeholder="${esc(ph.p||'Define the first framework axis')}">${esc(p.p)}</textarea></div>
+      <div class="fg"><label class="fl">2 — ${esc(labels.i)}</label><textarea class="inp" id="p-i" placeholder="${esc(ph.i||'Define the second framework axis')}">${esc(p.i)}</textarea></div>
+      <div class="fg"><label class="fl">3 — ${esc(labels.c)}</label><textarea class="inp" id="p-c" placeholder="${esc(ph.c||'Define the third framework axis')}">${esc(p.c)}</textarea></div>
+      <div class="fg"><label class="fl">4 — ${esc(labels.o)}</label><textarea class="inp" id="p-o" placeholder="${esc(ph.o||'Define the fourth framework axis')}">${esc(p.o)}</textarea></div>
     </div>
   </div>
 
@@ -779,8 +898,15 @@ function renderProtocol(){
 }
 function readProtocol(){
   const g=id=>document.getElementById(id)?.value||'';
-  Object.assign(ST.project,{title:g('p-title'),type:g('p-type'),question:g('p-question'),
+  const reviewTypeId=g('p-type')||'sr-pico';const meta=getReviewTypeMeta(reviewTypeId);
+  Object.assign(ST.project,{title:g('p-title'),reviewTypeId,type:meta.label,framework:meta.framework,registration:g('p-registration'),focus:g('p-focus'),question:g('p-question'),
     p:g('p-p'),i:g('p-i'),c:g('p-c'),o:g('p-o'),inc:g('p-inc'),exc:g('p-exc')});
+}
+function protocolTypeChanged(nextId){
+  readProtocol();
+  const meta=getReviewTypeMeta(nextId||'sr-pico');
+  ST.project.reviewTypeId=meta.id;ST.project.type=meta.label;ST.project.framework=meta.framework;
+  renderProtocol();
 }
 function saveProtocol(train){
   readProtocol();
@@ -793,7 +919,7 @@ function saveProtocol(train){
 }
 function loadExampleProtocol(){
   Object.assign(ST.project,{title:'mHealth interventions for blood-pressure control in LMICs',
-    type:'Intervention review',
+    reviewTypeId:'srma-pico',type:'Systematic Review + Meta-analysis (PICO)',framework:'PICO',registration:'',focus:'Blood-pressure control and adherence',
     question:'In adults with hypertension in low- and middle-income countries, do mobile-health interventions compared with usual care improve blood-pressure control?',
     p:'Adults (≥18) with diagnosed hypertension in low- or middle-income countries',
     i:'Mobile health / smartphone app / SMS-based self-management interventions',
@@ -920,7 +1046,7 @@ function renderSources(){
   document.getElementById('pane-sources').innerHTML=`
   <div class="pane-h"><div class="eyebrow">Phase 03 — find the evidence</div>
     <h1>⌕ Search sources</h1>
-    <p>Search live databases from here and pull records straight in — no manual export. Europe PMC, Crossref and OpenAlex allow direct queries (free, no key) and together cover most biomedical literature. Licensed databases (Embase, Scopus, Web of Science) can't be queried from a browser, so for those Pramāṇa drafts a strategy you paste in.</p></div>
+    <p>Search live databases from here and pull records straight in — no manual export. Europe PMC, Crossref and OpenAlex are queried directly now; PubMed, Embase, Scopus, Web of Science, Semantic Scholar, IEEE Xplore, and Cochrane are available as one-click query launch targets from the same strategy.</p></div>
 
   <div class="card"><div class="card-h">🔎 Live search <span class="tag">free · no key</span></div>
     <div class="fg"><label class="fl">Query <span class="hint">keywords or Boolean — e.g. mhealth AND hypertension AND (LMIC OR "low income")</span></label>
@@ -937,6 +1063,12 @@ function renderSources(){
     <div class="pbar" style="margin-bottom:10px"><i id="search-bar"></i></div>
     <div id="search-status" class="muted"></div>
     <div id="search-results"></div>
+    <div class="divider"></div>
+    <div class="card-h" style="margin-bottom:10px">Open the same query elsewhere</div>
+    <div class="row">
+      ${['pubmed','semantic','ieee','embase','scopus','wos','cochrane','doi'].map(t=>`<button class="btn gh sm" onclick="openSearchTarget('${t}')">${({pubmed:'PubMed',semantic:'Semantic Scholar',ieee:'IEEE Xplore',embase:'Embase',scopus:'Scopus',wos:'Web of Science',cochrane:'Cochrane',doi:'DOI / full text'})[t]}</button>`).join('')}
+    </div>
+    <div class="muted" style="margin-top:10px">Use these when a database needs a licensed institutional login or when you want to inspect DOI landing pages and full-text availability manually.</div>
   </div>
 
   <div class="card"><div class="card-h">Boolean strategy for licensed databases <span class="tag">copy & paste</span></div>
@@ -951,9 +1083,29 @@ function renderSources(){
 }
 function suggestQuery(){
   const p=ST.project;const syn=(ST.agent.synonyms||[]);
-  const q=[p.i,p.p,p.o].filter(Boolean).map(x=>x.split(/[,/]| or /i)[0].trim()).filter(Boolean);
-  const extra=syn.slice(0,4);
-  document.getElementById('sq').value=[...new Set(q.concat(extra))].filter(Boolean).join(' AND ');
+  const q=[p.i,p.p,p.o,p.focus].filter(Boolean).flatMap(x=>x.split(/\n|,|;|\/| or /i).map(s=>s.trim()).filter(Boolean));
+  const extra=syn.slice(0,8);
+  const terms=[...new Set(q.concat(extra))].filter(Boolean).slice(0,10);
+  document.getElementById('sq').value=terms.map(t=>/\s/.test(t)?`"${t}"`:t).join(' AND ');
+}
+function openSearchTarget(target){
+  const q=(document.getElementById('sq')||{}).value||ST.project._lastQuery||ST.project.question||'';
+  if(!q.trim()){toast('Enter or draft a query first','err');return;}
+  const urls={
+    pubmed:'https://pubmed.ncbi.nlm.nih.gov/?term=',
+    semantic:'https://www.semanticscholar.org/search?q=',
+    ieee:'https://ieeexplore.ieee.org/search/searchresult.jsp?queryText=',
+    embase:'https://www.embase.com/search/results?subaction=viewrecord&from=export&id=lui&query=',
+    scopus:'https://www.scopus.com/results/results.uri?sort=plf-f&src=s&st1=',
+    wos:'https://www.webofscience.com/wos/woscc/basic-search?search_mode=GeneralSearch&q=',
+    cochrane:'https://www.cochranelibrary.com/advanced-search/search?text=',
+    doi:'https://doi.org/'
+  };
+  const url=target==='doi'
+    ? (SEARCH_RESULTS.find(r=>r.doi)?.doi ? urls.doi+encodeURIComponent(SEARCH_RESULTS.find(r=>r.doi).doi) : null)
+    : urls[target]+encodeURIComponent(q);
+  if(!url){toast('No DOI available in the current preview yet','err');return;}
+  window.open(url,'_blank','noopener');
 }
 async function runLiveSearch(){
   const q=document.getElementById('sq').value.trim();
@@ -1145,8 +1297,8 @@ function parseRIS(t){const recs=[];let cur=null;
   });
   if(cur)recs.push(cur);return recs.filter(r=>r.title);
 }
-function parseNBIB(t){const recs=[];t.split(/\n\s*\n/).forEach(block=>{
-  if(!block.trim())return;const r={authors:''};const lines=block.split(/\r?\n/);let lastTag='';
+function parseNBIB(t){const recs=[];t.replace(/\r/g,'').split(/\n(?=PMID-\s|PMID -\s)/).forEach(block=>{
+  if(!block.trim())return;const r={authors:''};const lines=block.split(/\n/);let lastTag='';
   lines.forEach(l=>{const m=l.match(/^([A-Z]{2,4})\s*-\s?(.*)$/);
     if(m){lastTag=m[1];const v=m[2];
       if(lastTag==='TI')r.title=(r.title||'')+v+' ';
@@ -1154,10 +1306,15 @@ function parseNBIB(t){const recs=[];t.split(/\n\s*\n/).forEach(block=>{
       else if(lastTag==='FAU'||lastTag==='AU')r.authors+=(r.authors?'; ':'')+v;
       else if(lastTag==='DP')r.year=v.replace(/[^0-9]/g,'').slice(0,4);
       else if(lastTag==='JT'||lastTag==='TA')r.journal=r.journal||v;
-      else if(lastTag==='LID'||lastTag==='AID'){const d=v.match(/(10\.\d{4,}\/[^\s]+)/);if(d)r.doi=d[1];}
-    }else if(/^\s{4,}/.test(l)&&lastTag){if(lastTag==='TI')r.title+=l.trim()+' ';else if(lastTag==='AB')r.abstract+=l.trim()+' ';}
+      else if(lastTag==='LID'||lastTag==='AID'){const d=v.match(/(10\.\d{4,}\/[^\s\[]+)/);if(d)r.doi=d[1];}
+    }else if(/^\s{4,}/.test(l)&&lastTag){
+      if(lastTag==='TI')r.title+=l.trim()+' ';
+      else if(lastTag==='AB')r.abstract=(r.abstract||'')+l.trim()+' ';
+      else if(lastTag==='JT'||lastTag==='TA')r.journal=(r.journal||'')+' '+l.trim();
+    }
   });
-  if(r.title)recs.push(r);});return recs;
+  if(r.title){['title','abstract','journal','authors'].forEach(k=>r[k]&&(r[k]=r[k].replace(/\s+/g,' ').trim()));recs.push(r);}
+});return recs;
 }
 function parseBibTeX(t){const recs=[];const entries=t.split(/@\w+\s*{/).slice(1);
   entries.forEach(e=>{const r={authors:''};
@@ -1238,17 +1395,49 @@ window.unflag=unflag;
 
 /* ===================== SCREENING ENGINE ===================== */
 let SCREEN_FILTER='all', SCREEN_Q='';
+function currentReviewerName(){
+  if(window.BK&&BK.isServer()&&BK.user)return BK.user.name||BK.user.email||'team reviewer';
+  return 'Local reviewer';
+}
+function reviewedMeta(entry){
+  if(!entry)return '';
+  const who=entry.reviewer||entry.by||'reviewer';
+  const when=entry.reviewedAt?(' · '+new Date(entry.reviewedAt).toLocaleString()):'';
+  return `${who}${when}`;
+}
+function setDecisionComment(stage,id,val){
+  const r=refById(id);if(!r)return;
+  if(stage==='ft'){r.ft=r.ft||{};r.ft.comment=val;}
+  else{r.ta=r.ta||{};r.ta.comment=val;}
+  saveSoon();
+}
+function ftEstimateMinutes(r){
+  const ft=r.ft||{};
+  if(ft.pdfText){
+    return Math.max(4,Math.min(18,Math.round(ft.pdfText.length/2200)));
+  }
+  if(ft.fulltextUrl||r.doi||r.abstract)return 8;
+  return 12;
+}
+function fmtMinutes(mins){
+  if(!mins)return '0 min';
+  if(mins<60)return mins+' min';
+  const h=Math.floor(mins/60),m=mins%60;
+  return h+'h'+(m?(' '+m+'m'):'');
+}
 function buildScreenPrompt(title,abstract,mode){
   const a=ST.agent,p=ST.project;
   const persona=a.persona||'You are a senior systematic reviewer trained in Cochrane/JBI methodology.';
   const rubric=(a.rubric||[]).map((r,i)=>`  ${i+1}. ${r}`).join('\n')||'  Match the PICO and eligibility criteria.';
   const strict=ST.settings.strictness;
+  const reviewCtx=buildReviewContext(p);
   return`${persona}
 
 You are screening a title/abstract for this systematic review. Strictness: ${strict} (when unsure, ${strict==='strict'?'lean EXCLUDE':strict==='lenient'?'lean INCLUDE for full-text check':'mark MAYBE'}).
 
+${reviewCtx}
 QUESTION: ${p.question}
-PICO — P:${p.p||'any'} | I:${p.i||'any'} | C:${p.c||'any'} | O:${p.o||'any'}
+FRAMEWORK VALUES — 1:${p.p||'any'} | 2:${p.i||'any'} | 3:${p.c||'any'} | 4:${p.o||'any'}
 INCLUDE if: ${p.inc||'matches PICO'}
 EXCLUDE if: ${p.exc||'outside PICO'}
 
@@ -1268,7 +1457,7 @@ async function screenOne(id,useAdv){
   const res=parseJSON(await LLM(buildScreenPrompt(r.title,r.abstract,'screen'),320,model));
   const v=(res.v||'maybe').toLowerCase();
   const dec=v.includes('inc')?'include':v.includes('exc')?'exclude':'maybe';
-  r.ta={a:dec,b:null,final:dec,conf:res.conf||50,reason:res.reason||'',pico:res.pico||{},by:'agent',model};
+  r.ta={a:dec,b:null,final:dec,conf:res.conf||50,reason:res.reason||'',comment:(r.ta&&r.ta.comment)||'',pico:res.pico||{},by:'agent',model,reviewer:'Viveka',reviewedAt:new Date().toISOString()};
   return r;
 }
 async function screenAll(){
@@ -1291,7 +1480,8 @@ async function screenAll(){
 }
 function setDecision(id,dec,ev){
   const r=refById(id);if(!r)return;
-  r.ta={final:dec,human:dec,by:'human',conf:100,reason:'human decision',seeded:r.ta&&r.ta.seeded};
+  const prev=r.ta||{};
+  r.ta=Object.assign({},prev,{final:dec,human:dec,by:'human',conf:100,reason:prev.reason&&prev.by==='agent'?prev.reason:'human decision',comment:prev.comment||'',reviewer:currentReviewerName(),reviewedAt:new Date().toISOString(),seeded:prev.seeded});
   if(r._conflict)r._conflict=false; // lead resolved the disagreement
   saveSoon();
   if(currentMode()==='local'&&!ST.engine){renderScreen();renderSpine();return;}
@@ -1610,7 +1800,37 @@ function studyCard(r){
     </div></div>`;
 }
 async function reAsk(id){agentBusy(true);try{await screenOne(id,true);saveSoon();patchCard(id);renderScreenStats();toast('Re-screened (advanced)','ok');}catch(e){toast(e.message,'err')}agentBusy(false);}
-window.setScreenFilter=setScreenFilter;window.reAsk=reAsk;
+window.setScreenFilter=setScreenFilter;window.reAsk=reAsk;window.setDecisionComment=setDecisionComment;
+function studyCard(r){
+  const ta=r.ta;const dec=ta?ta.final:'';let chip='';
+  if(ta){
+    if(ta.by==='agent')chip=`<span class="dchip ai" title="Screening reviewer">⊹ Viveka ${ta.conf}%</span>`;
+    else if(ta.by==='local')chip=`<span class="dchip ai" title="Viveka Local score">⚙ Viveka Local ${Math.round((ta.prob||0)*100)}%</span>`;
+    else chip='<span class="dchip ai">Reviewer'+(ta.seeded?' · seed':'')+'</span>';
+  }
+  return`<div class="study ${dec}" data-id="${r.id}">
+    <div class="st-title">${hl(r.title)}</div>
+    <div class="st-meta"><span>${esc(r.authors?r.authors.split(';')[0]+(r.authors.includes(';')?' et al.':''):'—')}</span>
+      <span>${esc(r.year||'n.d.')}</span><span>${esc(r.journal||'')}</span>
+      ${r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi ↗</a>`:''}
+      <span style="color:var(--t3)">${esc(r.source)}</span></div>
+    ${r.abstract?`<div class="st-abs" onclick="this.classList.toggle('open')">${hl(r.abstract)}</div>`:'<div class="muted">No abstract — consider fetching it in Full text.</div>'}
+    <div class="st-foot">
+      ${ta?`<span class="dchip ${dec} ">${dec==='include'?'✓ Include':dec==='exclude'?'✗ Exclude':'? Maybe'}</span>
+        ${chip}
+        <div class="conf-bar"><i style="width:${ta.conf||0}%"></i></div>
+        <span class="muted" style="flex:1">${esc(ta.reason||'')}</span>`:'<span class="dchip pend">pending</span><span class="spacer"></span>'}
+      <button class="vbtn maybe ${dec==='maybe'?'act-maybe':''}" title="Maybe" onclick="ASRMA.setDecision('${r.id}','maybe',event)">?</button>
+      <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" title="Exclude" onclick="ASRMA.setDecision('${r.id}','exclude',event)">✗</button>
+      <button class="vbtn inc ${dec==='include'?'act-inc':''}" title="Include" onclick="ASRMA.setDecision('${r.id}','include',event)">✓</button>
+      ${currentMode()==='llm'?`<button class="vbtn" title="Re-ask Viveka (advanced model)" onclick="reAsk('${r.id}')">⊹</button>`:''}
+    </div>
+    ${ta?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ta))}</div>`:''}
+    <div class="fg" style="margin:10px 0 0">
+      <label class="fl">Comment / reason</label>
+      <textarea class="inp" style="min-height:56px" placeholder="Add reviewer comments, conflict notes, or a decision reason" oninput="setDecisionComment('ta','${r.id}',this.value)">${esc((ta&&ta.comment)||'')}</textarea>
+    </div></div>`;
+}
 
 
 /* ===================== FULL-TEXT RETRIEVAL ===================== */
@@ -1673,7 +1893,9 @@ async function ftScreen(id){
   try{
     const ctx=r.ft&&r.ft.pdfText?('FULL TEXT (excerpt):\n'+r.ft.pdfText.slice(0,9000)):('ABSTRACT:\n'+r.abstract);
     const p=ST.project;
+    const reviewCtx=buildReviewContext(p);
     const res=parseJSON(await LLM(`${ST.agent.persona||'You are a senior systematic reviewer.'}
+${reviewCtx}
 Full-text eligibility assessment for: ${p.question}
 INCLUDE if: ${p.inc}
 EXCLUDE if: ${p.exc}
@@ -1681,13 +1903,13 @@ STUDY: ${r.title}
 ${ctx}
 Return ONLY JSON: {"v":"include|exclude","reason":"<clause>","excl_cat":"<if exclude: wrong population|wrong intervention|wrong comparator|wrong outcome|wrong design|no usable data|other>"}`,400,ST.agent.advModel));
     r.ft=r.ft||{};r.ft.decision=(res.v||'').includes('inc')?'include':'exclude';
-    r.ft.reason=res.reason;r.ft.exclCat=res.excl_cat||'';r.ft.by='agent';
+    r.ft.reason=res.reason;r.ft.exclCat=res.excl_cat||'';r.ft.by='agent';r.ft.reviewer='Viveka';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';
     save();renderFulltext();renderSpine();
   }catch(e){toast(e.message,'err')}
   agentBusy(false);
 }
 function ftDecide(id,dec,cat){const r=ST.refs.find(x=>x.id===id);if(!r)return;
-  r.ft=r.ft||{};r.ft.decision=dec;r.ft.by='human';if(cat!==undefined)r.ft.exclCat=cat;
+  r.ft=r.ft||{};r.ft.decision=dec;r.ft.by='human';r.ft.reviewer=currentReviewerName();r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';if(cat!==undefined)r.ft.exclCat=cat;
   save();renderFulltextList();renderFTStats();renderSpine();}
 function renderFulltext(){
   document.getElementById('pane-fulltext').innerHTML=`
@@ -1740,6 +1962,51 @@ function renderFulltextList(){
       </div></div>`;}).join('');
 }
 window.ftScreen=ftScreen;window.ftDecide=ftDecide;
+function renderFTStats(){
+  const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  const inc=list.filter(r=>r.ft&&r.ft.decision==='include').length;
+  const exc=list.filter(r=>r.ft&&r.ft.decision==='exclude').length;
+  const oa=list.filter(r=>r.ft&&r.ft.oa).length;
+  const estTotal=list.reduce((sum,r)=>sum+ftEstimateMinutes(r),0);
+  const estPending=list.filter(r=>!(r.ft&&r.ft.decision)).reduce((sum,r)=>sum+ftEstimateMinutes(r),0);
+  const el=document.getElementById('ft-stats');if(!el)return;
+  el.innerHTML=`<div class="tiles">
+    <div class="tile"><div class="v">${list.length}</div><div class="k">at full text</div></div>
+    <div class="tile flow"><div class="v">${oa}</div><div class="k">open access</div></div>
+    <div class="tile inc"><div class="v">${inc}</div><div class="k">included</div></div>
+    <div class="tile exc"><div class="v">${exc}</div><div class="k">excluded</div></div>
+  </div><div class="muted" style="margin:-6px 0 14px">Estimated full-text review time: <b>${fmtMinutes(estTotal)}</b> total · <b>${fmtMinutes(estPending)}</b> still pending.</div>${inc?`<div class="row" style="margin-bottom:6px"><button class="btn" onclick="ASRMA.go('extract')">Extract data (${inc}) →</button></div>`:''}`;
+}
+function renderFulltextList(){
+  const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  const el=document.getElementById('ft-list');if(!el)return;
+  if(!list.length){el.innerHTML='<div class="empty"><div class="ico">▤</div><h3>No studies at full text</h3><div>Include some studies in title/abstract screening first.</div></div>';return;}
+  el.innerHTML=list.map(r=>{const ft=r.ft||{};const dec=ft.decision;
+    return`<div class="study ${dec}">
+      <div class="st-title">${esc(r.title)}</div>
+      <div class="st-meta"><span>${esc(r.year||'')}</span><span>${esc(r.journal||'')}</span>
+        ${ft.oa?'<span style="color:var(--inc);font-weight:700">● OA</span>':''}
+        ${ft.fulltextUrl?`<a href="${esc(ft.fulltextUrl)}" target="_blank">full text ↗</a>`:r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi ↗</a>`:''}
+        ${ft.pdfText?`<span style="color:var(--flow)">✓ ${esc(ft.pdfName||'text')} (${(ft.pdfText.length/1000).toFixed(0)}k chars)</span>`:'<span style="color:var(--maybe)">no full text yet</span>'}
+        <span style="color:var(--t3)">⏱ ~${fmtMinutes(ftEstimateMinutes(r))}</span></div>
+      <div class="st-foot">
+        ${dec?`<span class="dchip ${dec}">${dec==='include'?'✓ Included':'✗ Excluded'}</span>
+          ${ft.exclCat?`<span class="pill">${esc(ft.exclCat)}</span>`:''}
+          <span class="muted" style="flex:1">${esc(ft.reason||'')}</span>`:'<span class="dchip pend">not assessed</span><span class="spacer"></span>'}
+        <button class="btn gh sm" onclick="ASRMA.fetchFullText('${r.id}').then(()=>{renderFulltextList()})" title="Fetch open-access text online">🌐 Fetch</button>
+        <button class="btn gh sm" onclick="attachFullText('${r.id}')" title="Upload a PDF or .txt">📎 Attach</button>
+        <button class="btn gh sm" onclick="pasteFullText('${r.id}')" title="Paste text">📝 Paste</button>
+        <button class="btn flow sm" onclick="ftScreen('${r.id}')">⊹ Assess</button>
+        <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" onclick="ftDecide('${r.id}','exclude')">✗</button>
+        <button class="vbtn inc ${dec==='include'?'act-inc':''}" onclick="ftDecide('${r.id}','include')">✓</button>
+      </div>
+      ${ft.reviewedAt?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ft))}</div>`:''}
+      ${ft.pdfText?`<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--flow);font-weight:700">Preview retrieved full text</summary><div style="margin-top:8px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--wash);max-height:220px;overflow:auto;white-space:pre-wrap;font-size:12px;line-height:1.55">${esc(ft.pdfText.slice(0,2200))}</div></details>`:''}
+      <div class="fg" style="margin:10px 0 0">
+        <label class="fl">Comment / reason</label>
+        <textarea class="inp" style="min-height:64px" placeholder="Add reviewer comments, exclusion rationale, or notes for extraction" oninput="setDecisionComment('ft','${r.id}',this.value)">${esc(ft.comment||'')}</textarea>
+      </div></div>`;}).join('');
+}
 
 /* ===================== DATA EXTRACTION ===================== */
 const DEFAULT_FIELDS=[
