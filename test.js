@@ -4,7 +4,7 @@ const http = require('http');
 const db = require('./db');
 
 /* ---- tiny in-memory tables ---- */
-const T = { users: [], projects: [], members: [], invites: [] };
+const T = { users: [], projects: [], members: [], invites: [], resets: [] };
 function clone(o){ return JSON.parse(JSON.stringify(o)); }
 
 /* A hand-written matcher for the exact queries server.js issues.
@@ -27,6 +27,15 @@ async function mockQuery(text, params=[]) {
     const cols = s.match(/\(([^)]+)\) VALUES/)[1].split(',').map(c=>c.trim());
     const row={}; cols.forEach((c,i)=>row[c==='password_hash'?'password_hash':c]=params[i]); T.users.push(row); return [];
   }
+  if (s==='SELECT id,password_hash FROM users WHERE email=$1')
+    return T.users.filter(u=>u.email===params[0]).map(u=>({id:u.id,password_hash:u.password_hash}));
+  if (s==='UPDATE users SET password_hash=$1 WHERE id=$2'){ const u=T.users.find(u=>u.id===params[1]); if(u)u.password_hash=params[0]; return []; }
+
+  // password_resets
+  if (s.startsWith('INSERT INTO password_resets')){ T.resets.push({token:params[0],user_id:params[1],expires_at:params[2],used:false}); return []; }
+  if (s==='SELECT user_id,expires_at,used FROM password_resets WHERE token=$1')
+    return T.resets.filter(r=>r.token===params[0]).map(r=>clone(r));
+  if (s==='UPDATE password_resets SET used=true WHERE token=$1'){ const r=T.resets.find(r=>r.token===params[0]); if(r)r.used=true; return []; }
 
   // projects
   if (s.startsWith('INSERT INTO projects')) {
@@ -195,6 +204,37 @@ async function run() {
   const tok2 = r.body.link.split('invite=')[1];
   r = await linkUser('POST','/api/invites/accept',{token:tok2});
   ok('accept invite by token joins project', r.status===200 && r.body.projectId===pid);
+
+  console.log('\n=== PASSWORD RESET ===');
+  // forgot for a real user — email not configured in test, so devLink is returned
+  r = await bad('POST','/api/auth/forgot',{email:'lead@uni.edu'});
+  ok('forgot returns ok + devLink (no email configured)', r.status===200 && /reset=/.test(r.body.devLink||''));
+  const resetTok = (r.body.devLink||'').split('reset=')[1];
+  // forgot for a non-existent user — still ok, but no link (don't reveal existence)
+  r = await bad('POST','/api/auth/forgot',{email:'ghost@uni.edu'});
+  ok('forgot hides whether email exists', r.status===200 && !r.body.devLink);
+  // reset with a too-short password
+  r = await bad('POST','/api/auth/reset',{token:resetTok,password:'123'});
+  ok('reset rejects weak password', r.status===400);
+  // reset properly -> logs in
+  const resetClient = makeClient();
+  r = await resetClient('POST','/api/auth/reset',{token:resetTok,password:'newpass456'});
+  ok('reset succeeds and logs in', r.status===200 && r.body.user.email==='lead@uni.edu');
+  // token can't be reused
+  r = await bad('POST','/api/auth/reset',{token:resetTok,password:'another789'});
+  ok('used reset token rejected', r.status===400);
+  // can log in with the NEW password, not the old
+  const relog = makeClient();
+  r = await relog('POST','/api/auth/login',{email:'lead@uni.edu',password:'newpass456'});
+  ok('login works with new password', r.status===200);
+  r = await relog('POST','/api/auth/login',{email:'lead@uni.edu',password:'secret123'});
+  ok('old password no longer works', r.status===401);
+
+  console.log('\n=== RATE LIMITING ===');
+  const rlc = makeClient();
+  let blocked=false;
+  for (let i=0;i<12;i++){ const rr=await rlc('POST','/api/auth/login',{email:'rate@uni.edu',password:'x'}); if(rr.status===429){blocked=true;break;} }
+  ok('brute-force login gets blocked (429)', blocked);
 
   server.close();
   console.log(`\n=== RESULT: ${pass} passed, ${fail} failed ===`);

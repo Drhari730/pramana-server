@@ -14,7 +14,7 @@ You do NOT need to write code. You'll copy files and click buttons.
 
 ## What's in this folder
 - `server.js`, `db.js`, `package.json` - the backend (don't edit).
-- `public/index.html` - **replace this** with the Pramana app file (see Step 5).
+- `public/index.html` - the full Pramana web app, already included in this repo.
 - `.env.example` - the settings template.
 - `railway.json` - tells Railway how to run it.
 
@@ -48,7 +48,7 @@ Railway deploys from GitHub.
 6. Click **Settings -> Networking -> Generate Domain**. Copy the URL
    (e.g. `https://pramana-production.up.railway.app`).
 7. Go back to **Variables**, set `APP_URL` to that URL. Railway redeploys.
-8. Open the URL - you should see "Pramana server is running ✓".
+8. Open the URL - you should see the full Pramana login screen.
 
 **Cost:** Railway's Hobby plan is ~$5/month and covers this easily. Add a payment method
 when prompted. The Postgres database is included in that.
@@ -85,12 +85,11 @@ Skip this if email+password is enough.
 
 ---
 
-## STEP 5 - Put the Pramana app in
-1. Take the Pramana app file (`Pramana-SRMA.html`).
-2. Rename it to `index.html`.
-3. On GitHub, open the `public` folder -> **Add file -> Upload files** -> drop in `index.html`
-   (replace the placeholder) -> **Commit**.
-4. Railway redeploys. Your Railway URL now serves the full app, backed by accounts + sharing.
+## STEP 5 - Open the real app
+1. Railway serves the app from `public/index.html` automatically.
+2. Open your Railway URL.
+3. You should see the Pramana login/sign up screen, including forgot-password and reset-password flows.
+4. Create an account and continue inside the hosted app.
 
 ---
 

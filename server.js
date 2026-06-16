@@ -91,6 +91,32 @@ async function sendInviteEmail(to, project, link, inviter) {
   });
   return { sent: true };
 }
+async function sendResetEmail(to, link) {
+  const m = getMailer();
+  if (!m) return { sent: false, reason: 'email-not-configured' };
+  await m.sendMail({
+    from: process.env.SMTP_FROM || 'Pramana <no-reply@pramana.app>',
+    to,
+    subject: 'Reset your Pramana password',
+    html: `<p>You asked to reset your Pramana password.</p>
+           <p><a href="${link}" style="background:#4f46e5;color:#fff;padding:10px 18px;border-radius:8px;text-decoration:none">Choose a new password</a></p>
+           <p>Or paste this link: ${link}</p>
+           <p>This link expires in 1 hour. If you didn't request this, you can ignore this email.</p>`
+  });
+  return { sent: true };
+}
+
+/* ---------------- simple in-memory rate limiter ---------------- */
+const _hits = new Map();   // key -> {count, resetAt}
+function rateLimit(key, max, windowMs) {
+  const now = Date.now();
+  let e = _hits.get(key);
+  if (!e || now > e.resetAt) { e = { count: 0, resetAt: now + windowMs }; _hits.set(key, e); }
+  e.count++;
+  return e.count <= max ? { ok: true } : { ok: false, retryAfter: Math.ceil((e.resetAt - now) / 1000) };
+}
+// periodic cleanup so the map doesn't grow forever
+setInterval(() => { const now = Date.now(); for (const [k, v] of _hits) if (now > v.resetAt) _hits.delete(k); }, 10 * 60 * 1000).unref?.();
 
 /* ---------------- AUTH ROUTES ---------------- */
 app.post('/api/auth/register', async (req, res) => {
@@ -109,6 +135,10 @@ app.post('/api/auth/register', async (req, res) => {
 
 app.post('/api/auth/login', async (req, res) => {
   const { email, password } = req.body || {};
+  // brute-force protection: max 8 attempts per email+IP per 15 min
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0];
+  const rl = rateLimit('login:' + (email||'').toLowerCase() + ':' + ip, 8, 15 * 60 * 1000);
+  if (!rl.ok) return res.status(429).json({ error: `Too many login attempts. Try again in ${Math.ceil(rl.retryAfter/60)} minute(s).` });
   const rows = await db.q('SELECT id,email,name,password_hash FROM users WHERE email=$1', [(email||'').toLowerCase()]);
   const u = rows[0];
   if (!u || !u.password_hash || !(await bcrypt.compare(password || '', u.password_hash)))
@@ -142,6 +172,45 @@ app.post('/api/auth/google', async (req, res) => {
 
 app.post('/api/auth/logout', (req, res) => { res.clearCookie('pramana_token'); res.json({ ok: true }); });
 app.get('/api/me', requireAuth(async (req, res) => res.json({ user: req.user })));
+
+/* ---- password reset ---- */
+app.post('/api/auth/forgot', async (req, res) => {
+  const { email } = req.body || {};
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0];
+  const rl = rateLimit('forgot:' + ip, 5, 15 * 60 * 1000);
+  if (!rl.ok) return res.status(429).json({ error: 'Too many requests. Please wait a few minutes.' });
+  const rows = await db.q('SELECT id,password_hash FROM users WHERE email=$1', [(email||'').toLowerCase()]);
+  const u = rows[0];
+  // Always respond the same way so we don't reveal whether an email exists.
+  // Only actually create a reset if the account exists AND has a password (not google-only).
+  let link = null;
+  if (u && u.password_hash) {
+    const token = uid('rst_');
+    const expires = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+    await db.q('INSERT INTO password_resets (token,user_id,expires_at) VALUES ($1,$2,$3)', [token, u.id, expires]);
+    link = `${APP_URL}/?reset=${token}`;
+    try { await sendResetEmail(email, link); } catch (e) {}
+  }
+  // If email isn't configured, return the link so it can be shown on screen (testing/no-Brevo case).
+  const emailEnabled = !!process.env.SMTP_HOST;
+  res.json({ ok: true, devLink: (!emailEnabled && link) ? link : undefined });
+});
+
+app.post('/api/auth/reset', async (req, res) => {
+  const { token, password } = req.body || {};
+  if (!password || password.length < 6) return res.status(400).json({ error: 'Choose a password of at least 6 characters' });
+  const rows = await db.q('SELECT user_id,expires_at,used FROM password_resets WHERE token=$1', [token]);
+  const r = rows[0];
+  if (!r || r.used || new Date(r.expires_at).getTime() < Date.now())
+    return res.status(400).json({ error: 'This reset link is invalid or has expired. Please request a new one.' });
+  const hash = await bcrypt.hash(password, 10);
+  await db.q('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, r.user_id]);
+  await db.q('UPDATE password_resets SET used=true WHERE token=$1', [token]);
+  // log them in immediately
+  const urows = await db.q('SELECT id,email,name FROM users WHERE id=$1', [r.user_id]);
+  setAuthCookie(res, urows[0]);
+  res.json({ ok: true, user: urows[0] });
+});
 
 // when a user signs up/in, auto-join any pending invites for their email
 async function autoAcceptInvites(user) {
