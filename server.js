@@ -68,17 +68,29 @@ async function memberRole(projectId, userId) {
 /* ---------------- email (Brevo via nodemailer SMTP) ---------------- */
 const nodemailer = require('nodemailer');
 let mailer = null;
+const emailState = {
+  configured: false,
+  verifyOkAt: null,
+  verifyError: null,
+  lastEvent: null,
+  lastError: null,
+  lastAttemptAt: null,
+  lastSuccessAt: null,
+  lastRecipient: null
+};
 function hasRealValue(v) {
   if (!v) return false;
   const s = String(v).trim().toLowerCase();
   return !!s && !s.includes('your-brevo') && !s.includes('example.com') && !s.includes('paste-a-long-random');
 }
 function emailConfigured() {
-  return hasRealValue(process.env.SMTP_HOST) &&
+  const ok = hasRealValue(process.env.SMTP_HOST) &&
     hasRealValue(process.env.SMTP_PORT) &&
     hasRealValue(process.env.SMTP_USER) &&
     hasRealValue(process.env.SMTP_PASS) &&
     hasRealValue(process.env.SMTP_FROM);
+  emailState.configured = ok;
+  return ok;
 }
 function getMailer() {
   if (mailer) return mailer;
@@ -106,12 +118,36 @@ async function withTimeout(label, promise, ms) {
     if (timer) clearTimeout(timer);
   }
 }
-function queueEmail(label, fn) {
+async function verifyMailer() {
+  const m = getMailer();
+  if (!m) return { ok: false, reason: 'email-not-configured' };
+  if (emailState.verifyOkAt && Date.now() - emailState.verifyOkAt < 5 * 60 * 1000) return { ok: true };
+  try {
+    await withTimeout('SMTP verify', m.verify(), 7000);
+    emailState.verifyOkAt = Date.now();
+    emailState.verifyError = null;
+    return { ok: true };
+  } catch (e) {
+    emailState.verifyError = e.message;
+    emailState.lastError = e.message;
+    emailState.lastEvent = 'smtp-verify-failed';
+    return { ok: false, reason: e.message };
+  }
+}
+function queueEmail(label, recipient, fn) {
+  emailState.lastAttemptAt = Date.now();
+  emailState.lastRecipient = recipient;
+  emailState.lastEvent = label + ' queued';
   setTimeout(async () => {
     try {
       await withTimeout(label, fn(), 15000);
+      emailState.lastEvent = label + ' sent';
+      emailState.lastError = null;
+      emailState.lastSuccessAt = Date.now();
       console.log(label + ' sent');
     } catch (e) {
+      emailState.lastEvent = label + ' failed';
+      emailState.lastError = e.message;
       console.error(label + ' failed:', e.message);
     }
   }, 0);
@@ -223,8 +259,17 @@ app.post('/api/auth/register', async (req, res) => {
   const user = { id, email: email.toLowerCase(), name: name || email.split('@')[0] };
   await autoAcceptInvites(user);
   setAuthCookie(res, user);
-  if (emailConfigured()) queueEmail('Welcome email', () => sendWelcomeEmail(user.email, user.name));
-  res.json({ user, welcomeEmailQueued: emailConfigured() });
+  let welcomeEmailQueued = false, emailError;
+  if (emailConfigured()) {
+    const verify = await verifyMailer();
+    if (verify.ok) {
+      queueEmail('Welcome email', user.email, () => sendWelcomeEmail(user.email, user.name));
+      welcomeEmailQueued = true;
+    } else {
+      emailError = verify.reason;
+    }
+  }
+  res.json({ user, welcomeEmailQueued, emailError });
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -278,16 +323,25 @@ app.post('/api/auth/forgot', async (req, res) => {
   // Always respond the same way so we don't reveal whether an email exists.
   // Only actually create a reset if the account exists AND has a password (not google-only).
   let link = null;
+  let emailQueued = false, emailError;
   if (u && u.password_hash) {
     const token = uid('rst_');
     const expires = new Date(Date.now() + 60 * 60 * 1000).toISOString();
     await db.q('INSERT INTO password_resets (token,user_id,expires_at) VALUES ($1,$2,$3)', [token, u.id, expires]);
     link = `${APP_URL}/?reset=${token}`;
-    if (emailConfigured()) queueEmail('Reset email', () => sendResetEmail(email, link));
+    if (emailConfigured()) {
+      const verify = await verifyMailer();
+      if (verify.ok) {
+        queueEmail('Reset email', email, () => sendResetEmail(email, link));
+        emailQueued = true;
+      } else {
+        emailError = verify.reason;
+      }
+    }
   }
   // If email isn't configured, return the link so it can be shown on screen (testing/no-Brevo case).
   const emailEnabled = emailConfigured();
-  res.json({ ok: true, devLink: (!emailEnabled && link) ? link : undefined });
+  res.json({ ok: true, devLink: (!emailEnabled && link) ? link : undefined, emailQueued, emailError });
 });
 
 app.post('/api/auth/reset', async (req, res) => {
@@ -408,8 +462,13 @@ app.post('/api/projects/:id/invite', requireAuth(async (req, res) => {
   let mail = { sent: false };
   if (!existing[0]) {
     if (emailConfigured()) {
-      queueEmail('Invite email', () => sendInviteEmail(normalizedEmail, (proj[0]||{}).title || 'review', link, req.user.name || req.user.email));
-      mail = { sent: true, queued: true };
+      const verify = await verifyMailer();
+      if (verify.ok) {
+        queueEmail('Invite email', normalizedEmail, () => sendInviteEmail(normalizedEmail, (proj[0]||{}).title || 'review', link, req.user.name || req.user.email));
+        mail = { sent: true, queued: true };
+      } else {
+        mail = { sent: false, reason: verify.reason };
+      }
     } else {
       mail = { sent: false, reason: 'email-not-configured' };
     }
@@ -443,6 +502,15 @@ app.delete('/api/projects/:id/members/:userId', requireAuth(async (req, res) => 
 
 /* ---------------- config + static ---------------- */
 app.get('/api/config', (req, res) => res.json({ googleClientId: GOOGLE_CLIENT_ID, emailEnabled: emailConfigured() }));
+app.get('/api/email/status', (req, res) => res.json({
+  configured: emailConfigured(),
+  verifyError: emailState.verifyError,
+  lastEvent: emailState.lastEvent,
+  lastError: emailState.lastError,
+  lastAttemptAt: emailState.lastAttemptAt,
+  lastSuccessAt: emailState.lastSuccessAt,
+  lastRecipient: emailState.lastRecipient
+}));
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 
