@@ -458,7 +458,7 @@ function blankState(){return{
   project:{title:'',question:'',type:'Systematic Review (PICO)',reviewTypeId:'sr-pico',framework:'PICO',focus:'',registration:'',p:'',i:'',c:'',o:'',inc:'',exc:''},
   agent:{trained:false,persona:'',glossary:[],rubric:[],synonyms:[],calibration:null,model:'gemini-flash',advModel:'gemini-flash',trainedAt:null},
   refs:[], team:[], effects:[], engine:null,
-  prisma:{}, settings:{strictness:'balanced',screenMode:null,localThr:0.5},
+  prisma:{}, settings:{strictness:'balanced',screenMode:null,localThr:0.35,localMaybeBand:0.08},
   createdAt:new Date().toISOString()
 };}
 function listProjects(){try{return JSON.parse(localStorage.getItem(IDX))||[]}catch(e){return[]}}
@@ -1589,7 +1589,7 @@ function renderLLMControls(){
   </div>`;
 }
 /* ===================== LOCAL AI SCREENING ENGINE =====================
-   TF-IDF features + logistic regression, trained in-browser on a labelled
+   High-recall TF-IDF ensemble, trained in-browser on a labelled
    seed, then scores all remaining papers with ZERO LLM tokens.
    Model is stored locally in ST.engine and reused across sessions.        */
 const STOP=new Set(('the a an and or of in to for with on at by is are was were be been being this that these those we our us study studies result results method methods background conclusion conclusions aim aims objective objectives using used use also from as it its their which who whom between among versus vs than then more most less can may might will shall not no but however thus therefore can could would should has have had do does did such into over under out up down about after before during per via both each either neither all any some many few one two three new also based show shown showed found compared comparison group groups patient patients trial paper article review report data analysis significant significantly associated association effect effects outcome outcomes').split(' '));
@@ -1629,6 +1629,29 @@ function trainLR(samples,dim,epochs){
   return {w:Array.from(w),b};
 }
 function lrPredict(v,model){let z=model.b;for(const i in v)z+=model.w[i]*v[i];return 1/(1+Math.exp(-z));}
+function centroid(samples,target){
+  const c={};let n=0;
+  samples.forEach(s=>{if(s.y!==target)return;n++;for(const i in s.v)c[i]=(c[i]||0)+s.v[i];});
+  if(!n)return null;
+  let norm=0;for(const i in c){c[i]/=n;norm+=c[i]*c[i];}
+  norm=Math.sqrt(norm)||1;for(const i in c)c[i]/=norm;
+  return c;
+}
+function dotSparse(a,b){let s=0;if(!a||!b)return 0;for(const i in a)if(b[i]!=null)s+=a[i]*b[i];return s;}
+function sigmoid(x){return 1/(1+Math.exp(-Math.max(-30,Math.min(30,x))));}
+function localProbability(v,eng){
+  const lr=lrPredict(v,{w:eng.w,b:eng.b});
+  if(!eng.incCentroid||!eng.excCentroid)return lr;
+  const simInc=dotSparse(v,eng.incCentroid),simExc=dotSparse(v,eng.excCentroid);
+  const sim=sigmoid((simInc-simExc)*5);
+  return Math.max(0.001,Math.min(0.999,(lr*0.65)+(sim*0.35)));
+}
+function recallThreshold(samples,eng,target){
+  const pos=samples.filter(s=>s.y===1).map(s=>localProbability(s.v,eng)).sort((a,b)=>a-b);
+  if(pos.length<3)return 0.35;
+  const ix=Math.max(0,Math.min(pos.length-1,Math.floor(pos.length*(1-(target||0.95)))));
+  return Math.max(0.18,Math.min(0.35,pos[ix]));
+}
 
 function localTrainable(){
   const lab=ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.by==='human'&&(r.ta.final==='include'||r.ta.final==='exclude'));
@@ -1668,7 +1691,13 @@ function trainLocalEngine(){
   const topInc=idxs.slice().sort((a,b)=>b[1]-a[1]).slice(0,12).map(p=>eng.vocab[p[0]]);
   const topExc=idxs.slice().sort((a,b)=>a[1]-b[1]).slice(0,12).map(p=>eng.vocab[p[0]]);
   let correct=0;samples.forEach(s=>{if((lrPredict(s.v,model)>=0.5?1:0)===s.y)correct++;});
+  const incCentroid=centroid(samples,1),excCentroid=centroid(samples,0);
+  const tmpEngine={vocab:eng.vocab,vidx:eng.vidx,idf:eng.idf,w:model.w,b:model.b,incCentroid,excCentroid};
+  const autoThr=recallThreshold(samples,tmpEngine,0.95);
+  ST.settings.localThr=autoThr;
+  if(ST.settings.localMaybeBand==null)ST.settings.localMaybeBand=0.08;
   ST.engine={vocab:eng.vocab,vidx:eng.vidx,idf:eng.idf,w:model.w,b:model.b,
+    incCentroid,excCentroid,mode:'recall-ensemble',autoThr,
     trainedAt:new Date().toISOString(),seedN:t.total,seedInc:t.inc,seedExc:t.exc,topInc,topExc,
     trainAcc:Math.round(correct/samples.length*100),val};
   // prime the vector cache so later threshold tweaks re-score instantly
@@ -1684,15 +1713,16 @@ function vecFor(r,eng){const sig=engSig(eng);const c=_vecCache.get(r.id);
   const v=tfidf(ltok(docText(r)),eng);_vecCache.set(r.id,{sig,v});return v;}
 function scoreAllLocal(vmap){
   const eng=ST.engine;if(!eng)return;
-  const model={w:eng.w,b:eng.b};
-  const thr=ST.settings.localThr!=null?ST.settings.localThr:0.5;
+  const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
+  const maybeBand=ST.settings.localMaybeBand!=null?ST.settings.localMaybeBand:0.08;
   ST.refs.forEach(r=>{
     if(r.dup)return;
     if(r.ta&&r.ta.by==='human')return; // never overwrite human labels
     const v=(vmap&&vmap[r.id])||vecFor(r,eng);
-    const p=lrPredict(v,model);
-    const dec=p>=thr?'include':'exclude';
-    r.ta={a:dec,final:dec,prob:p,conf:Math.round(Math.abs(p-0.5)*200),reason:'local engine score '+(p*100).toFixed(0)+'%',by:'local'};
+    const p=localProbability(v,eng);
+    const dec=p>=thr?'include':(p>=thr-maybeBand?'maybe':'exclude');
+    const distance=dec==='exclude'?Math.max(0,(thr-maybeBand)-p):Math.abs(p-thr);
+    r.ta={a:dec,final:dec,prob:p,conf:Math.min(99,Math.round(Math.max(8,distance*220))),reason:'local recall score '+(p*100).toFixed(0)+'% at '+Math.round(thr*100)+'% threshold'+(dec==='maybe'?' (borderline - human review)':''),by:'local'};
   });
 }
 let _thrDeb=null;
@@ -1702,6 +1732,13 @@ function reThreshold(v){
   if(ST.engine)scoreAllLocal();            // instant — vectors are cached
   renderScreenStats();renderScreenList();
   clearTimeout(_thrDeb);_thrDeb=setTimeout(saveNow,400);
+}
+function setLocalPreset(kind){
+  if(kind==='high'){ST.settings.localThr=0.25;ST.settings.localMaybeBand=0.12;}
+  else if(kind==='strict'){ST.settings.localThr=0.5;ST.settings.localMaybeBand=0.05;}
+  else {ST.settings.localThr=ST.engine&&ST.engine.autoThr!=null?ST.engine.autoThr:0.35;ST.settings.localMaybeBand=0.08;}
+  if(ST.engine)scoreAllLocal();
+  saveSoon();renderScreen();
 }
 function activeLearningQueue(n){ // most-uncertain unlabelled (prob near 0.5)
   return ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.by==='local')
@@ -1720,12 +1757,12 @@ async function vivekaSeed(){ // optional: one small LLM batch to seed labels
   agentBusy(false);save();renderScreen();toast('Viveka labelled '+done+' seed papers — now train the local engine','ok');
 }
 function renderLocalControls(){
-  const t=localTrainable();const eng=ST.engine;const thr=ST.settings.localThr!=null?ST.settings.localThr:0.5;
+  const t=localTrainable();const eng=ST.engine;const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
   const scored=ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.by==='local').length;
   return `<div class="card tight" style="margin-bottom:14px">
     <div class="card-h">⚙ Viveka Local <span class="muted" style="font-weight:500">— in-browser screening engine</span> <span class="tag">${eng?'trained':'not trained'}</span></div>
     <div class="banner info" style="margin-bottom:12px"><span class="bi">ⓘ</span><div>
-      <b>How this works:</b> label a small seed (≈15–25 includes + excludes), then <b>Train</b>. The engine learns your include/exclude pattern (TF-IDF + logistic regression) and scores every other paper <b>free, in your browser</b> — no tokens. Review the ranked list from the top; use <b>active learning</b> to label the papers it's least sure about and retrain for a quick accuracy jump.</div></div>
+      <b>How this works:</b> label a small seed (15-25 includes + excludes), then <b>Train</b>. The engine learns with a high-recall TF-IDF ensemble and scores every other paper <b>free, in your browser</b> - no tokens. Borderline papers become <b>Maybe</b> for human review instead of being silently excluded.</div></div>
     <div class="row" style="margin-bottom:10px">
       <span class="pill ${t.inc>=3?'f':''}">${t.inc} includes labelled</span>
       <span class="pill ${t.exc>=3?'f':''}">${t.exc} excludes labelled</span>
@@ -1740,8 +1777,14 @@ function renderLocalControls(){
     </div>
     ${eng?`<div class="divider"></div>
     <div class="row"><label class="fl" style="margin:0">Include threshold <b id="thr-val">${Math.round(thr*100)}%</b></label>
-      <input type="range" min="0.2" max="0.8" step="0.02" value="${thr}" style="flex:1;max-width:280px" oninput="reThreshold(this.value)">
-      <span class="muted">lower = catch more (higher recall), higher = fewer false includes</span></div>
+      <input type="range" min="0.1" max="0.8" step="0.01" value="${thr}" style="flex:1;max-width:280px" oninput="reThreshold(this.value)">
+      <span class="muted">lower = more sensitive; 30-35% is the usual screening range</span></div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn gh sm" onclick="setLocalPreset('high')">High recall 25%</button>
+      <button class="btn gh sm" onclick="setLocalPreset('balanced')">Balanced 35%</button>
+      <button class="btn gh sm" onclick="setLocalPreset('strict')">Strict 50%</button>
+      <span class="muted">Use high recall when missing an includable paper is worse than reviewing extra maybes.</span>
+    </div>
     <div class="row" style="margin-top:8px">
       <span class="pill f">favours include: ${(eng.topInc||[]).slice(0,8).join(', ')}</span></div>
     <div class="row" style="margin-top:4px">
@@ -1755,23 +1798,28 @@ function loadActiveLearning(){
   toast('Showing the 15 most uncertain papers — label them and re-train','ok');
 }
 window.setMode=setMode;window.trainLocalEngine=trainLocalEngine;window.startSeeding=startSeeding;
-window.vivekaSeed=vivekaSeed;window.reThreshold=reThreshold;window.loadActiveLearning=loadActiveLearning;
+window.vivekaSeed=vivekaSeed;window.reThreshold=reThreshold;window.setLocalPreset=setLocalPreset;window.loadActiveLearning=loadActiveLearning;
 window.recommendedMode=recommendedMode;window.currentMode=currentMode;window.uniqueCount=uniqueCount;
 
 function renderScreenStats(){
   const el=document.getElementById('screen-stats');if(!el)return;
+  const allUnique=ST.refs.filter(r=>!r.dup);
+  const splitOn=BK.isServer()&&hasLiveAssignments();
+  const assignedOnly=splitOn&&BK.myAssignmentsOnly;
+  const pool=assignedOnly?allUnique.filter(r=>isAssignedToMe(r)):allUnique;
   let total=0,inc=0,maybe=0,exc=0,pend=0,byHuman=0,byEngine=0;
-  for(const r of ST.refs){if(r.dup)continue;total++;
+  for(const r of pool){total++;
     if(!r.ta){pend++;continue;}
     const f=r.ta.final;if(f==='include')inc++;else if(f==='maybe')maybe++;else if(f==='exclude')exc++;
     if(r.ta.by==='human')byHuman++;else if(r.ta.by==='local')byEngine++;}
   const local=currentMode()==='local';
-  const mine=BK.isServer()&&hasLiveAssignments()?myAssignedRefs().length:0;
-  const minePend=BK.isServer()&&hasLiveAssignments()?myPendingAssignedCount():0;
+  const mine=splitOn?myAssignedRefs().length:0;
+  const minePend=splitOn?myPendingAssignedCount():0;
+  const scopeNote=splitOn?`<div class="muted" style="margin:6px 0 12px">${assignedOnly?'Showing only studies assigned to you. Turn this off to view the full project.':'Showing the full project. Your assigned queue has '+mine+' studies, '+minePend+' still pending.'}</div>`:'';
   el.innerHTML=`<div class="tiles">
-    <div class="tile"><div class="v">${total}</div><div class="k">to screen</div></div>
-    ${mine?`<div class="tile syn"><div class="v">${mine}</div><div class="k">assigned to you</div></div>`:''}
-    ${minePend?`<div class="tile flow"><div class="v">${minePend}</div><div class="k">your pending</div></div>`:''}
+    <div class="tile"><div class="v">${total}</div><div class="k">${assignedOnly?'assigned queue':'to screen'}</div></div>
+    ${splitOn&&!assignedOnly?`<div class="tile syn"><div class="v">${mine}</div><div class="k">assigned to you</div></div>`:''}
+    ${splitOn&&!assignedOnly?`<div class="tile flow"><div class="v">${minePend}</div><div class="k">your pending</div></div>`:''}
     <div class="tile inc"><div class="v">${inc}</div><div class="k">include</div></div>
     <div class="tile maybe"><div class="v">${maybe}</div><div class="k">maybe</div></div>
     <div class="tile exc"><div class="v">${exc}</div><div class="k">exclude</div></div>
@@ -1779,6 +1827,7 @@ function renderScreenStats(){
       <div class="tile flow"><div class="v">${byEngine}</div><div class="k">engine-scored</div></div>`
       :`<div class="tile"><div class="v">${pend}</div><div class="k">pending</div></div>`}
   </div>${(inc||maybe)?`<div class="row" style="margin-bottom:6px"><button class="btn" onclick="ASRMA.go('fulltext')">Full-text screening (${inc+maybe}) →</button></div>`:''}`;
+  if(scopeNote)el.insertAdjacentHTML('beforeend',scopeNote);
 }
 let SCREEN_PAGE=1;const PAGE_SIZE=50;
 function setScreenFilter(f){SCREEN_FILTER=f;SCREEN_PAGE=1;document.querySelectorAll('#screen-seg button').forEach(b=>b.classList.remove('on'));
@@ -2814,7 +2863,7 @@ function loadDemoLarge(){
   // LLM Viveka is NOT the focus here; leave untrained so the page highlights Local
   ST.agent={trained:false,model:'gemini-flash',advModel:'gemini-flash',persona:'',glossary:[],synonyms:['mHealth','mobile health','app','SMS','hypertension','blood pressure','LMIC','adherence','telemonitoring'],rubric:[],calibration:null};
   ST.refs=refs;ST.effects=[];ST.team=[{name:'Lead Reviewer',role:'Lead'}];
-  ST.settings.screenMode='local';ST.settings.localThr=0.5;
+  ST.settings.screenMode='local';ST.settings.localThr=0.35;ST.settings.localMaybeBand=0.08;
   // label a seed: 30 includes + 30 excludes (simulating a reviewer's seed set)
   let si=0,se=0;
   for(const r of refs){if(r._truth==='include'&&si<30){r.ta={final:'include',by:'human',conf:100,reason:'seed label',seeded:true};si++;}
@@ -2898,7 +2947,7 @@ function renderViveka(){
         <div class="muted" style="margin-top:6px">A clean two-hump shape (most papers near 0% or 100%) means Viveka separates includes from excludes confidently. A flat middle means more borderline papers to review by hand.</div>
       </div>
       <div>
-        ${ev?`<div class="card-h" style="margin-bottom:10px">Confusion matrix <span class="muted" style="font-weight:500">@ ${Math.round((ST.settings.localThr!=null?ST.settings.localThr:0.5)*100)}% threshold</span></div>
+        ${ev?`<div class="card-h" style="margin-bottom:10px">Confusion matrix <span class="muted" style="font-weight:500">@ ${Math.round((ST.settings.localThr!=null?ST.settings.localThr:0.35)*100)}% threshold</span></div>
         ${confusionSVG(ev)}`:'<div class="card-h" style="margin-bottom:10px">Decision split</div>'}
         <div class="divider"></div>
         <div class="card-h" style="margin-bottom:8px">What Viveka learned</div>
@@ -3306,7 +3355,7 @@ async function serverTeamSplitModal(){
   modal('<div class="modal-h">👥 Team allocation<button class="x" onclick="closeModal()">×</button></div>'+
   '<div class="modal-b">'+
     '<div class="banner info" style="margin-bottom:14px"><span class="bi">🤝</span><div><b>Live shared allocation for this project.</b><br>Set what percentage of the screening queue each current project member should review. The assignment is saved inside the shared project, syncs to everyone, and each reviewer can switch to <b>My assigned only</b>.</div></div>'+
-    '<div class="row" style="margin-bottom:12px"><span class="pill f">Members in project: '+members.length+'</span><span class="pill s">Pending studies: '+pending.length+'</span><span class="pill">Already allocated: '+uniq.filter(r=>taAssignedIds(r).length).length+'</span></div>'+
+    '<div class="row" style="margin-bottom:12px"><span class="pill f">Members in project: '+members.length+'</span><span class="pill s">Queue being allocated: '+pending.length+'</span><span class="pill">Allocated in queue: '+pending.filter(r=>taAssignedIds(r).length).length+'</span></div>'+
     '<div class="card-h" style="margin-bottom:8px">Percentage split</div>'+
     (!active.length?'<div class="muted">No project members found yet.</div>':
       '<table class="tbl"><thead><tr><th>Member</th><th>Role</th><th style="width:120px">Percent</th><th style="width:110px">Current count</th></tr></thead><tbody>'+
