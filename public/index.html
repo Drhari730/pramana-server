@@ -1395,6 +1395,36 @@ window.unflag=unflag;
 
 /* ===================== SCREENING ENGINE ===================== */
 let SCREEN_FILTER='all', SCREEN_Q='';
+function ensureLiveSplit(){ if(!ST.liveSplit)ST.liveSplit={ta:{members:[],overlap:0,updatedAt:null,updatedBy:''}}; if(!ST.liveSplit.ta)ST.liveSplit.ta={members:[],overlap:0,updatedAt:null,updatedBy:''}; return ST.liveSplit; }
+function taAssignedIds(r){ return (r._assign&&Array.isArray(r._assign.ta))?r._assign.ta:[]; }
+function hasLiveAssignments(){ return ST.refs.some(r=>!r.dup&&taAssignedIds(r).length); }
+function isAssignedToMe(r){
+  if(!BK.isServer()||!BK.user) return true;
+  const ids=taAssignedIds(r);
+  if(!ids.length) return true;
+  return ids.includes(BK.user.id) || ids.includes(BK.user.email);
+}
+function myAssignedRefs(){
+  return ST.refs.filter(r=>!r.dup&&isAssignedToMe(r));
+}
+function myPendingAssignedCount(){
+  return ST.refs.filter(r=>!r.dup&&isAssignedToMe(r)&&(!r.ta||r.ta.by==='local')).length;
+}
+function toggleMyAssignmentsOnly(){
+  BK.myAssignmentsOnly=!BK.myAssignmentsOnly;
+  renderScreen();
+}
+function loadLiveSplitDefaults(members){
+  ensureLiveSplit();
+  const prior=ST.liveSplit.ta.members||[];
+  const priorMap={};prior.forEach(m=>priorMap[m.id]=m);
+  const active=members.slice();
+  const even=active.length?Math.floor(100/active.length):100;
+  return active.map((m,idx)=>({
+    id:m.id,name:m.name||m.email,email:m.email,role:m.role,
+    pct:priorMap[m.id]?priorMap[m.id].pct:(idx===active.length-1?100-even*(active.length-1):even)
+  }));
+}
 function currentReviewerName(){
   if(window.BK&&BK.isServer()&&BK.user)return BK.user.name||BK.user.email||'team reviewer';
   return 'Local reviewer';
@@ -1515,7 +1545,7 @@ function recommendedMode(){return uniqueCount()>SCREEN_THRESHOLD?'local':'llm';}
 function currentMode(){return ST.settings.screenMode||recommendedMode();}
 function setMode(m){ST.settings.screenMode=m;save();renderScreen();}
 function renderScreen(){
-  const n=uniqueCount();const mode=currentMode();const rec=recommendedMode();
+  const n=uniqueCount();const mode=currentMode();const rec=recommendedMode();const splitOn=BK.isServer()&&hasLiveAssignments();
   const recTxt=rec==='llm'
     ? `${n} papers — small enough that <b>Viveka (LLM)</b> can screen them all directly. On a free Gemini key this is typically <b>free</b> and most accurate at this size.`
     : `${n} papers — large enough that Viveka Local pays off: label a small seed, then screen the rest with <b>zero tokens</b>.`;
@@ -1533,7 +1563,8 @@ function renderScreen(){
     </div>
     <span class="muted">★ = recommended for ${n} papers · switch anytime</span>
     <span class="spacer"></span>
-    <button class="btn gh sm" onclick="teamBatchModal()" title="Split articles between reviewers and merge their work">👥 Team & batches</button>
+    ${splitOn?`<button class="btn gh sm" onclick="toggleMyAssignmentsOnly()" title="Show only studies assigned to you">${BK.myAssignmentsOnly?'My assigned only: on':'My assigned only: off'}</button>`:''}
+    <button class="btn gh sm" onclick="teamBatchModal()" title="${BK.isServer()?'Assign studies across live project members':'Split articles between reviewers and merge their work'}">👥 Team & batches</button>
   </div>
   <div id="screen-stats"></div>
   ${mode==='llm'?renderLLMControls():renderLocalControls()}
@@ -1735,8 +1766,12 @@ function renderScreenStats(){
     const f=r.ta.final;if(f==='include')inc++;else if(f==='maybe')maybe++;else if(f==='exclude')exc++;
     if(r.ta.by==='human')byHuman++;else if(r.ta.by==='local')byEngine++;}
   const local=currentMode()==='local';
+  const mine=BK.isServer()&&hasLiveAssignments()?myAssignedRefs().length:0;
+  const minePend=BK.isServer()&&hasLiveAssignments()?myPendingAssignedCount():0;
   el.innerHTML=`<div class="tiles">
     <div class="tile"><div class="v">${total}</div><div class="k">to screen</div></div>
+    ${mine?`<div class="tile syn"><div class="v">${mine}</div><div class="k">assigned to you</div></div>`:''}
+    ${minePend?`<div class="tile flow"><div class="v">${minePend}</div><div class="k">your pending</div></div>`:''}
     <div class="tile inc"><div class="v">${inc}</div><div class="k">include</div></div>
     <div class="tile maybe"><div class="v">${maybe}</div><div class="k">maybe</div></div>
     <div class="tile exc"><div class="v">${exc}</div><div class="k">exclude</div></div>
@@ -1754,6 +1789,7 @@ function filteredRefs(){
   else if(SCREEN_FILTER==='conflict'){u=u.filter(r=>r._conflict);}
   else if(SCREEN_FILTER==='pending')u=u.filter(r=>!r.ta||r.ta.by==='local');
   else if(SCREEN_FILTER!=='all')u=u.filter(r=>r.ta&&r.ta.final===SCREEN_FILTER);
+  if(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())u=u.filter(r=>isAssignedToMe(r));
   if(SCREEN_Q){const q=SCREEN_Q.toLowerCase();u=u.filter(r=>(r.title+' '+r.authors).toLowerCase().includes(q));}
   if(currentMode()==='local'&&ST.engine)u=u.slice().sort((a,b)=>((b.ta&&b.ta.prob)||0)-((a.ta&&a.ta.prob)||0));
   return u;
@@ -1786,7 +1822,8 @@ function studyCard(r){
     <div class="st-meta"><span>${esc(r.authors?r.authors.split(';')[0]+(r.authors.includes(';')?' et al.':''):'—')}</span>
       <span>${esc(r.year||'n.d.')}</span><span>${esc(r.journal||'')}</span>
       ${r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi ↗</a>`:''}
-      <span style="color:var(--t3)">${esc(r.source)}</span></div>
+      <span style="color:var(--t3)">${esc(r.source)}</span>
+      ${taAssignedIds(r).length?`<span style="color:var(--flow)">assigned: ${esc(taAssignedIds(r).length>1?'double-screened':'single reviewer')}</span>`:''}</div>
     ${r.abstract?`<div class="st-abs" onclick="this.classList.toggle('open')">${hl(r.abstract)}</div>`:'<div class="muted">No abstract — consider fetching it in Full text.</div>'}
     <div class="st-foot">
       ${ta?`<span class="dchip ${dec} ">${dec==='include'?'✓ Include':dec==='exclude'?'✗ Exclude':'? Maybe'}</span>
@@ -3128,6 +3165,7 @@ window.attachFullText=attachFullText;window.pasteFullText=pasteFullText;window.s
    lead imports & merges decisions, with conflict detection on overlapping items. */
 
 function teamBatchModal(){
+  if(BK.isServer()) return serverTeamSplitModal();
   const uniq=ST.refs.filter(r=>!r.dup);
   const assigned=uniq.filter(r=>r._batch).length;
   const team=ST.team.length?ST.team:[];
@@ -3250,6 +3288,91 @@ function mergeBatch(b){
 function tbConflicts(){return ST.refs.filter(r=>!r.dup&&r._conflict);}
 window.teamBatchModal=teamBatchModal;window.tbAddReviewer=tbAddReviewer;window.tbSplit=tbSplit;
 window.tbExportBatch=tbExportBatch;window.tbImportBatch=tbImportBatch;window.renderBatchList=renderBatchList;window.tbConflicts=tbConflicts;
+
+async function fetchProjectMembers(){
+  if(!BK.isServer()||!ST.id) return [];
+  const r=await BK.api('GET','/api/projects/'+ST.id+'/members');
+  BK.members=(r.members||[]).slice();
+  return BK.members;
+}
+async function serverTeamSplitModal(){
+  modal('<div class="modal-h">👥 Team allocation<button class="x" onclick="closeModal()">×</button></div><div class="modal-b"><div class="muted">Loading team members…</div></div>');
+  const members=await fetchProjectMembers();
+  const active=loadLiveSplitDefaults(members);
+  const editable=BK.role==='owner'||BK.role==='editor';
+  const uniq=ST.refs.filter(r=>!r.dup);
+  const pending=uniq.filter(r=>!r.ta||r.ta.by==='local');
+  const overlap=ensureLiveSplit().ta.overlap||0;
+  modal('<div class="modal-h">👥 Team allocation<button class="x" onclick="closeModal()">×</button></div>'+
+  '<div class="modal-b">'+
+    '<div class="banner info" style="margin-bottom:14px"><span class="bi">🤝</span><div><b>Live shared allocation for this project.</b><br>Set what percentage of the screening queue each current project member should review. The assignment is saved inside the shared project, syncs to everyone, and each reviewer can switch to <b>My assigned only</b>.</div></div>'+
+    '<div class="row" style="margin-bottom:12px"><span class="pill f">Members in project: '+members.length+'</span><span class="pill s">Pending studies: '+pending.length+'</span><span class="pill">Already allocated: '+uniq.filter(r=>taAssignedIds(r).length).length+'</span></div>'+
+    '<div class="card-h" style="margin-bottom:8px">Percentage split</div>'+
+    (!active.length?'<div class="muted">No project members found yet.</div>':
+      '<table class="tbl"><thead><tr><th>Member</th><th>Role</th><th style="width:120px">Percent</th><th style="width:110px">Current count</th></tr></thead><tbody>'+
+      active.map(m=>'<tr><td><b>'+esc(m.name||m.email)+'</b><div class="muted">'+esc(m.email||'')+'</div></td><td><span class="pill s">'+esc(m.role)+'</span></td>'+
+        '<td><input class="inp" id="alloc-pct-'+m.id+'" type="number" min="0" max="100" step="1" value="'+(m.pct||0)+'" '+(editable?'':'disabled')+'></td>'+
+        '<td>'+uniq.filter(r=>taAssignedIds(r).includes(m.id)).length+'</td></tr>').join('')+'</tbody></table>')+
+    '<div class="row" style="margin-top:12px">'+
+      '<label class="fl" style="margin:0">Double-screen overlap</label>'+
+      '<select class="inp" id="alloc-overlap" style="width:auto" '+(editable?'':'disabled')+'><option value="0" '+(overlap===0?'selected':'')+'>none</option><option value="0.2" '+(overlap===0.2?'selected':'')+'>20%</option><option value="0.5" '+(overlap===0.5?'selected':'')+'>50%</option><option value="1" '+(overlap===1?'selected':'')+'>100%</option></select>'+
+      '<span class="muted">Overlap adds a second reviewer to a portion of studies.</span></div>'+
+    '<div id="alloc-msg" style="margin-top:12px">'+renderServerAllocationSummary(active)+'</div>'+
+  '</div>'+
+  '<div class="modal-f">'+
+    (editable?'<button class="btn gh" onclick="serverAutoBalance()">Auto-balance</button><button class="btn" onclick="applyServerSplit()">Apply live split</button>':'<span class="muted">Only owners and editors can change allocation.</span>')+
+    '<button class="btn gh" onclick="closeModal()">Close</button></div>');
+}
+function renderServerAllocationSummary(active){
+  const plan=ensureLiveSplit().ta;
+  if(!(plan.members||[]).length)return '<div class="muted">No live percentage plan saved yet.</div>';
+  return '<div class="banner info"><span class="bi">✓</span><div>Saved by <b>'+esc(plan.updatedBy||'a collaborator')+'</b> on '+esc(plan.updatedAt?new Date(plan.updatedAt).toLocaleString():'')+'. '+
+    (plan.members||[]).map(m=>esc(m.name)+': '+m.pct+'%').join(' · ')+'</div></div>';
+}
+function serverAutoBalance(){
+  const members=(BK.members||[]).slice();
+  if(!members.length)return;
+  const even=Math.floor(100/members.length);
+  members.forEach((m,idx)=>{const el=document.getElementById('alloc-pct-'+m.id); if(el)el.value=(idx===members.length-1?100-even*(members.length-1):even);});
+}
+function applyServerSplit(){
+  const members=(BK.members||[]).slice();
+  if(!members.length){toast('No team members to allocate across','err');return;}
+  const pending=ST.refs.filter(r=>!r.dup&&(!r.ta||r.ta.by==='local'));
+  if(!pending.length){toast('No pending studies to allocate','err');return;}
+  const rows=members.map(m=>({id:m.id,name:m.name||m.email,email:m.email,role:m.role,pct:Math.max(0,parseFloat((document.getElementById('alloc-pct-'+m.id)||{}).value)||0)}))
+    .filter(m=>m.pct>0);
+  const totalPct=rows.reduce((s,m)=>s+m.pct,0);
+  if(!totalPct){toast('Enter at least one non-zero percentage','err');return;}
+  rows.forEach(m=>m.share=m.pct/totalPct);
+  const total=pending.length;
+  rows.forEach(m=>{const raw=m.share*total;m.count=Math.floor(raw);m.frac=raw-m.count;});
+  let left=total-rows.reduce((s,m)=>s+m.count,0);
+  rows.slice().sort((a,b)=>b.frac-a.frac).forEach(m=>{if(left>0){m.count++;left--;}})
+  pending.forEach(r=>{r._assign=r._assign||{};r._assign.ta=[];});
+  let idx=0;
+  rows.forEach(m=>{for(let i=0;i<m.count&&idx<pending.length;i++,idx++)pending[idx]._assign.ta=[m.id];});
+  while(idx<pending.length){pending[idx]._assign.ta=[rows[idx%rows.length].id];idx++;}
+  const overlap=parseFloat(document.getElementById('alloc-overlap').value)||0;
+  if(overlap>0&&rows.length>1){
+    pending.forEach((r,i)=>{
+      const take=overlap>=1?true:(((i*2654435761>>>0)%1000)/1000<overlap);
+      if(!take)return;
+      const primary=r._assign.ta[0];
+      const pIdx=Math.max(0,rows.findIndex(m=>m.id===primary));
+      const secondary=rows[(pIdx+1)%rows.length].id;
+      if(!r._assign.ta.includes(secondary))r._assign.ta.push(secondary);
+    });
+  }
+  const plan=ensureLiveSplit().ta;
+  plan.members=rows.map(m=>({id:m.id,name:m.name,email:m.email,role:m.role,pct:m.pct,count:pending.filter(r=>taAssignedIds(r).includes(m.id)).length}));
+  plan.overlap=overlap; plan.updatedAt=new Date().toISOString(); plan.updatedBy=currentReviewerName();
+  BK.myAssignmentsOnly=true;
+  saveNow();
+  toast('Live allocation saved and synced','ok');
+  serverTeamSplitModal();
+  renderScreen();
+}
 
 /* ===================== BATCH MODE (what a student reviewer uses) ===================== */
 let BATCH=null; // loaded batch a reviewer is screening
@@ -3393,7 +3516,7 @@ window.bmFilter=bmFilter;window.bmDecide=bmDecide;window.batchExport=batchExport
    - SERVER : served by the Pramana backend. Accounts + live shared projects.
    Mode is auto-detected at boot by probing /api/config. */
 const BK = {
-  mode:'local', user:null, config:{}, version:null, role:null, _pendingInvite:null,
+  mode:'local', user:null, config:{}, version:null, role:null, _pendingInvite:null, members:null, myAssignmentsOnly:false,
   async api(method, path, body, timeoutMs){
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), timeoutMs || 20000);
@@ -3703,7 +3826,9 @@ async function serverOpenProject(id){
   Object.keys(ST).forEach(k=>delete ST[k]);
   Object.assign(ST, blankState(), data, { id });   // ensure required keys exist
   window.ST=ST; BK.version=r.project.version; BK.role=r.role;
+  BK.myAssignmentsOnly = BK.role==='reviewer' && hasLiveAssignments();
   updatePill();updateKeyBtn();updateAgentChip();renderTeam();
+  startServerPolling();
   openWorkspace(ST.project&&ST.project.question?(ST.refs.length?'screen':'agents'):'protocol');
 }
 async function serverNewProject(){
@@ -3723,6 +3848,7 @@ function strip(st){ const o=Object.assign({},st); return o; }
 
 /* server save with optimistic concurrency + debounce */
 let _srvTimer=null, _srvSaving=false, _srvDirty=false;
+let _srvPoll=null;
 function serverSaveSoon(){ if(_srvTimer)return; _srvTimer=setTimeout(()=>{_srvTimer=null;serverSaveNow();},1400); }
 async function serverSaveNow(){
   if(!ST.id){ return; }
@@ -3738,6 +3864,28 @@ async function serverSaveNow(){
     _srvSaving=false;
     if(_srvDirty){ _srvDirty=false; serverSaveSoon(); }
   }
+}
+function startServerPolling(){
+  if(_srvPoll) clearInterval(_srvPoll);
+  if(!BK.isServer()||!ST.id) return;
+  _srvPoll=setInterval(async ()=>{
+    if(!ST.id||_srvSaving||_srvTimer) return;
+    try{
+      const r=await BK.api('GET','/api/projects/'+ST.id, null, 8000);
+      if(r.project && r.project.version!==BK.version){
+        const phase=(window.CUR&&CUR.id)||'screen';
+        const curId=ST.id;
+        const data=r.project.data||{};
+        Object.keys(ST).forEach(k=>delete ST[k]);
+        Object.assign(ST, blankState(), data, { id: curId||r.project.id });
+        window.ST=ST; BK.version=r.project.version; BK.role=r.role;
+        if(BK.role==='reviewer'&&hasLiveAssignments()) BK.myAssignmentsOnly=true;
+        updatePill();updateKeyBtn();updateAgentChip();renderTeam();
+        openWorkspace(phase);
+        toast('Project updated by a collaborator','ok');
+      }
+    }catch(e){}
+  },15000);
 }
 function onSaveConflict(){
   // someone else saved since we loaded — reload to get the latest, preserving the user's view
