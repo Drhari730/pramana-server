@@ -70,8 +70,6 @@ const nodemailer = require('nodemailer');
 let mailer = null;
 const emailState = {
   configured: false,
-  verifyOkAt: null,
-  verifyError: null,
   lastEvent: null,
   lastError: null,
   lastAttemptAt: null,
@@ -118,29 +116,13 @@ async function withTimeout(label, promise, ms) {
     if (timer) clearTimeout(timer);
   }
 }
-async function verifyMailer() {
-  const m = getMailer();
-  if (!m) return { ok: false, reason: 'email-not-configured' };
-  if (emailState.verifyOkAt && Date.now() - emailState.verifyOkAt < 5 * 60 * 1000) return { ok: true };
-  try {
-    await withTimeout('SMTP verify', m.verify(), 7000);
-    emailState.verifyOkAt = Date.now();
-    emailState.verifyError = null;
-    return { ok: true };
-  } catch (e) {
-    emailState.verifyError = e.message;
-    emailState.lastError = e.message;
-    emailState.lastEvent = 'smtp-verify-failed';
-    return { ok: false, reason: e.message };
-  }
-}
 function queueEmail(label, recipient, fn) {
   emailState.lastAttemptAt = Date.now();
   emailState.lastRecipient = recipient;
   emailState.lastEvent = label + ' queued';
   setTimeout(async () => {
     try {
-      await withTimeout(label, fn(), 15000);
+      await withTimeout(label, fn(), 20000);
       emailState.lastEvent = label + ' sent';
       emailState.lastError = null;
       emailState.lastSuccessAt = Date.now();
@@ -261,13 +243,8 @@ app.post('/api/auth/register', async (req, res) => {
   setAuthCookie(res, user);
   let welcomeEmailQueued = false, emailError;
   if (emailConfigured()) {
-    const verify = await verifyMailer();
-    if (verify.ok) {
-      queueEmail('Welcome email', user.email, () => sendWelcomeEmail(user.email, user.name));
-      welcomeEmailQueued = true;
-    } else {
-      emailError = verify.reason;
-    }
+    queueEmail('Welcome email', user.email, () => sendWelcomeEmail(user.email, user.name));
+    welcomeEmailQueued = true;
   }
   res.json({ user, welcomeEmailQueued, emailError });
 });
@@ -330,13 +307,8 @@ app.post('/api/auth/forgot', async (req, res) => {
     await db.q('INSERT INTO password_resets (token,user_id,expires_at) VALUES ($1,$2,$3)', [token, u.id, expires]);
     link = `${APP_URL}/?reset=${token}`;
     if (emailConfigured()) {
-      const verify = await verifyMailer();
-      if (verify.ok) {
-        queueEmail('Reset email', email, () => sendResetEmail(email, link));
-        emailQueued = true;
-      } else {
-        emailError = verify.reason;
-      }
+      queueEmail('Reset email', email, () => sendResetEmail(email, link));
+      emailQueued = true;
     }
   }
   // If email isn't configured, return the link so it can be shown on screen (testing/no-Brevo case).
@@ -462,13 +434,8 @@ app.post('/api/projects/:id/invite', requireAuth(async (req, res) => {
   let mail = { sent: false };
   if (!existing[0]) {
     if (emailConfigured()) {
-      const verify = await verifyMailer();
-      if (verify.ok) {
-        queueEmail('Invite email', normalizedEmail, () => sendInviteEmail(normalizedEmail, (proj[0]||{}).title || 'review', link, req.user.name || req.user.email));
-        mail = { sent: true, queued: true };
-      } else {
-        mail = { sent: false, reason: verify.reason };
-      }
+      queueEmail('Invite email', normalizedEmail, () => sendInviteEmail(normalizedEmail, (proj[0]||{}).title || 'review', link, req.user.name || req.user.email));
+      mail = { sent: true, queued: true };
     } else {
       mail = { sent: false, reason: 'email-not-configured' };
     }
@@ -504,7 +471,6 @@ app.delete('/api/projects/:id/members/:userId', requireAuth(async (req, res) => 
 app.get('/api/config', (req, res) => res.json({ googleClientId: GOOGLE_CLIENT_ID, emailEnabled: emailConfigured() }));
 app.get('/api/email/status', (req, res) => res.json({
   configured: emailConfigured(),
-  verifyError: emailState.verifyError,
   lastEvent: emailState.lastEvent,
   lastError: emailState.lastError,
   lastAttemptAt: emailState.lastAttemptAt,

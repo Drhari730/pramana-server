@@ -3349,9 +3349,9 @@ async function submitForgotEnhanced(){
     if(r.devLink){
       document.getElementById('fp-ok-t').innerHTML='Email is not configured on this server, so use this reset link directly:<br><a href="'+esc(r.devLink)+'" style="word-break:break-all;font-size:11px">'+esc(r.devLink)+'</a>';
     }else if(r.emailError){
-      document.getElementById('fp-ok-t').textContent='Reset email could not be sent from the server: '+r.emailError;
+      document.getElementById('fp-ok-t').textContent='Reset email could not be prepared on the server: '+r.emailError;
     }else{
-      document.getElementById('fp-ok-t').textContent='If an account exists for '+email+', a reset link has been queued. Check your inbox and spam folder.';
+      document.getElementById('fp-ok-t').textContent='If an account exists for '+email+', a reset email has been queued. Check your inbox, spam folder, and Railway email status.';
     }
     btn.style.display='none';
   }catch(e){
