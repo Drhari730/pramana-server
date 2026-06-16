@@ -70,6 +70,7 @@ const nodemailer = require('nodemailer');
 let mailer = null;
 const emailState = {
   configured: false,
+  transport: null,
   lastEvent: null,
   lastError: null,
   lastAttemptAt: null,
@@ -79,20 +80,27 @@ const emailState = {
 function hasRealValue(v) {
   if (!v) return false;
   const s = String(v).trim().toLowerCase();
-  return !!s && !s.includes('your-brevo') && !s.includes('example.com') && !s.includes('paste-a-long-random');
+  return !!s && !s.includes('your-brevo') && !s.includes('example.com') && !s.includes('paste-a-long-random') && !s.includes('your-api-key');
 }
-function emailConfigured() {
-  const ok = hasRealValue(process.env.SMTP_HOST) &&
+function apiEmailConfigured() {
+  return hasRealValue(process.env.BREVO_API_KEY) && hasRealValue(process.env.SMTP_FROM);
+}
+function smtpEmailConfigured() {
+  return hasRealValue(process.env.SMTP_HOST) &&
     hasRealValue(process.env.SMTP_PORT) &&
     hasRealValue(process.env.SMTP_USER) &&
     hasRealValue(process.env.SMTP_PASS) &&
     hasRealValue(process.env.SMTP_FROM);
+}
+function emailConfigured() {
+  const ok = apiEmailConfigured() || smtpEmailConfigured();
   emailState.configured = ok;
+  emailState.transport = apiEmailConfigured() ? 'brevo-api' : (smtpEmailConfigured() ? 'smtp' : null);
   return ok;
 }
 function getMailer() {
   if (mailer) return mailer;
-  if (!emailConfigured()) return null;   // email disabled if not configured
+  if (!smtpEmailConfigured()) return null;
   mailer = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: parseInt(process.env.SMTP_PORT || '587'),
@@ -102,6 +110,12 @@ function getMailer() {
     socketTimeout: 15000
   });
   return mailer;
+}
+function parseFromHeader(raw) {
+  const s = String(raw || '').trim();
+  const m = s.match(/^(.*)<([^>]+)>$/);
+  if (m) return { name: m[1].trim().replace(/^"|"$/g, ''), email: m[2].trim() };
+  return { name: 'Pramana', email: s };
 }
 async function withTimeout(label, promise, ms) {
   let timer;
@@ -134,6 +148,28 @@ function queueEmail(label, recipient, fn) {
     }
   }, 0);
 }
+async function sendViaBrevoApi({ to, subject, html }) {
+  const sender = parseFromHeader(process.env.SMTP_FROM);
+  const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'api-key': process.env.BREVO_API_KEY
+    },
+    body: JSON.stringify({
+      sender,
+      to: [{ email: to }],
+      subject,
+      htmlContent: html
+    })
+  });
+  let data = {};
+  try { data = await res.json(); } catch (e) {}
+  if (!res.ok) {
+    throw new Error((data && (data.message || data.code)) || ('Brevo API HTTP ' + res.status));
+  }
+  return data;
+}
 function emailFrame({ pretitle, title, body, ctaLabel, ctaLink, note }) {
   return `<!doctype html>
   <html><body style="margin:0;padding:0;background:#f4f7fb;font-family:Segoe UI,Arial,sans-serif;color:#10213a">
@@ -159,61 +195,61 @@ function emailFrame({ pretitle, title, body, ctaLabel, ctaLink, note }) {
   </body></html>`;
 }
 async function sendInviteEmail(to, project, link, inviter) {
-  const m = getMailer();
-  if (!m) return { sent: false, reason: 'email-not-configured' };
-  await m.sendMail({
-    from: process.env.SMTP_FROM || 'Pramana <no-reply@pramana.app>',
-    to,
-    subject: `${inviter} invited you to a Pramana review: ${project}`,
-    html: emailFrame({
-      pretitle: 'Pramana Evidence Synthesis',
-      title: 'You have been invited',
-      body: `<p>${inviter} has invited you to collaborate on the systematic review <b>${project}</b>.</p>
-             <p>Open the shared workspace below to join the review, screen studies, and work with the same live data.</p>`,
-      ctaLabel: 'Open the review',
-      ctaLink: link,
-      note: 'If the button does not open, paste the link above into your browser.'
-    })
+  const subject = `${inviter} invited you to a Pramana review: ${project}`;
+  const html = emailFrame({
+    pretitle: 'Pramana Evidence Synthesis',
+    title: 'You have been invited',
+    body: `<p>${inviter} has invited you to collaborate on the systematic review <b>${project}</b>.</p>
+           <p>Open the shared workspace below to join the review, screen studies, and work with the same live data.</p>`,
+    ctaLabel: 'Open the review',
+    ctaLink: link,
+    note: 'If the button does not open, paste the link above into your browser.'
   });
+  if (apiEmailConfigured()) await sendViaBrevoApi({ to, subject, html });
+  else {
+    const m = getMailer();
+    if (!m) return { sent: false, reason: 'email-not-configured' };
+    await m.sendMail({ from: process.env.SMTP_FROM || 'Pramana <no-reply@pramana.app>', to, subject, html });
+  }
   return { sent: true };
 }
 async function sendResetEmail(to, link) {
-  const m = getMailer();
-  if (!m) return { sent: false, reason: 'email-not-configured' };
-  await m.sendMail({
-    from: process.env.SMTP_FROM || 'Pramana <no-reply@pramana.app>',
-    to,
-    subject: 'Reset your Pramana password',
-    html: emailFrame({
-      pretitle: 'Pramana Evidence Synthesis',
-      title: 'Reset your password',
-      body: `<p>You asked to reset your Pramana password.</p>
-             <p>This link will let you choose a new password and expires in 1 hour.</p>`,
-      ctaLabel: 'Choose a new password',
-      ctaLink: link,
-      note: 'If you did not request this, you can ignore this email.'
-    })
+  const subject = 'Reset your Pramana password';
+  const html = emailFrame({
+    pretitle: 'Pramana Evidence Synthesis',
+    title: 'Reset your password',
+    body: `<p>You asked to reset your Pramana password.</p>
+           <p>This link will let you choose a new password and expires in 1 hour.</p>`,
+    ctaLabel: 'Choose a new password',
+    ctaLink: link,
+    note: 'If you did not request this, you can ignore this email.'
   });
+  if (apiEmailConfigured()) await sendViaBrevoApi({ to, subject, html });
+  else {
+    const m = getMailer();
+    if (!m) return { sent: false, reason: 'email-not-configured' };
+    await m.sendMail({ from: process.env.SMTP_FROM || 'Pramana <no-reply@pramana.app>', to, subject, html });
+  }
   return { sent: true };
 }
 async function sendWelcomeEmail(to, name) {
-  const m = getMailer();
-  if (!m) return { sent: false, reason: 'email-not-configured' };
-  await m.sendMail({
-    from: process.env.SMTP_FROM || 'Pramana <no-reply@pramana.app>',
-    to,
-    subject: 'Welcome to Pramana',
-    html: emailFrame({
-      pretitle: 'Pramana Evidence Synthesis',
-      title: 'Your account is ready',
-      body: `<p>Hello ${name || 'there'},</p>
-             <p>Your Pramana account has been created successfully.</p>
-             <p>You can now create reviews, invite collaborators, screen studies, extract data, and run meta-analysis from the same workspace.</p>`,
-      ctaLabel: 'Open Pramana',
-      ctaLink: APP_URL,
-      note: 'This email confirms that account creation was successful.'
-    })
+  const subject = 'Welcome to Pramana';
+  const html = emailFrame({
+    pretitle: 'Pramana Evidence Synthesis',
+    title: 'Your account is ready',
+    body: `<p>Hello ${name || 'there'},</p>
+           <p>Your Pramana account has been created successfully.</p>
+           <p>You can now create reviews, invite collaborators, screen studies, extract data, and run meta-analysis from the same workspace.</p>`,
+    ctaLabel: 'Open Pramana',
+    ctaLink: APP_URL,
+    note: 'This email confirms that account creation was successful.'
   });
+  if (apiEmailConfigured()) await sendViaBrevoApi({ to, subject, html });
+  else {
+    const m = getMailer();
+    if (!m) return { sent: false, reason: 'email-not-configured' };
+    await m.sendMail({ from: process.env.SMTP_FROM || 'Pramana <no-reply@pramana.app>', to, subject, html });
+  }
   return { sent: true };
 }
 
@@ -471,6 +507,7 @@ app.delete('/api/projects/:id/members/:userId', requireAuth(async (req, res) => 
 app.get('/api/config', (req, res) => res.json({ googleClientId: GOOGLE_CLIENT_ID, emailEnabled: emailConfigured() }));
 app.get('/api/email/status', (req, res) => res.json({
   configured: emailConfigured(),
+  transport: emailState.transport,
   lastEvent: emailState.lastEvent,
   lastError: emailState.lastError,
   lastAttemptAt: emailState.lastAttemptAt,
