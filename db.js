@@ -8,9 +8,15 @@ const { Pool } = require('pg');
 let pool = null;
 function getPool() {
   if (!pool) {
+    const connectionString = process.env.DATABASE_URL;
+    if (!connectionString) {
+      throw new Error(
+        'DATABASE_URL is missing. In Railway, open the pramana-server service, add the Postgres service variable DATABASE_URL, then redeploy.'
+      );
+    }
     pool = new Pool({
-      connectionString: process.env.DATABASE_URL,
-      ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('localhost')
+      connectionString,
+      ssl: connectionString.includes('localhost')
         ? false : { rejectUnauthorized: false }
     });
   }
