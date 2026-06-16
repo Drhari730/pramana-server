@@ -68,15 +68,53 @@ async function memberRole(projectId, userId) {
 /* ---------------- email (Brevo via nodemailer SMTP) ---------------- */
 const nodemailer = require('nodemailer');
 let mailer = null;
+function hasRealValue(v) {
+  if (!v) return false;
+  const s = String(v).trim().toLowerCase();
+  return !!s && !s.includes('your-brevo') && !s.includes('example.com') && !s.includes('paste-a-long-random');
+}
+function emailConfigured() {
+  return hasRealValue(process.env.SMTP_HOST) &&
+    hasRealValue(process.env.SMTP_PORT) &&
+    hasRealValue(process.env.SMTP_USER) &&
+    hasRealValue(process.env.SMTP_PASS) &&
+    hasRealValue(process.env.SMTP_FROM);
+}
 function getMailer() {
   if (mailer) return mailer;
-  if (!process.env.SMTP_HOST) return null;   // email disabled if not configured
+  if (!emailConfigured()) return null;   // email disabled if not configured
   mailer = nodemailer.createTransport({
     host: process.env.SMTP_HOST,
     port: parseInt(process.env.SMTP_PORT || '587'),
-    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS }
+    auth: { user: process.env.SMTP_USER, pass: process.env.SMTP_PASS },
+    connectionTimeout: 10000,
+    greetingTimeout: 10000,
+    socketTimeout: 15000
   });
   return mailer;
+}
+async function withTimeout(label, promise, ms) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(label + ' timed out after ' + ms + 'ms')), ms);
+      })
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+function queueEmail(label, fn) {
+  setTimeout(async () => {
+    try {
+      await withTimeout(label, fn(), 15000);
+      console.log(label + ' sent');
+    } catch (e) {
+      console.error(label + ' failed:', e.message);
+    }
+  }, 0);
 }
 function emailFrame({ pretitle, title, body, ctaLabel, ctaLink, note }) {
   return `<!doctype html>
@@ -184,9 +222,9 @@ app.post('/api/auth/register', async (req, res) => {
   await db.q('INSERT INTO users (id,email,name,password_hash) VALUES ($1,$2,$3,$4)', [id, email.toLowerCase(), name || email.split('@')[0], hash]);
   const user = { id, email: email.toLowerCase(), name: name || email.split('@')[0] };
   await autoAcceptInvites(user);
-  try { await sendWelcomeEmail(user.email, user.name); } catch (e) { console.error('Welcome email failed:', e.message); }
   setAuthCookie(res, user);
-  res.json({ user });
+  if (emailConfigured()) queueEmail('Welcome email', () => sendWelcomeEmail(user.email, user.name));
+  res.json({ user, welcomeEmailQueued: emailConfigured() });
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -245,10 +283,10 @@ app.post('/api/auth/forgot', async (req, res) => {
     const expires = new Date(Date.now() + 60 * 60 * 1000).toISOString();
     await db.q('INSERT INTO password_resets (token,user_id,expires_at) VALUES ($1,$2,$3)', [token, u.id, expires]);
     link = `${APP_URL}/?reset=${token}`;
-    try { await sendResetEmail(email, link); } catch (e) { console.error('Reset email failed:', e.message); }
+    if (emailConfigured()) queueEmail('Reset email', () => sendResetEmail(email, link));
   }
   // If email isn't configured, return the link so it can be shown on screen (testing/no-Brevo case).
-  const emailEnabled = !!process.env.SMTP_HOST;
+  const emailEnabled = emailConfigured();
   res.json({ ok: true, devLink: (!emailEnabled && link) ? link : undefined });
 });
 
@@ -369,17 +407,18 @@ app.post('/api/projects/:id/invite', requireAuth(async (req, res) => {
   const link = `${APP_URL}/?invite=${token}`;
   let mail = { sent: false };
   if (!existing[0]) {
-    try {
-      mail = await sendInviteEmail(normalizedEmail, (proj[0]||{}).title || 'review', link, req.user.name || req.user.email);
-    } catch (e) {
-      console.error('Invite email failed:', e.message);
-      mail = { sent: false, reason: e.message };
+    if (emailConfigured()) {
+      queueEmail('Invite email', () => sendInviteEmail(normalizedEmail, (proj[0]||{}).title || 'review', link, req.user.name || req.user.email));
+      mail = { sent: true, queued: true };
+    } else {
+      mail = { sent: false, reason: 'email-not-configured' };
     }
   }
   res.json({
     ok: true,
     link,
     emailed: mail.sent,
+    emailQueued: !!mail.queued,
     alreadyUser: !!existing[0],
     pendingAlreadyExists: !!existingPending[0],
     emailError: mail.sent ? undefined : mail.reason
@@ -403,7 +442,7 @@ app.delete('/api/projects/:id/members/:userId', requireAuth(async (req, res) => 
 }));
 
 /* ---------------- config + static ---------------- */
-app.get('/api/config', (req, res) => res.json({ googleClientId: GOOGLE_CLIENT_ID, emailEnabled: !!process.env.SMTP_HOST }));
+app.get('/api/config', (req, res) => res.json({ googleClientId: GOOGLE_CLIENT_ID, emailEnabled: emailConfigured() }));
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('*', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
 

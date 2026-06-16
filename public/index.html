@@ -18,7 +18,7 @@
   --exc:#dc2626; --exc-w:#fee2e2;
   --maybe:#d97706; --maybe-w:#fef3c7;
   --r:10px; --r2:14px;
-  --ff:'Inter',-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+  --ff:'Aptos','Segoe UI',Roboto,Helvetica,Arial,sans-serif;
   --fm:'SF Mono',ui-monospace,'Cascadia Code','Roboto Mono',Menlo,Consolas,monospace;
   --sh:0 1px 2px rgba(15,23,41,.05),0 4px 16px rgba(15,23,41,.06);
   --sh2:0 12px 40px rgba(15,23,41,.16);
@@ -3127,9 +3127,19 @@ window.bmFilter=bmFilter;window.bmDecide=bmDecide;window.batchExport=batchExport
    Mode is auto-detected at boot by probing /api/config. */
 const BK = {
   mode:'local', user:null, config:{}, version:null, role:null, _pendingInvite:null,
-  async api(method, path, body){
-    const r = await fetch(path, {method, headers:{'Content-Type':'application/json'},
-      credentials:'same-origin', body: body?JSON.stringify(body):undefined});
+  async api(method, path, body, timeoutMs){
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 20000);
+    let r;
+    try{
+      r = await fetch(path, {method, headers:{'Content-Type':'application/json'},
+        credentials:'same-origin', body: body?JSON.stringify(body):undefined, signal: ctrl.signal});
+    }catch(e){
+      clearTimeout(timer);
+      if(e && e.name==='AbortError') throw new Error('The server took too long to respond. Please try again.');
+      throw e;
+    }
+    clearTimeout(timer);
     let j={}; try{ j = await r.json(); }catch(e){}
     if(!r.ok){ const err=new Error(j.error||('HTTP '+r.status)); err.status=r.status; err.body=j; throw err; }
     return j;
@@ -3177,7 +3187,49 @@ function showAuthScreen(){
     </div>
     <div class="muted" style="text-align:center;margin-top:14px;font-size:11.5px">${BK._pendingInvite?'You were invited to a review — log in or sign up to join it.':'Your reviews are saved to your account and shared with collaborators you invite.'}</div>
   </div>`;
+  el.innerHTML = renderAuthMarkup(g);
   if(g) initGoogle();
+}
+function renderAuthMarkup(g){
+  return `<div style="width:100%;max-width:1080px;display:grid;grid-template-columns:minmax(0,1.15fr) minmax(360px,430px);gap:28px;align-items:center">
+    <section style="padding-right:8px">
+      <div style="display:inline-flex;align-items:center;gap:10px;padding:8px 14px;border-radius:999px;background:rgba(255,255,255,.78);border:1px solid #dbe4f2;color:#3657d6;font-size:11px;font-weight:700;letter-spacing:.08em;text-transform:uppercase">Pramana Evidence Synthesis</div>
+      <h1 style="font-size:52px;line-height:1.02;letter-spacing:-.04em;margin:18px 0 14px;color:#10213a;max-width:640px">Systematic reviews, screening, extraction, and meta-analysis in one shared workspace.</h1>
+      <p style="font-size:18px;line-height:1.65;color:#4d627c;max-width:650px;margin:0 0 20px">Built for review teams who need a practical workflow from protocol to PRISMA. Create a review, invite collaborators, screen studies live, extract data, and keep one current version of the evidence.</p>
+      <div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;max-width:720px;margin:22px 0 20px">
+        <div style="background:rgba(255,255,255,.82);border:1px solid #dbe4f2;border-radius:16px;padding:18px">
+          <div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">How to use</div>
+          <div style="font-size:14px;line-height:1.6;color:#24384f">Create an account, open a review, import studies, screen records, extract outcomes, run the synthesis, and share the same project with your team.</div>
+        </div>
+        <div style="background:rgba(255,255,255,.82);border:1px solid #dbe4f2;border-radius:16px;padding:18px">
+          <div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Privacy</div>
+          <div style="font-size:14px;line-height:1.6;color:#24384f">Project data stays inside your hosted workspace. Team access is controlled by invites, and password resets use one-time links.</div>
+        </div>
+      </div>
+      <div style="display:flex;flex-wrap:wrap;gap:12px;margin-top:18px">
+        <div style="padding:12px 14px;border-radius:14px;background:#fff;border:1px solid #dbe4f2;min-width:180px"><div style="font-size:12px;color:#73859d;text-transform:uppercase;letter-spacing:.08em;font-weight:700">Developed by</div><div style="font-size:16px;font-weight:800;color:#10213a;margin-top:4px">Dr G Hari Prakash</div></div>
+        <div style="padding:12px 14px;border-radius:14px;background:#fff;border:1px solid #dbe4f2;min-width:180px"><div style="font-size:12px;color:#73859d;text-transform:uppercase;letter-spacing:.08em;font-weight:700">Team</div><div style="font-size:16px;font-weight:800;color:#10213a;margin-top:4px">Stat Studio India</div></div>
+      </div>
+    </section>
+    <section>
+      <div style="text-align:center;margin-bottom:18px">
+        <div class="mk" style="width:52px;height:52px;font-size:24px;margin:0 auto 12px">P</div>
+        <h2 style="font-size:30px;font-weight:800;letter-spacing:-.03em;margin:0;color:#10213a">Pramana</h2>
+        <div class="muted" style="font-size:14px">Secure account access for live review collaboration</div>
+      </div>
+      <div class="card" style="margin:0;padding:26px;border-radius:20px">
+        <div class="seg" style="width:100%;margin-bottom:16px"><button id="au-tl" class="on" style="flex:1" onclick="authTab('login')">Log in</button><button id="au-tr" style="flex:1" onclick="authTab('reg')">Create account</button></div>
+        <div id="au-err" class="banner warn" style="display:none;margin-bottom:12px"><span class="bi">!</span><div id="au-err-t"></div></div>
+        <div class="fg" id="au-name-fg" style="display:none"><label class="fl">Name</label><input class="inp" id="au-name" placeholder="Dr G Hari Prakash"></div>
+        <div class="fg"><label class="fl">Email</label><input class="inp" id="au-email" type="email" placeholder="you@institution.edu"></div>
+        <div class="fg"><label class="fl">Password</label><input class="inp" id="au-pass" type="password" placeholder="At least 6 characters" onkeydown="if(event.key==='Enter')authSubmit()"></div>
+        <div id="au-forgot" style="text-align:right;margin:-6px 0 10px"><a href="#" onclick="showForgot();return false" style="font-size:11.5px;color:var(--syn);text-decoration:none">Forgot password?</a></div>
+        <button class="btn" style="width:100%;justify-content:center" id="au-submit" onclick="authSubmit()">Log in</button>
+        ${g?`<div style="text-align:center;margin:14px 0;color:var(--t3);font-size:12px">or</div><div id="gbtn"></div>`:''}
+      </div>
+      <div class="muted" style="text-align:center;margin-top:14px;font-size:12px">${BK._pendingInvite?'You were invited to a review. Log in or create an account to join it.':'Your reviews are stored in your account and shared only with collaborators you invite.'}</div>
+    </section>
+  </div>`;
 }
 let AUTH_TAB='login';
 function authTab(t){ AUTH_TAB=t;
@@ -3264,6 +3316,70 @@ async function submitReset(){
     await afterLogin();
   }catch(e){ const eb=document.getElementById('rs-err'); eb.style.display=''; document.getElementById('rs-err-t').textContent=e.message; btn.disabled=false; btn.textContent='Set new password & log in'; }
 }
+async function authSubmitEnhanced(){
+  hideAuthErr();
+  const email=document.getElementById('au-email').value.trim();
+  const pass=document.getElementById('au-pass').value;
+  const name=(document.getElementById('au-name')||{}).value;
+  const btn=document.getElementById('au-submit');
+  btn.disabled=true;
+  btn.textContent=AUTH_TAB==='reg'?'Creating account...':'Signing in...';
+  try{
+    const path = AUTH_TAB==='reg'?'/api/auth/register':'/api/auth/login';
+    const r = await BK.api('POST', path, AUTH_TAB==='reg'?{email,name,password:pass}:{email,password:pass}, 15000);
+    BK.user=r.user;
+    await afterLogin();
+    if(AUTH_TAB==='reg') toast(r.welcomeEmailQueued?'Account created. Welcome email queued.':'Account created. You can start your review now.','ok');
+  }catch(e){
+    showAuthErr(e.message);
+    btn.disabled=false;
+    btn.textContent=AUTH_TAB==='reg'?'Create account':'Log in';
+  }
+}
+async function submitForgotEnhanced(){
+  const email=document.getElementById('fp-email').value.trim();
+  const btn=document.getElementById('fp-submit');
+  btn.disabled=true;
+  btn.textContent='Sending...';
+  try{
+    const r=await BK.api('POST','/api/auth/forgot',{email},15000);
+    const okb=document.getElementById('fp-ok'); okb.style.display='';
+    if(r.devLink){
+      document.getElementById('fp-ok-t').innerHTML='Email is not configured on this server, so use this reset link directly:<br><a href="'+esc(r.devLink)+'" style="word-break:break-all;font-size:11px">'+esc(r.devLink)+'</a>';
+    }else{
+      document.getElementById('fp-ok-t').textContent='If an account exists for '+email+', a reset link has been queued. Check your inbox and spam folder.';
+    }
+    btn.style.display='none';
+  }catch(e){
+    const eb=document.getElementById('fp-err');
+    eb.style.display='';
+    document.getElementById('fp-err-t').textContent=e.message;
+    btn.disabled=false;
+    btn.textContent='Send reset link';
+  }
+}
+async function submitResetEnhanced(){
+  const pass=document.getElementById('rs-pass').value;
+  const btn=document.getElementById('rs-submit');
+  btn.disabled=true;
+  btn.textContent='Updating password...';
+  try{
+    const r=await BK.api('POST','/api/auth/reset',{token:RESET_TOKEN,password:pass},15000);
+    BK.user=r.user;
+    try{history.replaceState({},'',location.pathname);}catch(e){}
+    toast('Password updated. You are logged in.','ok');
+    await afterLogin();
+  }catch(e){
+    const eb=document.getElementById('rs-err');
+    eb.style.display='';
+    document.getElementById('rs-err-t').textContent=e.message;
+    btn.disabled=false;
+    btn.textContent='Set new password & log in';
+  }
+}
+authSubmit = authSubmitEnhanced;
+submitForgot = submitForgotEnhanced;
+submitReset = submitResetEnhanced;
 window.showForgot=showForgot;window.submitForgot=submitForgot;window.showResetScreen=showResetScreen;window.submitReset=submitReset;
 function initGoogle(){
   if(document.getElementById('gsi-script')){ renderGoogleBtn(); return; }
@@ -3408,6 +3524,26 @@ async function sendInvite(){
 async function removeMember(uid){ if(!confirm('Remove this person from the project?'))return;
   try{ await BK.api('DELETE','/api/projects/'+ST.id+'/members/'+uid); loadMembers(); }catch(e){ toast(e.message,'err'); } }
 window.inviteCollabModal=inviteCollabModal;window.sendInvite=sendInvite;window.removeMember=removeMember;window.loadMembers=loadMembers;
+async function sendInviteEnhanced(){
+  const email=document.getElementById('inv-email').value.trim();
+  const role=document.getElementById('inv-role').value;
+  if(!email){ toast('Enter an email','err'); return; }
+  try{
+    const r=await BK.api('POST','/api/projects/'+ST.id+'/invite',{email,role},15000);
+    const out=document.getElementById('inv-result');
+    let msg='';
+    if(r.emailQueued) msg='Invite email queued for '+esc(email)+'. ';
+    else if(r.alreadyUser) msg='Added '+esc(email)+' because they already have an account. ';
+    else if(r.pendingAlreadyExists) msg='An invite for '+esc(email)+' is already pending. ';
+    else if(r.emailError) msg='Invite created, but the email could not be sent from the server. ';
+    else msg='Invite created. ';
+    out.innerHTML = '✓ '+msg+'Share this link if needed:<br><code style="font-size:11px;word-break:break-all">'+esc(r.link)+'</code>';
+    document.getElementById('inv-email').value='';
+    loadMembers();
+  }catch(e){ toast(e.message,'err'); }
+}
+sendInvite = sendInviteEnhanced;
+window.sendInvite = sendInvite;
 
 function renderHomeServer(){
   const home=document.getElementById('home');
