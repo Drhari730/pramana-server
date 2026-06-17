@@ -901,31 +901,31 @@ Return ONLY JSON:
 
     // 2. Reviewer persona
     setStep(1,'run');
-    const persPrompt=`Write a concise expert-reviewer PERSONA + standing instructions for an AI agent that will screen titles/abstracts for THIS review, as if it were a senior systematic reviewer specialised in: ${dom.domain}.
+    const persPrompt=`Write a concise expert-reviewer PERSONA + standing instructions for an AI agent that will screen titles/abstracts and full texts for THIS review, as if it were a senior systematic-review methods panel specialised in: ${dom.domain}.
 ${reviewCtx}
 QUESTION: ${p.question}
 FRAMEWORK VALUES — 1:${p.p}|2:${p.i}|3:${p.c}|4:${p.o}
 INCLUSION: ${p.inc||'must match PICO'}
 EXCLUSION: ${p.exc||'outside PICO'}
-Return ONLY JSON: {"persona":"<120-180 words, second person, methodologically rigorous, Cochrane/JBI-aligned, names the specific expertise needed and the default behaviour on uncertainty>"}`;
+Return ONLY JSON: {"persona":"<150-220 words, second person, methodologically rigorous, Cochrane/JBI/PRISMA-aligned, names the specific expertise needed, states that title/abstract uncertainty should become MAYBE rather than false exclusion, and says full-text exclusion needs an explicit reason>"}`;
     ST.agent.persona=(parseJSON(await LLM(persPrompt,700)).persona)||'';
     setStep(1,'done');await sleep(150);
 
     // 3. Decision rubric
     setStep(2,'run');
-    const rubPrompt=`Create a precise INCLUDE/EXCLUDE decision rubric for screeners of this review. 
+    const rubPrompt=`Create a precise INCLUDE/EXCLUDE/MAYBE decision rubric for expert screeners of this review. 
 ${reviewCtx}
 QUESTION:${p.question}; FRAMEWORK 1:${p.p}|2:${p.i}|3:${p.c}|4:${p.o}; INC:${p.inc}; EXC:${p.exc}
-Return ONLY JSON: {"rubric":[ "<6-9 short, testable decision rules; each starts with INCLUDE if / EXCLUDE if / MAYBE if>" ]}`;
+Return ONLY JSON: {"rubric":[ "<8-12 short, testable decision rules; include hard-exclude rules, uncertainty/MAYBE rules for incomplete abstracts, and full-text exclusion categories; each starts with INCLUDE if / EXCLUDE if / MAYBE if>" ]}`;
     ST.agent.rubric=(parseJSON(await LLM(rubPrompt,800)).rubric)||[];
     setStep(2,'done');await sleep(150);
 
     // 4. Synthetic gold standard
     setStep(3,'run');
-    const goldPrompt=`Generate a calibration test set of 8 realistic study ABSTRACTS for this review — a mix that a careful reviewer would clearly INCLUDE or EXCLUDE, plus 2 genuinely borderline ones, with the correct label.
+    const goldPrompt=`Generate a rigorous calibration test set of 14 realistic study ABSTRACTS for this review: clear includes, hard excludes, near-miss excludes, and genuinely borderline abstracts that should be MAYBE for full-text review.
 ${reviewCtx}
 QUESTION:${p.question}; FRAMEWORK 1:${p.p}|2:${p.i}|3:${p.c}|4:${p.o}; INC:${p.inc}; EXC:${p.exc}
-Return ONLY JSON: {"cases":[{"title":"...","abstract":"2-3 sentences","gold":"include|exclude","why":"short"}]}`;
+Return ONLY JSON: {"cases":[{"title":"...","abstract":"2-4 sentences","gold":"include|exclude|maybe","why":"short"}]}`;
     const gold=(parseJSON(await LLM(goldPrompt,1600)).cases)||[];
     setStep(3,'done');await sleep(150);
 
@@ -934,8 +934,8 @@ Return ONLY JSON: {"cases":[{"title":"...","abstract":"2-3 sentences","gold":"in
     let correct=0,details=[];
     for(const g of gold){
       try{
-        const v=parseJSON(await LLM(buildScreenPrompt(g.title,g.abstract,'calibration'),300));
-        const pred=(v.v||'').toLowerCase().includes('inc')?'include':'exclude';
+        const v=parseJSON(await LLM(buildScreenPrompt(g.title,g.abstract,'calibration'),350));
+        const pred=normDecision(v.v);
         const ok=pred===g.gold;if(ok)correct++;
         details.push({title:g.title,gold:g.gold,pred,ok});
       }catch(e){details.push({title:g.title,gold:g.gold,pred:'error',ok:false})}
@@ -1069,6 +1069,7 @@ function renderAgents(){
         <div style="margin-top:8px">
           <span class="pill s">Model: ${MODELS[a.model].label}</span>
           <span class="pill f">Advanced: ${MODELS[a.advModel].label}</span>
+          ${(a.corrections&&a.corrections.length)?`<span class="pill s">learned ${a.corrections.length} expert corrections</span>`:''}
         </div>
       </div>
       ${cal?`<div style="text-align:center">
@@ -1607,12 +1608,22 @@ function logAIDiscrepancy(stage,r,prev,human){
   ST.agent=ST.agent||{};ST.agent.corrections=ST.agent.corrections||[];
   ST.agent.corrections.push(item);
   ST.agent.corrections=ST.agent.corrections.slice(-30);
+  ST.agent.adaptedAt=item.at;
   return true;
 }
 function correctionMemory(stage){
   const rows=(ST.agent&&ST.agent.corrections||[]).filter(x=>!stage||x.stage===stage).slice(-8);
   if(!rows.length)return '';
-  return '\nHUMAN CORRECTIONS TO LEARN FROM:\n'+rows.map((x,i)=>`${i+1}. ${x.title||'Study'}: Viveka said ${x.aiDecision}; human reviewer changed to ${x.humanDecision}. Prior reason: ${x.aiReason||'not recorded'}`).join('\n')+'\n';
+  return '\nHUMAN CORRECTIONS / ACTIVE-LEARNING LESSONS:\n'
+    +'Use these as reviewer feedback. Do not repeat the same mistake pattern; apply the correction only when the current study is substantively similar.\n'
+    +rows.map((x,i)=>`${i+1}. ${x.title||'Study'}: prior AI said ${x.aiDecision}; human expert changed to ${x.humanDecision}. Prior reason: ${x.aiReason||'not recorded'}`).join('\n')+'\n';
+}
+function normDecision(v){
+  v=(v||'').toString().toLowerCase();
+  if(v.includes('inc'))return 'include';
+  if(v.includes('may')||v.includes('unclear')||v.includes('border'))return 'maybe';
+  if(v.includes('exc'))return 'exclude';
+  return 'maybe';
 }
 let _localRetrainT=null;
 function scheduleLocalRetrain(){
@@ -1630,7 +1641,12 @@ function buildScreenPrompt(title,abstract,mode){
   const reviewCtx=buildReviewContext(p);
   return`${persona}
 
-You are screening a title/abstract for this systematic review. Strictness: ${strict} (when unsure, ${strict==='strict'?'lean EXCLUDE':strict==='lenient'?'lean INCLUDE for full-text check':'mark MAYBE'}).
+You are screening a title/abstract for this systematic review. Act like a careful dual-reviewer panel:
+- First judge Population, concept/intervention/exposure, comparator/context, outcome, and study design separately.
+- Then make the final decision.
+- In title/abstract screening, avoid false exclusions. If the abstract is incomplete but plausibly eligible, choose "maybe" for human/full-text review.
+- Only exclude when a clear exclusion rule is met.
+Strictness: ${strict} (when unsure, ${strict==='strict'?'lean EXCLUDE only if a clear exclusion is present':strict==='lenient'?'lean INCLUDE/MAYBE for full-text check':'mark MAYBE'}).
 
 ${reviewCtx}
 QUESTION: ${p.question}
@@ -1647,15 +1663,14 @@ Title: ${title}
 Abstract: ${abstract||'(no abstract available)'}
 
 Decide. Return ONLY JSON:
-{"v":"include|exclude|maybe","conf":0-100,"reason":"<one clause>","pico":{"p":true/false,"i":true/false,"o":true/false}}`;
+{"v":"include|exclude|maybe","conf":0-100,"reason":"<specific one-clause eligibility rationale>","pico":{"p":true/false,"i":true/false,"o":true/false}}`;
 }
 async function screenOne(id,useAdv){
   const r=ST.refs.find(x=>x.id===id);if(!r)return;
   const started=Date.now();
   const model=useAdv?ST.agent.advModel:ST.agent.model;
   const res=parseJSON(await LLM(buildScreenPrompt(r.title,r.abstract,'screen'),320,model));
-  const v=(res.v||'maybe').toLowerCase();
-  const dec=v.includes('inc')?'include':v.includes('exc')?'exclude':'maybe';
+  const dec=normDecision(res.v);
   r.ta={a:dec,b:null,final:dec,conf:res.conf||50,reason:res.reason||'',comment:(r.ta&&r.ta.comment)||'',pico:res.pico||{},by:'agent',model,reviewer:'Viveka',reviewedAt:new Date().toISOString(),ms:Date.now()-started};
   return r;
 }
@@ -1778,7 +1793,14 @@ function renderLLMControls(){
    Model is stored locally in ST.engine and reused across sessions.        */
 const STOP=new Set(('the a an and or of in to for with on at by is are was were be been being this that these those we our us study studies result results method methods background conclusion conclusions aim aims objective objectives using used use also from as it its their which who whom between among versus vs than then more most less can may might will shall not no but however thus therefore can could would should has have had do does did such into over under out up down about after before during per via both each either neither all any some many few one two three new also based show shown showed found compared comparison group groups patient patients trial paper article review report data analysis significant significantly associated association effect effects outcome outcomes').split(' '));
 function lstem(w){return w.replace(/(ational|ization|iveness|fulness)$/,'').replace(/(ies)$/,'y').replace(/(ing|edly|edness|ed|ly|es|s)$/,'').replace(/(.)\1$/,'$1');}
-function ltok(s){return (s||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/).filter(w=>w.length>2&&w.length<25&&!STOP.has(w)&&!/^\d+$/.test(w)).map(lstem).filter(w=>w.length>2);}
+function ltok(s){
+  const base=(s||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/)
+    .filter(w=>w.length>2&&w.length<25&&!STOP.has(w)&&!/^\d+$/.test(w)).map(lstem).filter(w=>w.length>2);
+  const out=base.slice();
+  for(let i=0;i<base.length-1;i++)out.push(base[i]+'_'+base[i+1]);
+  for(let i=0;i<base.length-2;i++)out.push(base[i]+'_'+base[i+1]+'_'+base[i+2]);
+  return out;
+}
 function docText(r){return (r.title||'')+' '+(r.title||'')+' '+(r.abstract||'');} // title weighted x2
 
 function buildVocab(docs){
@@ -1834,13 +1856,13 @@ function recallThreshold(samples,eng,target){
   const pos=samples.filter(s=>s.y===1).map(s=>localProbability(s.v,eng)).sort((a,b)=>a-b);
   if(pos.length<3)return 0.35;
   const ix=Math.max(0,Math.min(pos.length-1,Math.floor(pos.length*(1-(target||0.95)))));
-  return Math.max(0.18,Math.min(0.35,pos[ix]));
+  return Math.max(0.12,Math.min(0.45,pos[ix]));
 }
 
 function localTrainable(){
   const lab=ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.by==='human'&&(r.ta.final==='include'||r.ta.final==='exclude'));
   const inc=lab.filter(r=>r.ta.final==='include').length,exc=lab.filter(r=>r.ta.final==='exclude').length;
-  return {inc,exc,total:lab.length,ok:inc>=3&&exc>=3};
+  return {inc,exc,total:lab.length,ok:inc>=5&&exc>=5};
 }
 function crossValLocal(samples,dim){
   const k=Math.min(5,Math.floor(samples.length/2));
@@ -1852,7 +1874,9 @@ function crossValLocal(samples,dim){
     const tr=[],te=[];samples.forEach((s,i)=>{(test.has(i)?te:tr).push(s);});
     if(!tr.some(s=>s.y===1)||!tr.some(s=>s.y===0))continue;
     const m=trainLR(tr.map(s=>({v:s.v,y:s.y})),dim,220);
-    te.forEach(s=>{const p=lrPredict(s.v,m)>=0.5?1:0;
+    const tmp={w:m.w,b:m.b,incCentroid:centroid(tr,1),excCentroid:centroid(tr,0)};
+    const thr=recallThreshold(tr,tmp,0.97);
+    te.forEach(s=>{const p=localProbability(s.v,tmp)>=thr?1:0;
       if(s.y===1&&p===1)tp++;else if(s.y===0&&p===1)fp++;else if(s.y===1&&p===0)fn++;else tn++;});
   }
   const recall=tp+fn?tp/(tp+fn):0,prec=tp+fp?tp/(tp+fp):0;
@@ -1877,7 +1901,7 @@ function trainLocalEngine(){
   let correct=0;samples.forEach(s=>{if((lrPredict(s.v,model)>=0.5?1:0)===s.y)correct++;});
   const incCentroid=centroid(samples,1),excCentroid=centroid(samples,0);
   const tmpEngine={vocab:eng.vocab,vidx:eng.vidx,idf:eng.idf,w:model.w,b:model.b,incCentroid,excCentroid};
-  const autoThr=recallThreshold(samples,tmpEngine,0.95);
+  const autoThr=recallThreshold(samples,tmpEngine,0.97);
   ST.settings.localThr=autoThr;
   if(ST.settings.localMaybeBand==null)ST.settings.localMaybeBand=0.08;
   ST.engine={vocab:eng.vocab,vidx:eng.vidx,idf:eng.idf,w:model.w,b:model.b,
@@ -1929,9 +1953,10 @@ function setLocalPreset(kind){
   if(ST.engine)scoreAllLocal();
   saveSoon();renderScreen();
 }
-function activeLearningQueue(n){ // most-uncertain unlabelled (prob near 0.5)
+function activeLearningQueue(n){ // most-uncertain unlabelled (prob near the active include threshold)
+  const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
   return titleAbstractScopeRefs().filter(r=>r.ta&&r.ta.by==='local')
-    .map(r=>({r,u:Math.abs((r.ta.prob||.5)-0.5)})).sort((a,b)=>a.u-b.u).slice(0,n||15).map(o=>o.r.id);
+    .map(r=>({r,u:Math.abs((r.ta.prob||.5)-thr)})).sort((a,b)=>a.u-b.u).slice(0,n||20).map(o=>o.r.id);
 }
 let SEED_MODE=false;
 function startSeeding(){SEED_MODE=true;SCREEN_FILTER='pending';renderScreen();toast('Label papers below with ✓ / ✗ to build the seed','ok');}
@@ -1941,7 +1966,7 @@ async function vivekaSeed(){ // optional: one small LLM batch to seed labels
   if(!pend.length){toast('No unlabelled papers to seed from','err');return;}
   agentBusy(true);const bar=document.getElementById('seed-bar');let done=0;
   for(const r of pend){try{const res=parseJSON(await LLM(buildScreenPrompt(r.title,r.abstract,'seed'),300));
-    const v=(res.v||'').toLowerCase();r.ta={a:v.includes('inc')?'include':'exclude',final:v.includes('inc')?'include':'exclude',conf:res.conf||60,reason:'seed label (Viveka): '+(res.reason||''),by:'human',seeded:true};
+    const dec=normDecision(res.v);r.ta={a:dec,final:dec,conf:res.conf||60,reason:'seed label (Viveka): '+(res.reason||''),by:'human',seeded:true};
   }catch(e){}done++;if(bar)bar.style.width=Math.round(done/pend.length*100)+'%';if(done%5===0)renderScreenStats();}
   agentBusy(false);save();renderScreen();toast('Viveka labelled '+done+' seed papers — now train the local engine','ok');
 }
@@ -1951,10 +1976,10 @@ function renderLocalControls(){
   return `<div class="card tight" style="margin-bottom:14px">
     <div class="card-h">⚙ Viveka Local <span class="muted" style="font-weight:500">— in-browser screening engine</span> <span class="tag">${eng?'trained':'not trained'}</span></div>
     <div class="banner info" style="margin-bottom:12px"><span class="bi">ⓘ</span><div>
-      <b>How this works:</b> label a small seed (15-25 includes + excludes), then <b>Train</b>. The engine learns with a high-recall TF-IDF ensemble and scores every other paper <b>free, in your browser</b> - no tokens. Borderline papers become <b>Maybe</b> for human review instead of being silently excluded.</div></div>
+      <b>How this works:</b> label a balanced seed (at least 5 includes and 5 excludes; ideally 20-40 total), then <b>Train</b>. The engine learns with a high-recall TF-IDF phrase ensemble and scores every other paper <b>free, in your browser</b> - no tokens. Borderline papers become <b>Maybe</b> for human review instead of being silently excluded.</div></div>
     <div class="row" style="margin-bottom:10px">
-      <span class="pill ${t.inc>=3?'f':''}">${t.inc} includes labelled</span>
-      <span class="pill ${t.exc>=3?'f':''}">${t.exc} excludes labelled</span>
+      <span class="pill ${t.inc>=5?'f':''}">${t.inc} includes labelled</span>
+      <span class="pill ${t.exc>=5?'f':''}">${t.exc} excludes labelled</span>
       ${eng?`<span class="pill s">seed ${eng.seedN} · ${eng.val?('cross-val recall '+eng.val.recall+'% · prec '+eng.val.prec+'%'):('resub '+eng.trainAcc+'%')} · scored ${scored}</span>`:''}
     </div>
     <div class="row">
@@ -1967,7 +1992,7 @@ function renderLocalControls(){
     ${eng?`<div class="divider"></div>
     <div class="row"><label class="fl" style="margin:0">Include threshold <b id="thr-val">${Math.round(thr*100)}%</b></label>
       <input type="range" min="0.1" max="0.8" step="0.01" value="${thr}" style="flex:1;max-width:280px" oninput="reThreshold(this.value)">
-      <span class="muted">lower = more sensitive; 30-35% is the usual screening range</span></div>
+      <span class="muted">lower = more sensitive; auto threshold targets high recall</span></div>
     <div class="row" style="margin-top:8px">
       <button class="btn gh sm" onclick="setLocalPreset('high')">High recall 25%</button>
       <button class="btn gh sm" onclick="setLocalPreset('balanced')">Balanced 35%</button>
@@ -2190,8 +2215,9 @@ EXCLUDE if: ${p.exc}
 ${correctionMemory('ft')}
 STUDY: ${r.title}
 ${ctx}
-Return ONLY JSON: {"v":"include|exclude","reason":"<clause>","excl_cat":"<if exclude: wrong population|wrong intervention|wrong comparator|wrong outcome|wrong design|no usable data|other>"}`,400,ST.agent.advModel));
-    r.ft=r.ft||{};r.ft.decision=(res.v||'').includes('inc')?'include':'exclude';
+Assess as a full-text eligibility reviewer. Use the full paper text when available; if only an abstract is available, be cautious and choose include unless a clear exclusion is present. Exclusion must name the single strongest PRISMA reason.
+Return ONLY JSON: {"v":"include|exclude|maybe","reason":"<specific full-text eligibility rationale>","excl_cat":"<if exclude: wrong population|wrong intervention|wrong comparator|wrong outcome|wrong design|no usable data|other>"}`,450,ST.agent.advModel));
+    r.ft=r.ft||{};r.ft.decision=normDecision(res.v);
     r.ft.reason=res.reason;r.ft.exclCat=res.excl_cat||'';r.ft.by='agent';r.ft.model=ST.agent.advModel;r.ft.reviewer='Viveka';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';r.ft.ms=Date.now()-started;
     if(!silent){save();renderFulltext();renderSpine();}
   }catch(e){toast(e.message,'err')}
