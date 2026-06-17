@@ -15,6 +15,7 @@
      POST /api/projects/:id/invite  {email,role}       owner/editor; emails a link
      POST /api/invites/accept  {token}                 join a project (must be logged in)
      DELETE /api/projects/:id/members/:userId          remove a member (owner)
+     POST /api/ai/generate     {prompt,maxTok,model}   server-side AI proxy
    Static: serves the front-end (index.html) from ./public
    ============================================================ */
 const path = require('path');
@@ -28,6 +29,16 @@ const db = require('./db');
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-change-me';
 const APP_URL = process.env.APP_URL || 'http://localhost:3000';
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const AI_KEYS = {
+  'gemini-flash': process.env.GEMINI_API_KEY || process.env.GOOGLE_AI_API_KEY || '',
+  'gpt4o-mini': process.env.OPENAI_API_KEY || '',
+  'claude-haiku': process.env.ANTHROPIC_API_KEY || '',
+  deepseek: process.env.DEEPSEEK_API_KEY || '',
+  'zai-glm': process.env.ZAI_API_KEY || ''
+};
+function aiServerEnabled() {
+  return Object.values(AI_KEYS).some(hasRealValue);
+}
 
 const app = express();
 app.use(express.json({ limit: '12mb' }));   // project data can be large
@@ -98,6 +109,84 @@ function emailConfigured() {
   emailState.transport = apiEmailConfigured() ? 'brevo-api' : (smtpEmailConfigured() ? 'smtp' : null);
   return ok;
 }
+
+/* ---------------- server-side AI provider proxy ---------------- */
+function aiModelMeta(model) {
+  return {
+    'gemini-flash': {
+      key: AI_KEYS['gemini-flash'],
+      label: 'Gemini 2.0 Flash'
+    },
+    'gpt4o-mini': {
+      key: AI_KEYS['gpt4o-mini'],
+      label: 'GPT-4o mini',
+      endpoint: 'https://api.openai.com/v1/chat/completions',
+      providerModel: 'gpt-4o-mini'
+    },
+    'claude-haiku': {
+      key: AI_KEYS['claude-haiku'],
+      label: 'Claude Haiku'
+    },
+    deepseek: {
+      key: AI_KEYS.deepseek,
+      label: 'DeepSeek Chat',
+      endpoint: 'https://api.deepseek.com/v1/chat/completions',
+      providerModel: 'deepseek-chat'
+    },
+    'zai-glm': {
+      key: AI_KEYS['zai-glm'],
+      label: 'Z.ai GLM-4',
+      endpoint: 'https://api.z.ai/api/paas/v4/chat/completions',
+      providerModel: 'glm-4-flash'
+    }
+  }[model];
+}
+function configuredAIModels() {
+  return Object.keys(AI_KEYS).filter(k => hasRealValue(AI_KEYS[k]));
+}
+async function serverLLM(prompt, maxTok, model) {
+  const meta = aiModelMeta(model);
+  if (!meta) throw new Error('Unsupported AI model');
+  if (!hasRealValue(meta.key)) throw new Error(meta.label + ' is not configured on the server');
+  const maxOutputTokens = Math.max(32, Math.min(Number(maxTok) || 900, 2500));
+  let r, d, txt;
+  if (model === 'gemini-flash') {
+    r = await withTimeout('Gemini request', fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=' + encodeURIComponent(meta.key), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens, temperature: 0.2 }
+      })
+    }), 60000);
+    d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) throw new Error((d.error && d.error.message) || 'Gemini server error');
+    txt = d.candidates && d.candidates[0] && d.candidates[0].content &&
+      d.candidates[0].content.parts && d.candidates[0].content.parts[0] &&
+      d.candidates[0].content.parts[0].text;
+  } else if (model === 'claude-haiku') {
+    r = await withTimeout('Claude request', fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-api-key': meta.key, 'anthropic-version': '2023-06-01' },
+      body: JSON.stringify({ model: 'claude-3-5-haiku-20241022', max_tokens: maxOutputTokens, messages: [{ role: 'user', content: prompt }] })
+    }), 60000);
+    d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) throw new Error((d.error && d.error.message) || 'Claude server error');
+    txt = d.content && d.content[0] && d.content[0].text;
+  } else {
+    r = await withTimeout('AI provider request', fetch(meta.endpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + meta.key },
+      body: JSON.stringify({ model: meta.providerModel, max_tokens: maxOutputTokens, temperature: 0.2, messages: [{ role: 'user', content: prompt }] })
+    }), 60000);
+    d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) throw new Error((d.error && d.error.message) || 'AI provider server error');
+    txt = d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+  }
+  if (!txt) throw new Error('Empty AI response');
+  return txt;
+}
+
 function getMailer() {
   if (mailer) return mailer;
   if (!smtpEmailConfigured()) return null;
@@ -508,8 +597,32 @@ app.delete('/api/projects/:id/members/:userId', requireAuth(async (req, res) => 
   res.json({ ok: true });
 }));
 
+/* ---------------- AI ---------------- */
+app.post('/api/ai/generate', requireAuth(async (req, res) => {
+  const { prompt, maxTok, model } = req.body || {};
+  const selectedModel = model || 'gemini-flash';
+  if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'Prompt required' });
+  if (prompt.length > 30000) return res.status(413).json({ error: 'Prompt is too large for this Phase 1 server endpoint' });
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0];
+  const rl = rateLimit('ai:' + req.user.id + ':' + ip, 120, 60 * 60 * 1000);
+  if (!rl.ok) return res.status(429).json({ error: `AI limit reached. Try again in ${Math.ceil(rl.retryAfter/60)} minute(s).` });
+  try {
+    const text = await serverLLM(prompt, maxTok, selectedModel);
+    res.json({ text, model: selectedModel, server: true });
+  } catch (e) {
+    const msg = e && e.message ? e.message : 'AI server failed';
+    const status = /not configured/i.test(msg) ? 503 : 502;
+    res.status(status).json({ error: msg });
+  }
+}));
+
 /* ---------------- config + static ---------------- */
-app.get('/api/config', (req, res) => res.json({ googleClientId: GOOGLE_CLIENT_ID, emailEnabled: emailConfigured() }));
+app.get('/api/config', (req, res) => res.json({
+  googleClientId: GOOGLE_CLIENT_ID,
+  emailEnabled: emailConfigured(),
+  aiServerEnabled: aiServerEnabled(),
+  aiModels: configuredAIModels()
+}));
 app.get('/api/email/status', (req, res) => res.json({
   configured: emailConfigured(),
   transport: emailState.transport,

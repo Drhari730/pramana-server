@@ -717,6 +717,18 @@ const MODELS={
   'zai-glm':     {label:'Z.ai GLM-4',keyId:'zai',hint:'z.ai — cheap, strong'},
 };
 function getKey(m){return localStorage.getItem('asrma_key_'+MODELS[m].keyId)||''}
+function serverAIReady(model){
+  return !!(window.BK&&BK.isServer&&BK.isServer()&&BK.config&&BK.config.aiServerEnabled&&
+    (!model||!Array.isArray(BK.config.aiModels)||!BK.config.aiModels.length||BK.config.aiModels.includes(model)));
+}
+function serverModelFor(model){
+  if(serverAIReady(model))return model;
+  if(serverAIReady()&&Array.isArray(BK.config.aiModels)&&BK.config.aiModels.length)return BK.config.aiModels[0];
+  return null;
+}
+function hasAnyAIKey(){
+  return serverAIReady() || Object.keys(MODELS).some(id=>getKey(id));
+}
 function agentBusy(b){const d=document.getElementById('agent-dot');if(!d)return;
   d.className='agent-dot '+(b?'busy':(ST.agent.trained?'ready':'untrained'));
   const l=document.getElementById('agent-label');if(l&&b)l.textContent='Viveka working…';
@@ -728,6 +740,12 @@ const _bucket=(()=>{let t=20,max=22,last=Date.now();
 
 async function LLM(prompt,maxTok,model){
   model=model||ST.agent.model||'gemini-flash';maxTok=maxTok||900;
+  const serverModel=serverModelFor(model);
+  if(serverModel){
+    const r=await BK.api('POST','/api/ai/generate',{prompt,maxTok,model:serverModel},70000);
+    if(!r||!r.text)throw new Error('Empty server AI response');
+    return r.text;
+  }
   const key=getKey(model);
   if(!key){keyModal();throw new Error('No API key for '+MODELS[model].label+'. Add it under 🔑 Keys.');}
   await _bucket.acquire();
@@ -803,8 +821,8 @@ function saveKeys(){
   toast(any?'Keys saved':'Models updated','ok');
 }
 function updateKeyBtn(){const b=document.getElementById('key-btn');if(!b)return;
-  const ok=Object.keys(MODELS).some(id=>getKey(id));
-  b.textContent=ok?'🔑 Keys ✓':'🔑 Add keys';
+  const ok=hasAnyAIKey();
+  b.textContent=serverAIReady()?'Server AI ✓':(ok?'🔑 Keys ✓':'🔑 Add keys');
   b.style.borderColor=ok?'var(--inc)':'';b.style.color=ok?'var(--inc)':'';}
 window.saveKeys=saveKeys;
 
@@ -813,7 +831,7 @@ async function trainAgents(){
   const p=ST.project;
   const reviewCtx=buildReviewContext(p);
   if(!p.question){toast('Define your protocol & PICO first','err');ASRMA.go('protocol');return;}
-  if(!Object.keys(MODELS).some(id=>getKey(id))){keyModal();return;}
+  if(!hasAnyAIKey()){keyModal();return;}
   const btn=document.getElementById('train-btn');if(btn){btn.disabled=true;btn.innerHTML='⊹ Training…';}
   agentBusy(true);
   const steps=['s-domain','s-persona','s-rubric','s-gold','s-calib'];

@@ -2,6 +2,12 @@
    emulates just enough Postgres for our queries. No external DB needed. */
 const http = require('http');
 const db = require('./db');
+process.env.GEMINI_API_KEY = '';
+process.env.GOOGLE_AI_API_KEY = '';
+process.env.OPENAI_API_KEY = '';
+process.env.ANTHROPIC_API_KEY = '';
+process.env.DEEPSEEK_API_KEY = '';
+process.env.ZAI_API_KEY = '';
 
 /* ---- tiny in-memory tables ---- */
 const T = { users: [], projects: [], members: [], invites: [], resets: [] };
@@ -245,6 +251,12 @@ async function run() {
   ok('login works with new password', r.status===200);
   r = await relog('POST','/api/auth/login',{email:'lead@uni.edu',password:'secret123'});
   ok('old password no longer works', r.status===401);
+
+  console.log('\n=== SERVER AI PHASE 1 ===');
+  r = await lead('GET','/api/config');
+  ok('config reports server AI disabled when no key set', r.status===200 && r.body.aiServerEnabled===false);
+  r = await lead('POST','/api/ai/generate',{model:'gemini-flash',prompt:'Return OK',maxTok:16});
+  ok('server AI endpoint requires configured provider key', r.status===503 && /not configured/i.test(r.body.error||''));
 
   console.log('\n=== RATE LIMITING ===');
   const rlc = makeClient();
