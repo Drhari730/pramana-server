@@ -639,6 +639,25 @@ const ASRMA={
   addEffect,removeEffect,runMeta
 };
 window.ASRMA=ASRMA;
+function phaseRenderer(id){
+  return {protocol:renderProtocol,agents:renderAgents,sources:renderSources,import:renderImport,
+    dedup:renderDedup,screen:renderScreen,fulltext:renderFulltext,extract:renderExtract,
+    quality:renderQuality,synth:renderSynth,grade:renderGrade,report:renderReport,viveka:renderViveka}[id];
+}
+function renderCurrentPhaseNoSave(phase){
+  const id=phase||CUR||'protocol';
+  CUR=id;
+  document.querySelectorAll('.pane').forEach(p=>p.classList.remove('on'));
+  const pane=document.getElementById('pane-'+id);
+  if(pane)pane.classList.add('on');
+  const work=document.getElementById('work');
+  const top=work?work.scrollTop:0;
+  const fn=phaseRenderer(id);
+  if(fn)fn();
+  renderSpine();
+  if(work)work.scrollTop=top;
+}
+window.renderCurrentPhaseNoSave=renderCurrentPhaseNoSave;
 
 /* ===================== MODAL ===================== */
 function modal(html){const m=document.getElementById('modal');m.style.maxWidth='';m.innerHTML=html;document.getElementById('modal-bg').classList.add('on');}
@@ -1662,6 +1681,7 @@ function renderScreen(){
     <button class="btn gh sm" onclick="teamBatchModal()" title="${BK.isServer()?'Assign studies across live project members':'Split articles between reviewers and merge their work'}">👥 Team & batches</button>
   </div>
   <div id="screen-stats"></div>
+  <div class="toolbar"><button class="btn gh sm" onclick="resetTitleAbstractScreening()" title="Clear all title/abstract screening decisions">Reset title/abstract screening</button></div>
   ${mode==='llm'?renderLLMControls():renderLocalControls()}
   ${mode==='local'?`<div class="toolbar"><span class="muted" id="screen-time">Timer appears after Viveka Local scores or re-thresholds.</span></div>`:''}
   <div class="toolbar">
@@ -2350,6 +2370,135 @@ function renderFulltextList(){
     (shown<list.length?`<div style="text-align:center;padding:16px"><button class="btn gh" onclick="moreFulltextCards()">Load more full-text studies - showing ${shown} of ${list.length}</button></div>`:
       (list.length>FT_PAGE_SIZE?`<div class="muted" style="text-align:center;padding:12px">All ${list.length} full-text studies shown</div>`:''));
 }
+
+let FT_FILTER='all';
+function fullTextBaseRefs(){
+  return ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+}
+function filteredFullTextRefs(){
+  let list=fullTextBaseRefs();
+  if(FT_FILTER==='pending')list=list.filter(r=>!(r.ft&&r.ft.decision));
+  else if(FT_FILTER!=='all')list=list.filter(r=>r.ft&&r.ft.decision===FT_FILTER);
+  return list;
+}
+function setFTFilter(f){
+  FT_FILTER=f;FT_PAGE=1;
+  document.querySelectorAll('#ft-seg button').forEach(b=>b.classList.remove('on'));
+  const btn=document.querySelector(`#ft-seg button[onclick*="'${f}'"]`);if(btn)btn.classList.add('on');
+  renderFulltextList();
+}
+function resetTitleAbstractScreening(){
+  if(BATCH_CTRL.ta&&BATCH_CTRL.ta.running){toast('Stop Viveka first, then reset','err');return;}
+  const scope=titleAbstractScopeRefs();
+  if(!scope.length){toast('No title/abstract records to reset','err');return;}
+  if(!confirm('Reset title/abstract screening decisions for '+scope.length+' visible records? Imported records and assignments will stay.'))return;
+  scope.forEach(r=>{delete r.ta;delete r._conflict;});
+  saveNow();renderScreen();renderSpine();toast('Title/abstract screening reset','ok');
+}
+function resetFullTextScreening(){
+  if((BATCH_CTRL.ftCloud&&BATCH_CTRL.ftCloud.running)||(BATCH_CTRL.ftLocal&&BATCH_CTRL.ftLocal.running)){toast('Stop full-text screening first, then reset','err');return;}
+  const list=filteredFullTextRefs();
+  if(!list.length){toast('No full-text records in this filter to reset','err');return;}
+  if(!confirm('Reset full-text screening decisions for '+list.length+' records in the current filter? Retrieved full text/PDF text will be kept.'))return;
+  list.forEach(r=>{
+    if(!r.ft)return;
+    const keep={};
+    ['oa','pdfText','pdfName','fulltextUrl','source','doi','fetchedAt'].forEach(k=>{if(r.ft[k]!=null)keep[k]=r.ft[k];});
+    r.ft=keep;
+  });
+  saveNow();renderFulltext();renderSpine();toast('Full-text screening reset','ok');
+}
+window.setFTFilter=setFTFilter;window.resetTitleAbstractScreening=resetTitleAbstractScreening;window.resetFullTextScreening=resetFullTextScreening;
+renderFulltext=function(){
+  if(typeof FT_PAGE!=='undefined')FT_PAGE=1;
+  document.getElementById('pane-fulltext').innerHTML=`
+  <div class="pane-h"><div class="eyebrow">Phase 07 - confirm eligibility</div>
+    <h1>Full-text screening</h1>
+    <p>Pull open-access full text from Europe PMC and Unpaywall, or attach a PDF / paste the text yourself, then assess eligibility against the full paper and record an exclusion reason for the PRISMA flow.</p></div>
+  <div id="ft-stats"></div>
+  <div class="toolbar">
+    <button class="btn flow sm" id="ft-fetch-btn" onclick="ASRMA.fetchAllFullText()">Fetch full text</button>
+    <button class="btn gh sm" id="ft-fetch-stop-btn" onclick="stopBatch('fetchFT')" disabled>Stop</button>
+    <div class="pbar" style="width:160px"><i id="ft-bar"></i></div>
+    <span class="muted" id="ft-fetch-time">Open-access papers are retrieved from Europe PMC and Unpaywall, not AI tokens.</span>
+  </div>
+  <div class="toolbar">
+    <button class="btn flow sm" id="ft-cloud-btn" onclick="screenAllFullText('cloud')">Full-text screen all - Cloud</button>
+    <button class="btn gh sm" id="ft-local-btn" onclick="screenAllFullText('local')">Full-text screen all - Local</button>
+    <button class="btn gh sm" id="ft-cloud-stop-btn" onclick="stopBatch('ftCloud')" disabled>Stop Cloud</button>
+    <button class="btn gh sm" id="ft-local-stop-btn" onclick="stopBatch('ftLocal')" disabled>Stop Local</button>
+    <button class="btn gh sm" onclick="screenAllFullText('cloud',true)">Resume Cloud</button>
+    <button class="btn gh sm" onclick="screenAllFullText('local',true)">Resume Local</button>
+    <button class="btn gh sm" onclick="resetFullTextScreening()">Reset current full-text filter</button>
+    <div class="pbar" style="width:160px"><i id="ft-screen-bar"></i></div>
+    <span class="muted" id="ft-screen-time">Timer appears while full-text screening runs.</span>
+  </div>
+  <div class="toolbar">
+    <div class="seg" id="ft-seg">
+      ${['all','pending','include','maybe','exclude'].map(f=>`<button class="${FT_FILTER===f?'on':''}" onclick="setFTFilter('${f}')">${f[0].toUpperCase()+f.slice(1)}</button>`).join('')}
+    </div>
+  </div>
+  <div id="ft-list"></div>`;
+  renderFTStats();renderFulltextList();updateBatchButtons();
+};
+renderFTStats=function(){
+  const list=fullTextBaseRefs();
+  const inc=list.filter(r=>r.ft&&r.ft.decision==='include').length;
+  const maybe=list.filter(r=>r.ft&&r.ft.decision==='maybe').length;
+  const exc=list.filter(r=>r.ft&&r.ft.decision==='exclude').length;
+  const pend=list.filter(r=>!(r.ft&&r.ft.decision)).length;
+  const oa=list.filter(r=>r.ft&&r.ft.oa).length;
+  const estTotal=list.reduce((sum,r)=>sum+ftEstimateMinutes(r),0);
+  const estPending=list.filter(r=>!(r.ft&&r.ft.decision)).reduce((sum,r)=>sum+ftEstimateMinutes(r),0);
+  const disc=ensureAudit().filter(x=>x.stage==='ft').length;
+  const tile=(f,val,label,cls)=>`<div class="tile ${cls||''}" style="cursor:pointer" onclick="setFTFilter('${f}')"><div class="v">${val}</div><div class="k">${label}</div></div>`;
+  const el=document.getElementById('ft-stats');if(!el)return;
+  el.innerHTML=`<div class="tiles">
+    ${tile('all',list.length,'at full text','')}
+    ${tile('pending',pend,'pending','')}
+    <div class="tile flow"><div class="v">${oa}</div><div class="k">open access</div></div>
+    ${tile('include',inc,'included','inc')}
+    ${tile('maybe',maybe,'maybe','maybe')}
+    ${tile('exclude',exc,'excluded','exc')}
+    ${disc?`<div class="tile maybe"><div class="v">${disc}</div><div class="k">AI discrepancies logged</div></div>`:''}
+  </div><div class="muted" style="margin:-6px 0 14px">Estimated full-text review time: <b>${fmtMinutes(estTotal)}</b> total - <b>${fmtMinutes(estPending)}</b> still pending.</div>${inc?`<div class="row" style="margin-bottom:6px"><button class="btn" onclick="ASRMA.go('extract')">Extract data (${inc}) -></button></div>`:''}`;
+};
+renderFulltextList=function(){
+  const list=filteredFullTextRefs();
+  const el=document.getElementById('ft-list');if(!el)return;
+  if(!list.length){el.innerHTML='<div class="empty"><div class="ico">FT</div><h3>No full-text studies in this filter</h3><div>Switch to All, Pending, Include, Maybe, or Exclude.</div></div>';return;}
+  const shown=Math.min(list.length,FT_PAGE*FT_PAGE_SIZE);
+  el.innerHTML=list.slice(0,shown).map(r=>{const ft=r.ft||{};const dec=ft.decision;
+    return`<div class="study ${dec||''}">
+      <div class="st-title">${esc(r.title)}</div>
+      <div class="st-meta"><span>${esc(r.year||'')}</span><span>${esc(r.journal||'')}</span>
+        ${ft.oa?'<span style="color:var(--inc);font-weight:700">OA</span>':''}
+        ${ft.fulltextUrl?`<a href="${esc(ft.fulltextUrl)}" target="_blank">full text</a>`:r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi</a>`:''}
+        ${ft.pdfText?`<span style="color:var(--flow)">text attached (${(ft.pdfText.length/1000).toFixed(0)}k chars)</span>`:'<span style="color:var(--maybe)">no full text yet</span>'}
+        <span style="color:var(--t3)">estimated human time: ~${fmtMinutes(ftEstimateMinutes(r))}</span>
+        ${ft.ms?`<span style="color:var(--t3)">Viveka time: ${fmtDuration(ft.ms)}</span>`:''}</div>
+      <div class="st-foot">
+        ${dec?`<span class="dchip ${dec}">${dec==='include'?'Included':dec==='maybe'?'Maybe':'Excluded'}</span>
+          ${ft.exclCat?`<span class="pill">${esc(ft.exclCat)}</span>`:''}
+          <span class="muted" style="flex:1">${esc(ft.reason||'')}</span>`:'<span class="dchip pend">not assessed</span><span class="spacer"></span>'}
+        <button class="btn gh sm" onclick="ASRMA.fetchFullText('${r.id}').then(()=>{renderFulltextList()})" title="Fetch open-access text online">Fetch</button>
+        <button class="btn gh sm" onclick="attachFullText('${r.id}')" title="Upload a PDF or .txt">Attach</button>
+        <button class="btn gh sm" onclick="pasteFullText('${r.id}')" title="Paste text">Paste</button>
+        <button class="btn flow sm" onclick="ftScreen('${r.id}','cloud')">Viveka Cloud</button>
+        <button class="btn gh sm" onclick="ftScreen('${r.id}','local').then(()=>{renderFulltextList();renderFTStats();})">Viveka Local</button>
+        <button class="vbtn maybe ${dec==='maybe'?'act-maybe':''}" onclick="ftDecide('${r.id}','maybe')">?</button>
+        <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" onclick="ftDecide('${r.id}','exclude')">x</button>
+        <button class="vbtn inc ${dec==='include'?'act-inc':''}" onclick="ftDecide('${r.id}','include')">✓</button>
+      </div>
+      ${ft.reviewedAt?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ft))}</div>`:''}
+      ${ft.pdfText?`<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--flow);font-weight:700">Preview retrieved full text</summary><div style="margin-top:8px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--wash);max-height:220px;overflow:auto;white-space:pre-wrap;font-size:12px;line-height:1.55">${esc(ft.pdfText.slice(0,2200))}</div></details>`:''}
+      <div class="fg" style="margin:10px 0 0">
+        <label class="fl">Comment / reason</label>
+        <textarea class="inp" style="min-height:64px" placeholder="Add reviewer comments, exclusion rationale, or notes for extraction" oninput="setDecisionComment('ft','${r.id}',this.value)">${esc(ft.comment||'')}</textarea>
+      </div></div>`;}).join('')+
+    (shown<list.length?`<div style="text-align:center;padding:16px"><button class="btn gh" onclick="moreFulltextCards()">Load more full-text studies - showing ${shown} of ${list.length}</button></div>`:
+      (list.length>FT_PAGE_SIZE?`<div class="muted" style="text-align:center;padding:12px">All ${list.length} full-text studies shown</div>`:''));
+};
 
 /* ===================== DATA EXTRACTION ===================== */
 const DEFAULT_FIELDS=[
@@ -4296,10 +4445,11 @@ function startServerPolling(){
   if(!BK.isServer()||!ST.id) return;
   _srvPoll=setInterval(async ()=>{
     if(!ST.id||_srvSaving||_srvTimer) return;
+    if(typeof BATCH_CTRL!=='undefined'&&Object.values(BATCH_CTRL).some(x=>x&&x.running)) return;
     try{
       const r=await BK.api('GET','/api/projects/'+ST.id, null, 8000);
       if(r.project && r.project.version!==BK.version){
-        const phase=(window.CUR&&CUR.id)||'screen';
+        const phase=(typeof CUR==='string'&&CUR)||((window.CUR&&window.CUR.id)||'screen');
         const curId=ST.id;
         const data=r.project.data||{};
         Object.keys(ST).forEach(k=>delete ST[k]);
@@ -4307,8 +4457,8 @@ function startServerPolling(){
         window.ST=ST; BK.version=r.project.version; BK.role=r.role;
         if(BK.role==='reviewer'&&hasLiveAssignments()) BK.myAssignmentsOnly=true;
         updatePill();updateKeyBtn();updateAgentChip();renderTeam();
-        openWorkspace(phase);
-        toast('Project updated by a collaborator','ok');
+        renderCurrentPhaseNoSave(phase);
+        setSyncState('saved');
       }
     }catch(e){}
   },15000);
