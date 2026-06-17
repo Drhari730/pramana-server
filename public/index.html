@@ -1441,6 +1441,11 @@ function myAssignedRefs(){
 function myPendingAssignedCount(){
   return ST.refs.filter(r=>!r.dup&&isAssignedToMe(r)&&(!r.ta||r.ta.by==='local')).length;
 }
+function titleAbstractScopeRefs(){
+  let refs=ST.refs.filter(r=>!r.dup);
+  if(BK.isServer&&BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())refs=refs.filter(r=>isAssignedToMe(r));
+  return refs;
+}
 function toggleMyAssignmentsOnly(){
   BK.myAssignmentsOnly=!BK.myAssignmentsOnly;
   renderScreen();
@@ -1573,26 +1578,28 @@ async function screenOne(id,useAdv){
 }
 async function screenAll(resume){
   if(!ST.agent.trained){toast('Train the agent first','err');ASRMA.go('agents');return;}
-  if(BATCH_CTRL.ta.running){toast('Viveka Cloud is already screening','err');return;}
-  const pend=ST.refs.filter(r=>!r.dup&&!r.ta);
-  const queue=resume?pend:(pend.length?pend:ST.refs.filter(r=>!r.dup));
+  if(BATCH_CTRL.ta.running){updateBatchButtons();toast('Viveka Cloud is already screening - use Stop if you want to pause it','err');return;}
+  const scope=titleAbstractScopeRefs();
+  const pend=scope.filter(r=>!r.ta);
+  const queue=resume?pend:(pend.length?pend:scope);
   if(!queue.length){toast('Nothing to screen','err');return;}
   if(!resume&&pend.length===0&&!confirm('Re-screen all '+queue.length+' studies?'))return;
   const btn=document.getElementById('screen-btn');if(btn)btn.disabled=true;
   batchStart('ta');
   agentBusy(true);
-  const bar=document.getElementById('screen-bar');let done=0;const list=pend.length?pend:queue;const started=Date.now();
-  progressTick('screen-time',0,list.length,started,'Viveka Cloud');
+  const bar=document.getElementById('screen-bar');let done=0;const list=queue;const started=Date.now();
+  const scopeLabel=(BK.isServer&&BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())?'Viveka Cloud - assigned only':'Viveka Cloud';
+  progressTick('screen-time',0,list.length,started,scopeLabel);
   for(const r of list){
     if(BATCH_CTRL.ta.stop)break;
     try{await screenOne(r.id);}catch(e){r.ta={a:'maybe',final:'maybe',conf:0,reason:'error: '+e.message,by:'agent'};}
     done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';
-    progressTick('screen-time',done,list.length,started,'Viveka Cloud');
+    progressTick('screen-time',done,list.length,started,scopeLabel);
     if(done%10===0){saveSoon();renderScreenStats();}
   }
   const stopped=BATCH_CTRL.ta.stop;
   batchEnd('ta');saveNow();agentBusy(false);renderScreen();renderSpine();
-  toast((stopped?'Stopped after ':'Screened ')+done+' studies','ok');
+  toast((stopped?'Stopped after ':'Screened ')+done+' '+((BK.isServer&&BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())?'assigned ':'')+'studies','ok');
 }
 function setDecision(id,dec,ev){
   const r=refById(id);if(!r)return;
@@ -1667,6 +1674,7 @@ function renderScreen(){
   </div>
   <div id="screen-list"></div>`;
   renderScreenStats();renderScreenList();
+  updateBatchButtons();
 }
 function renderLLMControls(){
   return `<div class="toolbar">
@@ -1808,8 +1816,7 @@ function scoreAllLocal(vmap){
   const started=Date.now();let scored=0;
   const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
   const maybeBand=ST.settings.localMaybeBand!=null?ST.settings.localMaybeBand:0.08;
-  ST.refs.forEach(r=>{
-    if(r.dup)return;
+  titleAbstractScopeRefs().forEach(r=>{
     if(r.ta&&r.ta.by==='human')return; // never overwrite human labels
     const v=(vmap&&vmap[r.id])||vecFor(r,eng);
     const p=localProbability(v,eng);
@@ -1839,14 +1846,14 @@ function setLocalPreset(kind){
   saveSoon();renderScreen();
 }
 function activeLearningQueue(n){ // most-uncertain unlabelled (prob near 0.5)
-  return ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.by==='local')
+  return titleAbstractScopeRefs().filter(r=>r.ta&&r.ta.by==='local')
     .map(r=>({r,u:Math.abs((r.ta.prob||.5)-0.5)})).sort((a,b)=>a.u-b.u).slice(0,n||15).map(o=>o.r.id);
 }
 let SEED_MODE=false;
 function startSeeding(){SEED_MODE=true;SCREEN_FILTER='pending';renderScreen();toast('Label papers below with ✓ / ✗ to build the seed','ok');}
 async function vivekaSeed(){ // optional: one small LLM batch to seed labels
   if(!ST.agent.trained){toast('Set up Viveka first (Phase 02), or label the seed by hand','err');return;}
-  const pend=ST.refs.filter(r=>!r.dup&&(!r.ta||r.ta.by==='local')).slice(0,40);
+  const pend=titleAbstractScopeRefs().filter(r=>!r.ta||r.ta.by==='local').slice(0,40);
   if(!pend.length){toast('No unlabelled papers to seed from','err');return;}
   agentBusy(true);const bar=document.getElementById('seed-bar');let done=0;
   for(const r of pend){try{const res=parseJSON(await LLM(buildScreenPrompt(r.title,r.abstract,'seed'),300));
@@ -1856,7 +1863,7 @@ async function vivekaSeed(){ // optional: one small LLM batch to seed labels
 }
 function renderLocalControls(){
   const t=localTrainable();const eng=ST.engine;const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
-  const scored=ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.by==='local').length;
+  const scored=titleAbstractScopeRefs().filter(r=>r.ta&&r.ta.by==='local').length;
   return `<div class="card tight" style="margin-bottom:14px">
     <div class="card-h">⚙ Viveka Local <span class="muted" style="font-weight:500">— in-browser screening engine</span> <span class="tag">${eng?'trained':'not trained'}</span></div>
     <div class="banner info" style="margin-bottom:12px"><span class="bi">ⓘ</span><div>
