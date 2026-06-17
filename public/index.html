@@ -716,7 +716,13 @@ const MODELS={
   'deepseek':    {label:'DeepSeek Chat',keyId:'deepseek',hint:'platform.deepseek.com — very cheap'},
   'zai-glm':     {label:'Z.ai GLM-4',keyId:'zai',hint:'z.ai — cheap, strong'},
 };
-function getKey(m){return localStorage.getItem('asrma_key_'+MODELS[m].keyId)||''}
+function browserAIKeysAllowed(){
+  return !(window.BK&&BK.isServer&&BK.isServer());
+}
+function getKey(m){
+  if(!browserAIKeysAllowed())return '';
+  return localStorage.getItem('asrma_key_'+MODELS[m].keyId)||'';
+}
 function serverAIReady(model){
   return !!(window.BK&&BK.isServer&&BK.isServer()&&BK.config&&BK.config.aiServerEnabled&&
     (!model||!Array.isArray(BK.config.aiModels)||!BK.config.aiModels.length||BK.config.aiModels.includes(model)));
@@ -728,6 +734,9 @@ function serverModelFor(model){
 }
 function hasAnyAIKey(){
   return serverAIReady() || Object.keys(MODELS).some(id=>getKey(id));
+}
+function purgeBrowserAIKeys(){
+  Object.values(MODELS).forEach(m=>{try{localStorage.removeItem('asrma_key_'+m.keyId);}catch(e){}});
 }
 function agentBusy(b){const d=document.getElementById('agent-dot');if(!d)return;
   d.className='agent-dot '+(b?'busy':(ST.agent.trained?'ready':'untrained'));
@@ -824,6 +833,43 @@ function updateKeyBtn(){const b=document.getElementById('key-btn');if(!b)return;
   const ok=hasAnyAIKey();
   b.textContent=serverAIReady()?'Server AI ✓':(ok?'🔑 Keys ✓':'🔑 Add keys');
   b.style.borderColor=ok?'var(--inc)':'';b.style.color=ok?'var(--inc)':'';}
+window.saveKeys=saveKeys;
+function serverModelOptions(selected){
+  const entries=serverAIReady()&&Array.isArray(BK.config.aiModels)&&BK.config.aiModels.length
+    ? Object.entries(MODELS).filter(([id])=>BK.config.aiModels.includes(id))
+    : Object.entries(MODELS);
+  return entries.map(([id,m])=>`<option value="${id}" ${selected===id?'selected':''}>${m.label}</option>`).join('');
+}
+keyModal=function(){
+  const serverMode=!!(window.BK&&BK.isServer&&BK.isServer());
+  const body=serverMode
+    ? `<div class="banner info"><span class="bi">✓</span><div><b>${serverAIReady()?'Server AI is active.':'Server AI belongs in Railway.'}</b> API keys are stored in Railway variables and are not shown in the browser. Add or change provider keys only from the Railway service settings.</div></div>`
+    : `<div class="banner warn"><span class="bi">!</span><div>Server AI is not configured yet. For production, add provider keys in Railway variables instead of browser storage.</div></div>`+
+      Object.entries(MODELS).map(([id,m])=>`<div class="fg"><label class="fl">${m.label}${m.free?' <span class="pill f">free</span>':''} <span class="hint">${m.hint}</span></label><input class="inp" id="k-${m.keyId}" type="password" placeholder="paste key..." value="${esc(getKey(id))}"></div>`).join('');
+  modal(`<div class="modal-h">AI settings<button class="x" onclick="closeModal()">x</button></div>
+  <div class="modal-b">
+    ${body}
+    <div class="fg"><label class="fl">Default agent model</label><select class="inp" id="k-model">${serverModelOptions(ST.agent.model)}</select></div>
+    <div class="fg"><label class="fl">Advanced model <span class="hint">full-text, extraction, RoB</span></label><select class="inp" id="k-adv">${serverModelOptions(ST.agent.advModel)}</select></div>
+  </div>
+  <div class="modal-f"><button class="btn gh" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveKeys()">Save</button></div>`);
+};
+saveKeys=function(){
+  if(browserAIKeysAllowed()){
+    Object.values(MODELS).forEach(m=>{const el=document.getElementById('k-'+m.keyId);if(el){const v=el.value.trim();if(v)localStorage.setItem('asrma_key_'+m.keyId,v);}});
+  }else{
+    purgeBrowserAIKeys();
+  }
+  ST.agent.model=document.getElementById('k-model').value;
+  ST.agent.advModel=document.getElementById('k-adv').value;
+  save();updateKeyBtn();agentBusy(false);closeModal();toast('AI settings saved','ok');
+};
+updateKeyBtn=function(){
+  const b=document.getElementById('key-btn');if(!b)return;
+  const ok=hasAnyAIKey();
+  b.textContent=(window.BK&&BK.isServer&&BK.isServer())?(serverAIReady()?'Server AI ready':'Server AI missing'):(ok?'Keys ready':'Add keys');
+  b.style.borderColor=ok?'var(--inc)':'';b.style.color=ok?'var(--inc)':'';
+};
 window.saveKeys=saveKeys;
 
 /* ===================== AGENT TRAINING (headline feature) ===================== */
@@ -3035,6 +3081,51 @@ function saveSettings(){
   save();updateAgentChip();updatePill();renderSpine();closeModal();toast('Settings saved','ok');
 }
 window.settingsModal=settingsModal;window.saveSettings=saveSettings;
+settingsModal=function(){
+  const serverMode=!!(window.BK&&BK.isServer&&BK.isServer());
+  const keyBlock=serverMode
+    ? '<div class="banner info" style="margin-bottom:14px"><span class="bi">✓</span><div><b>'+(serverAIReady()?'Server AI is active.':'Server AI is configured only in Railway.')+'</b> Browser key fields are disabled on the hosted app. Add or rotate provider keys only in Railway variables.</div></div>'
+    : '<div class="banner warn" style="margin-bottom:14px"><span class="bi">!</span><div>Server AI is not configured. Add keys in Railway for production. Browser key fields are shown only for local/offline fallback.</div></div>'+
+      Object.entries(MODELS).map(([id,m])=>'<div class="fg"><label class="fl">'+m.label+(m.free?' <span class="pill f">free</span>':'')+' <span class="hint">'+m.hint+'</span></label><input class="inp" id="k-'+m.keyId+'" type="password" placeholder="paste key..." value="'+esc(getKey(id))+'"></div>').join('');
+  modal('<div class="modal-h">Settings<button class="x" onclick="closeModal()">x</button></div>'+
+  '<div class="modal-b">'+
+    '<div class="card-h" style="margin-bottom:10px">Project</div>'+
+    '<div class="fg"><label class="fl">Project name</label><input class="inp" id="set-title" value="'+esc(ST.project.title||'')+'" placeholder="My systematic review"></div>'+
+    '<div class="divider"></div>'+
+    '<div class="card-h" style="margin-bottom:10px">AI reviewer</div>'+
+    '<div class="grid2">'+
+      '<div class="fg"><label class="fl">Screening model <span class="hint">Viveka</span></label><select class="inp" id="k-model">'+serverModelOptions(ST.agent.model)+'</select></div>'+
+      '<div class="fg"><label class="fl">Advanced model <span class="hint">full-text, extraction, RoB</span></label><select class="inp" id="k-adv">'+serverModelOptions(ST.agent.advModel)+'</select></div>'+
+    '</div>'+
+    '<div class="fg"><label class="fl">Screening strictness</label><select class="inp" id="set-strict">'+['lenient','balanced','strict'].map(s=>'<option value="'+s+'" '+(ST.settings.strictness===s?'selected':'')+'>'+s+'</option>').join('')+'</select></div>'+
+    '<div class="divider"></div>'+
+    '<div class="card-h" style="margin-bottom:10px">API keys</div>'+
+    keyBlock+
+    '<div class="divider"></div>'+
+    '<button class="btn danger gh sm" onclick="resetLocalProjectFromSettings()">Reset project</button>'+
+  '</div>'+
+  '<div class="modal-f"><button class="btn gh" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveSettings()">Save</button></div>');
+};
+saveSettings=function(){
+  if(browserAIKeysAllowed()){
+    Object.values(MODELS).forEach(m=>{const el=document.getElementById('k-'+m.keyId);if(el){const v=el.value.trim();if(v)localStorage.setItem('asrma_key_'+m.keyId,v);}});
+  }else{
+    purgeBrowserAIKeys();
+  }
+  ST.agent.model=document.getElementById('k-model').value;
+  ST.agent.advModel=document.getElementById('k-adv').value;
+  ST.settings.strictness=document.getElementById('set-strict').value;
+  ST.project.title=document.getElementById('set-title').value;
+  save();updateAgentChip();updatePill();renderSpine();updateKeyBtn();closeModal();toast('Settings saved','ok');
+};
+window.settingsModal=settingsModal;window.saveSettings=saveSettings;
+function resetLocalProjectFromSettings(){
+  if(confirm('Reset everything? This clears the current project from this browser.')){
+    localStorage.removeItem(LS);
+    location.reload();
+  }
+}
+window.resetLocalProjectFromSettings=resetLocalProjectFromSettings;
 
 /* ===================== ABOUT / HOW TO USE ===================== */
 function aboutModal(){
@@ -4696,6 +4787,7 @@ async function boot(){
   const params=new URLSearchParams(location.search);
   if(params.get('invite')) BK._pendingInvite=params.get('invite');
   await BK.detect();
+  if(BK.isServer())purgeBrowserAIKeys();
   window.ST=ST; updateKeyBtn();
   if(BK.isServer()){
     // add a sync indicator + share button into the header (once)
