@@ -381,6 +381,11 @@ async function autoAcceptInvites(user) {
 app.get('/api/projects', requireAuth(async (req, res) => {
   const rows = await db.q(
     `SELECT p.id,p.title,p.version,p.updated_at,m.role,
+            COALESCE(jsonb_array_length(CASE WHEN jsonb_typeof(p.data->'refs')='array' THEN p.data->'refs' ELSE '[]'::jsonb END),0) AS total_count,
+            (SELECT count(*) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p.data->'refs')='array' THEN p.data->'refs' ELSE '[]'::jsonb END) AS r(ref)
+              WHERE NOT COALESCE((r.ref->>'dup')::boolean,false) AND (r.ref->'ta'->>'final') IS NOT NULL) AS screened_count,
+            (SELECT count(*) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p.data->'refs')='array' THEN p.data->'refs' ELSE '[]'::jsonb END) AS r(ref)
+              WHERE NOT COALESCE((r.ref->>'dup')::boolean,false) AND (r.ref->'ft'->>'decision')='include') AS included_count,
             (SELECT count(*) FROM members mm WHERE mm.project_id=p.id) AS member_count
      FROM projects p JOIN members m ON m.project_id=p.id
      WHERE m.user_id=$1 ORDER BY p.updated_at DESC`, [req.user.id]);

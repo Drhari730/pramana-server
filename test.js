@@ -46,7 +46,11 @@ async function mockQuery(text, params=[]) {
   if (s.startsWith('SELECT p.id,p.title,p.version,p.updated_at,m.role')) {
     return T.members.filter(m=>m.user_id===params[0]).map(m=>{
       const p=T.projects.find(p=>p.id===m.project_id);
+      const refs=Array.isArray(p.data&&p.data.refs)?p.data.refs:[];
       return {id:p.id,title:p.title,version:p.version,updated_at:p.updated_at,role:m.role,
+        total_count:refs.length,
+        screened_count:refs.filter(r=>!r.dup&&r.ta&&r.ta.final).length,
+        included_count:refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include').length,
         member_count:T.members.filter(x=>x.project_id===p.id).length};
     });
   }

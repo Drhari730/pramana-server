@@ -264,7 +264,36 @@ svg text{font-family:var(--ff)}
 .new-card .plus{font-size:34px;font-weight:300;line-height:1}
 .prog-mini{height:5px;background:var(--wash2);border-radius:5px;overflow:hidden;flex:1;max-width:90px}
 .prog-mini i{display:block;height:100%;background:linear-gradient(90deg,var(--flow),var(--syn))}
+.welcome-card{background:linear-gradient(135deg,rgba(13,148,136,.1),rgba(79,70,229,.08));border:1px solid rgba(79,70,229,.18);border-radius:var(--r2);padding:18px;margin-bottom:18px;box-shadow:var(--sh)}
+.welcome-card h2{font-size:20px;margin:0 0 4px;letter-spacing:-.02em}
+.welcome-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-top:14px}
+.welcome-stat{background:rgba(255,255,255,.76);border:1px solid var(--line);border-radius:10px;padding:10px 12px}
+.welcome-stat b{font-size:18px;font-family:var(--fm)}
+.conflict-soft{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:60;background:var(--ink);color:#fff;padding:12px 16px;border-radius:10px;box-shadow:var(--sh2);display:flex;gap:12px;align-items:center;font-size:13px;max-width:calc(100vw - 24px)}
 @media(max-width:900px){#spine{display:none}.pane{padding:22px 18px 80px}.grid2{grid-template-columns:1fr}#home{padding:28px 18px 80px}}
+@media(max-width:720px){
+  body{overflow:auto}
+  #hdr{height:auto;min-height:56px;padding:8px 10px;gap:8px;flex-wrap:wrap;align-items:flex-start}
+  .brand{font-size:14px;gap:7px}.brand .mk{width:28px;height:28px}.brand .sub{font-size:9px}
+  .proj-pill{order:3;width:100%;max-width:none;margin:2px 0 0;padding:7px 10px}
+  #hdr-r{margin-left:0;gap:6px;flex-wrap:wrap;justify-content:flex-end;flex:1}
+  .agent-chip{max-width:160px;overflow:hidden;white-space:nowrap;padding:5px 9px}
+  .hbtn,.btn{min-height:38px}
+  .team-stack{display:none}
+  #main{display:block;min-height:calc(100vh - 74px)}
+  #work{overflow:visible}
+  .pane{padding:16px 12px 72px;max-width:none}
+  .pane-h h1{font-size:20px;line-height:1.2}.pane-h p{font-size:13px;margin-bottom:16px}
+  .toolbar{padding:10px;gap:8px;align-items:stretch}.toolbar .btn,.toolbar .hbtn{justify-content:center}
+  .seg{width:100%;overflow-x:auto}.seg button{white-space:nowrap}
+  .tiles{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.tile{padding:12px}.tile .v{font-size:22px}
+  .study{padding:12px;margin-bottom:10px}.study .st-title{font-size:14px}.study .st-meta{gap:8px}
+  .st-foot{align-items:stretch}.st-foot .btn{flex:1 1 120px;justify-content:center}.st-foot .vbtn{width:38px;height:38px}
+  .proj-grid{grid-template-columns:1fr}.home-hero{align-items:flex-start}.home-hero h1{font-size:26px}
+  #home{padding:20px 12px 72px}.home-hero .row{width:100%}.home-hero .btn{flex:1;justify-content:center}
+  .modal-bg{padding:10px}.modal{max-height:92vh}.modal-h{padding:16px}.modal-b{padding:16px}.modal-f{padding:12px;flex-wrap:wrap}
+  .conflict-soft{left:12px;right:12px;bottom:12px;transform:none;flex-wrap:wrap}
+}
 </style>
 </head>
 <body>
@@ -1472,6 +1501,15 @@ function progressTick(id,done,total,start,label){
   const left=Math.max(0,total-done);
   el.textContent=`${label||'Screening'}: ${done}/${total} · elapsed ${fmtDuration(elapsed)} · ${done?('~'+fmtDuration(per)+' / article · ETA '+fmtDuration(per*left)):'starting...'}`;
 }
+const BATCH_CTRL={ta:{running:false,stop:false},ftCloud:{running:false,stop:false},ftLocal:{running:false,stop:false},fetchFT:{running:false,stop:false}};
+function batchStart(k){BATCH_CTRL[k]=BATCH_CTRL[k]||{};BATCH_CTRL[k].running=true;BATCH_CTRL[k].stop=false;updateBatchButtons();}
+function stopBatch(k){if(BATCH_CTRL[k]){BATCH_CTRL[k].stop=true;toast('Stopping after the current article finishes','ok');updateBatchButtons();}}
+function batchEnd(k){if(BATCH_CTRL[k]){BATCH_CTRL[k].running=false;updateBatchButtons();}}
+function updateBatchButtons(){
+  const pairs=[['ta','screen-stop-btn'],['ftCloud','ft-cloud-stop-btn'],['ftLocal','ft-local-stop-btn'],['fetchFT','ft-fetch-stop-btn']];
+  pairs.forEach(([k,id])=>{const b=document.getElementById(id);if(b)b.disabled=!(BATCH_CTRL[k]&&BATCH_CTRL[k].running);});
+}
+window.stopBatch=stopBatch;window.updateBatchButtons=updateBatchButtons;
 function logAIDiscrepancy(stage,r,prev,human){
   const aiDecision=prev&&(prev.final||prev.decision);
   if(!prev||!aiDecision||!prev.by||prev.by==='human'||aiDecision===human)return false;
@@ -1533,25 +1571,28 @@ async function screenOne(id,useAdv){
   r.ta={a:dec,b:null,final:dec,conf:res.conf||50,reason:res.reason||'',comment:(r.ta&&r.ta.comment)||'',pico:res.pico||{},by:'agent',model,reviewer:'Viveka',reviewedAt:new Date().toISOString(),ms:Date.now()-started};
   return r;
 }
-async function screenAll(){
+async function screenAll(resume){
   if(!ST.agent.trained){toast('Train the agent first','err');ASRMA.go('agents');return;}
-  const todo=ST.refs.filter(r=>!r.dup&&(!r.ta||r.ta.by==='agent'&&r.ta.pending));
+  if(BATCH_CTRL.ta.running){toast('Viveka Cloud is already screening','err');return;}
   const pend=ST.refs.filter(r=>!r.dup&&!r.ta);
-  const queue=pend.length?pend:ST.refs.filter(r=>!r.dup);
+  const queue=resume?pend:(pend.length?pend:ST.refs.filter(r=>!r.dup));
   if(!queue.length){toast('Nothing to screen','err');return;}
-  if(pend.length===0&&!confirm('Re-screen all '+queue.length+' studies?'))return;
+  if(!resume&&pend.length===0&&!confirm('Re-screen all '+queue.length+' studies?'))return;
   const btn=document.getElementById('screen-btn');if(btn)btn.disabled=true;
+  batchStart('ta');
   agentBusy(true);
   const bar=document.getElementById('screen-bar');let done=0;const list=pend.length?pend:queue;const started=Date.now();
   progressTick('screen-time',0,list.length,started,'Viveka Cloud');
   for(const r of list){
+    if(BATCH_CTRL.ta.stop)break;
     try{await screenOne(r.id);}catch(e){r.ta={a:'maybe',final:'maybe',conf:0,reason:'error: '+e.message,by:'agent'};}
     done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';
     progressTick('screen-time',done,list.length,started,'Viveka Cloud');
     if(done%10===0){saveSoon();renderScreenStats();}
   }
-  saveNow();agentBusy(false);renderScreen();renderSpine();
-  toast('Screened '+done+' studies','ok');
+  const stopped=BATCH_CTRL.ta.stop;
+  batchEnd('ta');saveNow();agentBusy(false);renderScreen();renderSpine();
+  toast((stopped?'Stopped after ':'Screened ')+done+' studies','ok');
 }
 function setDecision(id,dec,ev){
   const r=refById(id);if(!r)return;
@@ -1630,6 +1671,8 @@ function renderScreen(){
 function renderLLMControls(){
   return `<div class="toolbar">
     <button class="btn flow sm" id="screen-btn" onclick="ASRMA.screenAll()">⊹ Auto-screen with Viveka</button>
+    <button class="btn gh sm" id="screen-stop-btn" onclick="stopBatch('ta')" disabled>Stop</button>
+    <button class="btn gh sm" onclick="ASRMA.screenAll(true)">Resume pending</button>
     <div class="pbar" style="width:140px"><i id="screen-bar"></i></div>
     <span class="muted" id="screen-time">Timer appears while Viveka Cloud is screening.</span>
     <select class="inp" style="width:auto" onchange="ST.settings.strictness=this.value;save()">
@@ -2011,24 +2054,31 @@ async function retrieveFT(r){
   }catch(e){}}
   return got;
 }
-async function fetchFullText(id){
+async function fetchFullText(id,silent){
   const r=ST.refs.find(x=>x.id===id);if(!r)return;
   const got=await retrieveFT(r);
   if(got.abstract)r.abstract=got.abstract;
   if(got.doi)r.doi=got.doi;
   r.ft=r.ft||{};
   Object.assign(r.ft,{fulltextUrl:got.url||r.ft.fulltextUrl,oa:got.oa||false,pdfText:got.text||r.ft.pdfText,retrieved:true});
-  save();return r;
+  if(!silent)save();return r;
 }
 async function fetchAllFullText(){
   const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
   if(!list.length){toast('No included studies to fetch','err');return;}
+  if(BATCH_CTRL.fetchFT.running){toast('Full-text fetch is already running','err');return;}
   const btn=document.getElementById('ft-fetch-btn');if(btn)btn.disabled=true;
-  let done=0;const bar=document.getElementById('ft-bar');
-  for(const r of list){try{await fetchFullText(r.id);}catch(e){}
+  batchStart('fetchFT');
+  let done=0;const bar=document.getElementById('ft-bar');const started=Date.now();
+  progressTick('ft-fetch-time',0,list.length,started,'Open-access fetch');
+  for(const r of list){
+    if(BATCH_CTRL.fetchFT.stop)break;
+    try{await fetchFullText(r.id,true);}catch(e){}
     done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';
-    if(done%3===0)renderFulltextList();}
-  renderFulltext();renderSpine();toast('Retrieved metadata for '+done+' studies','ok');
+    progressTick('ft-fetch-time',done,list.length,started,'Open-access fetch');
+    if(done%10===0){saveSoon();renderFTStats();}}
+  const stopped=BATCH_CTRL.fetchFT.stop;
+  batchEnd('fetchFT');saveNow();renderFulltext();renderSpine();toast((stopped?'Stopped after ':'Retrieved metadata for ')+done+' studies','ok');
 }
 async function ftScreen(id,mode){
   mode=mode||'cloud';
@@ -2071,26 +2121,32 @@ async function ftScreenLocal(id,silent){
   r.ft.exclCat=dec==='exclude'?'other':'';r.ft.by='local';r.ft.reviewer='Viveka Local';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';r.ft.prob=p;r.ft.ms=Date.now()-started;
   if(!silent)save();return r;
 }
-async function screenAllFullText(mode){
+async function screenAllFullText(mode,resume){
   mode=mode||'cloud';
   const listAll=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
   if(!listAll.length){toast('No title/abstract included studies for full text','err');return;}
   if(mode==='cloud'&&!ST.agent.trained){toast('Train Viveka Cloud first','err');ASRMA.go('agents');return;}
   if(mode==='local'&&!ST.engine){toast('Train Viveka Local first','err');ASRMA.go('screen');return;}
+  const key=mode==='local'?'ftLocal':'ftCloud';
+  if(BATCH_CTRL[key].running){toast('Full-text screening is already running','err');return;}
   const pending=listAll.filter(r=>!(r.ft&&r.ft.decision));
   const list=pending.length?pending:listAll;
-  if(!pending.length&&!confirm('Re-assess all '+list.length+' full-text studies with Viveka '+(mode==='local'?'Local':'Cloud')+'?'))return;
+  if(resume&&!pending.length){toast('No pending full-text articles to resume','ok');return;}
+  if(!resume&&!pending.length&&!confirm('Re-assess all '+list.length+' full-text studies with Viveka '+(mode==='local'?'Local':'Cloud')+'?'))return;
   const btn=document.getElementById(mode==='local'?'ft-local-btn':'ft-cloud-btn');if(btn)btn.disabled=true;
+  batchStart(key);
   agentBusy(mode==='cloud');
   const bar=document.getElementById('ft-screen-bar');let done=0;const started=Date.now();
   progressTick('ft-screen-time',0,list.length,started,'Full-text '+(mode==='local'?'Local':'Cloud'));
   for(const r of list){
+    if(BATCH_CTRL[key].stop)break;
     try{await ftScreen(r.id,mode,true);}catch(e){r.ft=r.ft||{};r.ft.decision='maybe';r.ft.reason='error: '+e.message;r.ft.by=mode==='local'?'local':'agent';}
     done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';
     progressTick('ft-screen-time',done,list.length,started,'Full-text '+(mode==='local'?'Local':'Cloud'));
-    if(done%3===0){saveSoon();renderFTStats();}
+    if(done%10===0){saveSoon();renderFTStats();}
   }
-  saveNow();agentBusy(false);renderFulltext();renderSpine();toast('Full-text assessed '+done+' studies with Viveka '+(mode==='local'?'Local':'Cloud'),'ok');
+  const stopped=BATCH_CTRL[key].stop;
+  batchEnd(key);saveNow();agentBusy(false);renderFulltext();renderSpine();toast((stopped?'Stopped after ':'Full-text assessed ')+done+' studies with Viveka '+(mode==='local'?'Local':'Cloud'),'ok');
 }
 function ftDecide(id,dec,cat){const r=ST.refs.find(x=>x.id===id);if(!r)return;
   const prev=r.ft||{};
@@ -2099,6 +2155,7 @@ function ftDecide(id,dec,cat){const r=ST.refs.find(x=>x.id===id);if(!r)return;
   if(learned&&prev.by==='local')scheduleLocalRetrain();
   save();renderFulltextList();renderFTStats();renderSpine();}
 function renderFulltext(){
+  if(typeof FT_PAGE!=='undefined')FT_PAGE=1;
   document.getElementById('pane-fulltext').innerHTML=`
   <div class="pane-h"><div class="eyebrow">Phase 07 — confirm eligibility</div>
     <h1>▤ Full-text screening</h1>
@@ -2106,12 +2163,17 @@ function renderFulltext(){
   <div id="ft-stats"></div>
   <div class="toolbar">
     <button class="btn flow sm" id="ft-fetch-btn" onclick="ASRMA.fetchAllFullText()">🌐 Fetch full text</button>
+    <button class="btn gh sm" id="ft-fetch-stop-btn" onclick="stopBatch('fetchFT')" disabled>Stop</button>
     <div class="pbar" style="width:160px"><i id="ft-bar"></i></div>
-    <span class="muted">Open-access papers retrieved automatically; others link out.</span>
+    <span class="muted" id="ft-fetch-time">Open-access papers are retrieved from Europe PMC and Unpaywall, not AI tokens.</span>
   </div>
   <div class="toolbar">
     <button class="btn flow sm" id="ft-cloud-btn" onclick="screenAllFullText('cloud')">⊹ Full-text screen all · Cloud</button>
     <button class="btn gh sm" id="ft-local-btn" onclick="screenAllFullText('local')">⚙ Full-text screen all · Local</button>
+    <button class="btn gh sm" id="ft-cloud-stop-btn" onclick="stopBatch('ftCloud')" disabled>Stop Cloud</button>
+    <button class="btn gh sm" id="ft-local-stop-btn" onclick="stopBatch('ftLocal')" disabled>Stop Local</button>
+    <button class="btn gh sm" onclick="screenAllFullText('cloud',true)">Resume Cloud</button>
+    <button class="btn gh sm" onclick="screenAllFullText('local',true)">Resume Local</button>
     <div class="pbar" style="width:160px"><i id="ft-screen-bar"></i></div>
     <span class="muted" id="ft-screen-time">Timer appears while full-text screening runs.</span>
   </div>
@@ -2131,11 +2193,15 @@ function renderFTStats(){
     <div class="tile exc"><div class="v">${exc}</div><div class="k">excluded</div></div>
   </div>${inc?`<div class="row" style="margin-bottom:6px"><button class="btn" onclick="ASRMA.go('extract')">Extract data (${inc}) →</button></div>`:''}`;
 }
+let FT_PAGE=1;const FT_PAGE_SIZE=30;
+function moreFulltextCards(){FT_PAGE++;renderFulltextList();}
+window.moreFulltextCards=moreFulltextCards;
 function renderFulltextList(){
   const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
   const el=document.getElementById('ft-list');if(!el)return;
   if(!list.length){el.innerHTML='<div class="empty"><div class="ico">▤</div><h3>No studies at full text</h3><div>Include some studies in title/abstract screening first.</div></div>';return;}
-  el.innerHTML=list.map(r=>{const ft=r.ft||{};const dec=ft.decision;
+  const shown=Math.min(list.length,FT_PAGE*FT_PAGE_SIZE);
+  el.innerHTML=list.slice(0,shown).map(r=>{const ft=r.ft||{};const dec=ft.decision;
     return`<div class="study ${dec}">
       <div class="st-title">${esc(r.title)}</div>
       <div class="st-meta"><span>${esc(r.year||'')}</span><span>${esc(r.journal||'')}</span>
@@ -2152,7 +2218,9 @@ function renderFulltextList(){
         <button class="btn flow sm" onclick="ftScreen('${r.id}')">⊹ Assess</button>
         <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" onclick="ftDecide('${r.id}','exclude')">✗</button>
         <button class="vbtn inc ${dec==='include'?'act-inc':''}" onclick="ftDecide('${r.id}','include')">✓</button>
-      </div></div>`;}).join('');
+      </div></div>`;}).join('')+
+    (shown<list.length?`<div style="text-align:center;padding:16px"><button class="btn gh" onclick="moreFulltextCards()">Load more full-text studies — showing ${shown} of ${list.length}</button></div>`:
+      (list.length>FT_PAGE_SIZE?`<div class="muted" style="text-align:center;padding:12px">All ${list.length} full-text studies shown</div>`:''));
 }
 window.ftScreen=ftScreen;window.ftScreenLocal=ftScreenLocal;window.screenAllFullText=screenAllFullText;window.ftDecide=ftDecide;
 function renderFTStats(){
@@ -2237,6 +2305,43 @@ function renderFulltextList(){
         <label class="fl">Comment / reason</label>
         <textarea class="inp" style="min-height:64px" placeholder="Add reviewer comments, exclusion rationale, or notes for extraction" oninput="setDecisionComment('ft','${r.id}',this.value)">${esc(ft.comment||'')}</textarea>
       </div></div>`;}).join('');
+}
+
+function renderFulltextList(){
+  const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  const el=document.getElementById('ft-list');if(!el)return;
+  if(!list.length){el.innerHTML='<div class="empty"><div class="ico">▤</div><h3>No studies at full text</h3><div>Include some studies in title/abstract screening first.</div></div>';return;}
+  const shown=Math.min(list.length,FT_PAGE*FT_PAGE_SIZE);
+  el.innerHTML=list.slice(0,shown).map(r=>{const ft=r.ft||{};const dec=ft.decision;
+    return`<div class="study ${dec||''}">
+      <div class="st-title">${esc(r.title)}</div>
+      <div class="st-meta"><span>${esc(r.year||'')}</span><span>${esc(r.journal||'')}</span>
+        ${ft.oa?'<span style="color:var(--inc);font-weight:700">OA</span>':''}
+        ${ft.fulltextUrl?`<a href="${esc(ft.fulltextUrl)}" target="_blank">full text</a>`:r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi</a>`:''}
+        ${ft.pdfText?`<span style="color:var(--flow)">text attached (${(ft.pdfText.length/1000).toFixed(0)}k chars)</span>`:'<span style="color:var(--maybe)">no full text yet</span>'}
+        <span style="color:var(--t3)">estimated human time: ~${fmtMinutes(ftEstimateMinutes(r))}</span>
+        ${ft.ms?`<span style="color:var(--t3)">Viveka time: ${fmtDuration(ft.ms)}</span>`:''}</div>
+      <div class="st-foot">
+        ${dec?`<span class="dchip ${dec}">${dec==='include'?'Included':dec==='maybe'?'Maybe':'Excluded'}</span>
+          ${ft.exclCat?`<span class="pill">${esc(ft.exclCat)}</span>`:''}
+          <span class="muted" style="flex:1">${esc(ft.reason||'')}</span>`:'<span class="dchip pend">not assessed</span><span class="spacer"></span>'}
+        <button class="btn gh sm" onclick="ASRMA.fetchFullText('${r.id}').then(()=>{renderFulltextList()})" title="Fetch open-access text online">Fetch</button>
+        <button class="btn gh sm" onclick="attachFullText('${r.id}')" title="Upload a PDF or .txt">Attach</button>
+        <button class="btn gh sm" onclick="pasteFullText('${r.id}')" title="Paste text">Paste</button>
+        <button class="btn flow sm" onclick="ftScreen('${r.id}','cloud')">Viveka Cloud</button>
+        <button class="btn gh sm" onclick="ftScreen('${r.id}','local').then(()=>{renderFulltextList();renderFTStats();})">Viveka Local</button>
+        <button class="vbtn maybe ${dec==='maybe'?'act-maybe':''}" onclick="ftDecide('${r.id}','maybe')">?</button>
+        <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" onclick="ftDecide('${r.id}','exclude')">x</button>
+        <button class="vbtn inc ${dec==='include'?'act-inc':''}" onclick="ftDecide('${r.id}','include')">✓</button>
+      </div>
+      ${ft.reviewedAt?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ft))}</div>`:''}
+      ${ft.pdfText?`<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--flow);font-weight:700">Preview retrieved full text</summary><div style="margin-top:8px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--wash);max-height:220px;overflow:auto;white-space:pre-wrap;font-size:12px;line-height:1.55">${esc(ft.pdfText.slice(0,2200))}</div></details>`:''}
+      <div class="fg" style="margin:10px 0 0">
+        <label class="fl">Comment / reason</label>
+        <textarea class="inp" style="min-height:64px" placeholder="Add reviewer comments, exclusion rationale, or notes for extraction" oninput="setDecisionComment('ft','${r.id}',this.value)">${esc(ft.comment||'')}</textarea>
+      </div></div>`;}).join('')+
+    (shown<list.length?`<div style="text-align:center;padding:16px"><button class="btn gh" onclick="moreFulltextCards()">Load more full-text studies - showing ${shown} of ${list.length}</button></div>`:
+      (list.length>FT_PAGE_SIZE?`<div class="muted" style="text-align:center;padding:12px">All ${list.length} full-text studies shown</div>`:''));
 }
 
 /* ===================== DATA EXTRACTION ===================== */
@@ -4084,8 +4189,25 @@ function renderGoogleBtn(){
   }});
   const host=document.getElementById('gbtn'); if(host) google.accounts.id.renderButton(host,{theme:'outline',size:'large',width:368});
 }
+function userDisplayName(){
+  const raw=(BK.user&&(BK.user.name||BK.user.email))||'Doctor';
+  return raw.includes('@')?raw.split('@')[0]:raw;
+}
+function loginStorageKey(){
+  return 'pramana_last_login_'+((BK.user&&BK.user.email)||'user').toLowerCase();
+}
+function rememberLogin(){
+  const key=loginStorageKey();
+  BK.previousLoginAt=localStorage.getItem(key)||'';
+  localStorage.setItem(key,new Date().toISOString());
+}
+function fmtDateTime(v){
+  if(!v)return 'First login on this browser';
+  try{return new Date(v).toLocaleString(undefined,{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'});}catch(e){return 'Recently';}
+}
 async function afterLogin(){
   const el=document.getElementById('auth-screen'); if(el)el.style.display='none';
+  rememberLogin();
   updateUserChip();
   // honour a pending invite link, then go home
   if(BK._pendingInvite){
@@ -4114,7 +4236,8 @@ window.showAuthScreen=showAuthScreen;window.authTab=authTab;window.authSubmit=au
 async function serverListProjects(){
   const r = await BK.api('GET','/api/projects');
   return (r.projects||[]).map(p=>({ id:p.id, title:p.title, question:'', updatedAt:p.updated_at,
-    counts:{total:0,incl:0,screened:0}, role:p.role, members:p.member_count, _server:true }));
+    counts:{total:Number(p.total_count||0),incl:Number(p.included_count||0),screened:Number(p.screened_count||0)},
+    role:p.role, members:p.member_count, _server:true }));
 }
 async function serverOpenProject(id){
   const r = await BK.api('GET','/api/projects/'+id);
@@ -4187,8 +4310,8 @@ function onSaveConflict(){
   // someone else saved since we loaded — reload to get the latest, preserving the user's view
   if(document.getElementById('conflict-bar')) return;
   const bar=document.createElement('div'); bar.id='conflict-bar';
-  bar.style.cssText='position:fixed;bottom:18px;left:50%;transform:translateX(-50%);z-index:60;background:var(--exc);color:#fff;padding:12px 18px;border-radius:10px;box-shadow:var(--sh2);display:flex;gap:12px;align-items:center;font-size:13px';
-  bar.innerHTML='A collaborator saved changes. <button class="btn sm" style="background:#fff;color:var(--exc)" onclick="reloadShared()">Reload latest</button>';
+  bar.className='conflict-soft';
+  bar.innerHTML='<span>Newer team changes are available.</span> <button class="btn sm" style="background:#fff;color:var(--ink)" onclick="reloadShared()">Reload latest</button>';
   document.body.appendChild(bar);
 }
 async function reloadShared(){ const b=document.getElementById('conflict-bar'); if(b)b.remove();
@@ -4196,9 +4319,14 @@ async function reloadShared(){ const b=document.getElementById('conflict-bar'); 
 function setSyncState(s){
   const el=document.getElementById('sync-state'); if(!el)return;
   el.textContent = s==='saved'?'✓ all changes saved':s==='conflict'?'⚠ needs reload':s==='error'?'⚠ offline — retrying':'saving…';
-  el.style.color = s==='error'||s==='conflict'?'var(--exc)':'var(--t3)';
+  el.style.color = s==='error'?'var(--exc)':s==='conflict'?'var(--maybe)':'var(--t3)';
 }
 window.reloadShared=reloadShared;
+setSyncState=function(s){
+  const el=document.getElementById('sync-state'); if(!el)return;
+  el.textContent = s==='saved'?'Saved':s==='conflict'?'New team changes available':s==='error'?'Offline - retrying':'Saving...';
+  el.style.color = s==='error'?'var(--exc)':s==='conflict'?'var(--maybe)':'var(--t3)';
+};
 
 /* ---------- INVITE / MEMBERS UI (inside a project) ---------- */
 async function inviteCollabModal(){
@@ -4262,7 +4390,19 @@ window.sendInvite = sendInvite;
 
 function renderHomeServer(){
   const home=document.getElementById('home');
+  const name=esc(userDisplayName());
+  const last=esc(fmtDateTime(BK.previousLoginAt));
   home.innerHTML=`<div class="home-wrap">
+    <div class="welcome-card">
+      <h2>Welcome, ${name}</h2>
+      <div class="muted">Last login: ${last}</div>
+      <div class="welcome-stats">
+        <div class="welcome-stat"><b id="dash-reviews">-</b><div class="muted">active reviews</div></div>
+        <div class="welcome-stat"><b id="dash-progress">-</b><div class="muted">overall screening progress</div><div class="prog-mini" style="max-width:none;margin-top:8px"><i id="dash-progress-bar" style="width:0%"></i></div></div>
+        <div class="welcome-stat"><b id="dash-done">-</b><div class="muted">screened records</div></div>
+        <div class="welcome-stat"><b id="dash-updated">-</b><div class="muted">last project update</div></div>
+      </div>
+    </div>
     <div class="home-hero">
       <div><h1>Your reviews</h1>
         <p class="lead">Reviews are saved to your account and shared live with everyone you invite. Create one, or open a shared review below.</p></div>
@@ -4278,8 +4418,17 @@ function renderHomeServer(){
       <div class="muted" style="padding:20px">Loading your reviews…</div>
     </div></div>`;
   serverListProjects().then(projs=>{
+    const total=projs.reduce((s,p)=>s+(p.counts&&p.counts.total||0),0);
+    const screened=projs.reduce((s,p)=>s+(p.counts&&p.counts.screened||0),0);
+    const pct=total?Math.round(screened/total*100):0;
+    const lastUpdate=projs[0]&&projs[0].updatedAt?fmtDateTime(projs[0].updatedAt):'No project yet';
+    const setDash=(id,val)=>{const el=document.getElementById(id);if(el)el.textContent=val;};
+    setDash('dash-reviews',projs.length);setDash('dash-progress',pct+'%');setDash('dash-done',screened+' / '+total);setDash('dash-updated',lastUpdate);
+    const dashBar=document.getElementById('dash-progress-bar');if(dashBar)dashBar.style.width=pct+'%';
     const cards=projs.map(p=>{
       const when=p.updatedAt?new Date(p.updatedAt).toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'}):'';
+      const c=p.counts||{total:0,incl:0,screened:0};
+      const prog=c.total?Math.round(c.screened/Math.max(1,c.total)*100):0;
       return `<div class="proj-card" onclick="openProject('${p.id}')">
         <div class="pc-title">${esc(p.title||'Untitled review')}</div>
         <div class="pc-q">${esc(p.question||'Open to view the protocol and studies')}</div>
@@ -4295,6 +4444,74 @@ function renderHomeServer(){
       +(!projs.length?'<div class="muted" style="padding:20px">No reviews yet — create your first.</div>':'');
   }).catch(e=>{ const grid=document.getElementById('home-grid'); if(grid)grid.innerHTML='<div class="banner warn"><span class="bi">⚠</span><div>Could not load reviews: '+esc(e.message)+'</div></div>'; });
 }
+window.renderHomeServer=renderHomeServer;
+function serverReviewProgress(p){
+  const c=p.counts||{};
+  const total=Number(c.total||0);
+  const screened=Number(c.screened||0);
+  const included=Number(c.incl||0);
+  const pct=total?Math.round(screened/total*100):0;
+  return {total,screened,included,pct};
+}
+function setHomeText(id,value){const el=document.getElementById(id);if(el)el.textContent=value;}
+renderHomeServer=function(){
+  const home=document.getElementById('home');
+  const name=esc(userDisplayName());
+  const last=esc(fmtDateTime(BK.previousLoginAt));
+  home.innerHTML=`<div class="home-wrap">
+    <div class="welcome-card">
+      <h2>Welcome, ${name}</h2>
+      <div class="muted">Last login: ${last}</div>
+      <div class="welcome-stats">
+        <div class="welcome-stat"><b id="dash-reviews">-</b><div class="muted">active reviews</div></div>
+        <div class="welcome-stat"><b id="dash-progress">-</b><div class="muted">overall title/abstract progress</div><div class="prog-mini" style="max-width:none;margin-top:8px"><i id="dash-progress-bar" style="width:0%"></i></div></div>
+        <div class="welcome-stat"><b id="dash-done">-</b><div class="muted">screened records</div></div>
+        <div class="welcome-stat"><b id="dash-included">-</b><div class="muted">full-text included</div></div>
+      </div>
+    </div>
+    <div class="home-hero">
+      <div><h1>Your reviews</h1>
+        <p class="lead">Reviews are saved to your account and shared live with everyone you invite. Create one, or open a shared review below.</p></div>
+      <div class="spacer"></div>
+      <div class="row" style="align-items:center">
+        <span class="muted">${esc((BK.user&&(BK.user.name||BK.user.email))||'')}</span>
+        <button class="btn" onclick="newProject()">+ New review</button>
+        <button class="btn gh" onclick="doLogout()">Log out</button>
+      </div>
+    </div>
+    <div id="home-grid" class="proj-grid">
+      <div class="proj-card new-card" onclick="newProject()"><div class="plus">+</div><div style="margin-top:8px;font-weight:600">Start a new review</div></div>
+      <div class="muted" style="padding:20px">Loading your reviews...</div>
+    </div></div>`;
+  serverListProjects().then(projs=>{
+    const totals=projs.reduce((a,p)=>{const v=serverReviewProgress(p);a.total+=v.total;a.screened+=v.screened;a.included+=v.included;return a;},{total:0,screened:0,included:0});
+    const pct=totals.total?Math.round(totals.screened/totals.total*100):0;
+    setHomeText('dash-reviews',projs.length);
+    setHomeText('dash-progress',pct+'%');
+    setHomeText('dash-done',totals.screened+' / '+totals.total);
+    setHomeText('dash-included',totals.included);
+    const dashBar=document.getElementById('dash-progress-bar');if(dashBar)dashBar.style.width=pct+'%';
+    const cards=projs.map(p=>{
+      const when=p.updatedAt?new Date(p.updatedAt).toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'}):'';
+      const v=serverReviewProgress(p);
+      return `<div class="proj-card" onclick="openProject('${p.id}')">
+        <div class="pc-title">${esc(p.title||'Untitled review')}</div>
+        <div class="pc-q">${v.total?`${v.screened} of ${v.total} records screened`:'Open to view the protocol and studies'}</div>
+        <div class="pc-meta"><span class="pill ${p.role==='owner'?'f':'s'}">${esc(p.role||'member')}</span>
+          ${p.members>1?`<span class="pill">${p.members} members</span>`:''}
+          ${v.included?`<span class="pill f">${v.included} included</span>`:''}</div>
+        <div class="prog-mini" style="max-width:none;margin-top:12px"><i style="width:${v.pct}%"></i></div>
+        <div class="muted" style="margin-top:6px">${v.pct}% title/abstract complete</div>
+        <div class="pc-foot" onclick="event.stopPropagation()">
+          <span class="pc-date" style="flex:1">${esc(when)}</span>
+          ${p.role==='owner'?`<button class="pc-act del" title="Delete for everyone" onclick="deleteProject('${p.id}')">x</button>`:''}
+        </div></div>`;
+    }).join('');
+    const grid=document.getElementById('home-grid');
+    if(grid)grid.innerHTML=`<div class="proj-card new-card" onclick="newProject()"><div class="plus">+</div><div style="margin-top:8px;font-weight:600">Start a new review</div></div>`+cards
+      +(!projs.length?'<div class="muted" style="padding:20px">No reviews yet - create your first.</div>':'');
+  }).catch(e=>{ const grid=document.getElementById('home-grid'); if(grid)grid.innerHTML='<div class="banner warn"><span class="bi">!</span><div>Could not load reviews: '+esc(e.message)+'</div></div>'; });
+};
 window.renderHomeServer=renderHomeServer;
 
 let _booted=false;
