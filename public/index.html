@@ -461,6 +461,7 @@ function blankState(){return{
   prisma:{}, settings:{strictness:'balanced',screenMode:null,localThr:0.35,localMaybeBand:0.08},
   createdAt:new Date().toISOString()
 };}
+function ensureAudit(){ST.audit=ST.audit||[];return ST.audit;}
 function listProjects(){try{return JSON.parse(localStorage.getItem(IDX))||[]}catch(e){return[]}}
 function writeIndex(arr){try{localStorage.setItem(IDX,JSON.stringify(arr))}catch(e){}}
 function projCounts(){const u=ST.refs.filter(r=>!r.dup);
@@ -605,6 +606,7 @@ const ASRMA={
   trainAgents,screenAll,screenOne,setDecision,
   importText:doImportText,importFile:doImportFile,parseAndAdd,
   dedup:runDedup,fetchFullText,fetchAllFullText,
+  ftScreen,screenAllFullText,
   addEffect,removeEffect,runMeta
 };
 window.ASRMA=ASRMA;
@@ -1455,6 +1457,45 @@ function fmtMinutes(mins){
   const h=Math.floor(mins/60),m=mins%60;
   return h+'h'+(m?(' '+m+'m'):'');
 }
+function fmtDuration(ms){
+  ms=Math.max(0,Math.round(ms||0));
+  if(ms<1000)return ms+' ms';
+  const sec=Math.round(ms/1000);
+  if(sec<60)return sec+' sec';
+  const m=Math.floor(sec/60),s=sec%60;
+  return m+'m'+(s?(' '+s+'s'):'');
+}
+function progressTick(id,done,total,start,label){
+  const el=document.getElementById(id);if(!el)return;
+  const elapsed=Date.now()-start;
+  const per=done?elapsed/done:0;
+  const left=Math.max(0,total-done);
+  el.textContent=`${label||'Screening'}: ${done}/${total} · elapsed ${fmtDuration(elapsed)} · ${done?('~'+fmtDuration(per)+' / article · ETA '+fmtDuration(per*left)):'starting...'}`;
+}
+function logAIDiscrepancy(stage,r,prev,human){
+  const aiDecision=prev&&(prev.final||prev.decision);
+  if(!prev||!aiDecision||!prev.by||prev.by==='human'||aiDecision===human)return false;
+  const item={id:uid('disc_'),stage,refId:r.id,title:r.title||'',aiBy:prev.by,model:prev.model||'',aiDecision,humanDecision:human,
+    aiReason:prev.reason||'',reviewer:currentReviewerName(),at:new Date().toISOString()};
+  ensureAudit().push(item);
+  ST.agent=ST.agent||{};ST.agent.corrections=ST.agent.corrections||[];
+  ST.agent.corrections.push(item);
+  ST.agent.corrections=ST.agent.corrections.slice(-30);
+  return true;
+}
+function correctionMemory(stage){
+  const rows=(ST.agent&&ST.agent.corrections||[]).filter(x=>!stage||x.stage===stage).slice(-8);
+  if(!rows.length)return '';
+  return '\nHUMAN CORRECTIONS TO LEARN FROM:\n'+rows.map((x,i)=>`${i+1}. ${x.title||'Study'}: Viveka said ${x.aiDecision}; human reviewer changed to ${x.humanDecision}. Prior reason: ${x.aiReason||'not recorded'}`).join('\n')+'\n';
+}
+let _localRetrainT=null;
+function scheduleLocalRetrain(){
+  if(!ST.engine)return;
+  const t=localTrainable();
+  if(!t.ok)return;
+  clearTimeout(_localRetrainT);
+  _localRetrainT=setTimeout(()=>{_localRetrainT=null;try{trainLocalEngine();toast('Viveka Local learned from the human correction and re-scored the queue','ok');}catch(e){}},1200);
+}
 function buildScreenPrompt(title,abstract,mode){
   const a=ST.agent,p=ST.project;
   const persona=a.persona||'You are a senior systematic reviewer trained in Cochrane/JBI methodology.';
@@ -1473,6 +1514,7 @@ EXCLUDE if: ${p.exc||'outside PICO'}
 
 DECISION RUBRIC:
 ${rubric}
+${correctionMemory('ta')}
 
 STUDY
 Title: ${title}
@@ -1483,11 +1525,12 @@ Decide. Return ONLY JSON:
 }
 async function screenOne(id,useAdv){
   const r=ST.refs.find(x=>x.id===id);if(!r)return;
+  const started=Date.now();
   const model=useAdv?ST.agent.advModel:ST.agent.model;
   const res=parseJSON(await LLM(buildScreenPrompt(r.title,r.abstract,'screen'),320,model));
   const v=(res.v||'maybe').toLowerCase();
   const dec=v.includes('inc')?'include':v.includes('exc')?'exclude':'maybe';
-  r.ta={a:dec,b:null,final:dec,conf:res.conf||50,reason:res.reason||'',comment:(r.ta&&r.ta.comment)||'',pico:res.pico||{},by:'agent',model,reviewer:'Viveka',reviewedAt:new Date().toISOString()};
+  r.ta={a:dec,b:null,final:dec,conf:res.conf||50,reason:res.reason||'',comment:(r.ta&&r.ta.comment)||'',pico:res.pico||{},by:'agent',model,reviewer:'Viveka',reviewedAt:new Date().toISOString(),ms:Date.now()-started};
   return r;
 }
 async function screenAll(){
@@ -1499,10 +1542,12 @@ async function screenAll(){
   if(pend.length===0&&!confirm('Re-screen all '+queue.length+' studies?'))return;
   const btn=document.getElementById('screen-btn');if(btn)btn.disabled=true;
   agentBusy(true);
-  const bar=document.getElementById('screen-bar');let done=0;const list=pend.length?pend:queue;
+  const bar=document.getElementById('screen-bar');let done=0;const list=pend.length?pend:queue;const started=Date.now();
+  progressTick('screen-time',0,list.length,started,'Viveka Cloud');
   for(const r of list){
     try{await screenOne(r.id);}catch(e){r.ta={a:'maybe',final:'maybe',conf:0,reason:'error: '+e.message,by:'agent'};}
     done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';
+    progressTick('screen-time',done,list.length,started,'Viveka Cloud');
     if(done%10===0){saveSoon();renderScreenStats();}
   }
   saveNow();agentBusy(false);renderScreen();renderSpine();
@@ -1511,7 +1556,9 @@ async function screenAll(){
 function setDecision(id,dec,ev){
   const r=refById(id);if(!r)return;
   const prev=r.ta||{};
+  const learned=logAIDiscrepancy('ta',r,prev,dec);
   r.ta=Object.assign({},prev,{final:dec,human:dec,by:'human',conf:100,reason:prev.reason&&prev.by==='agent'?prev.reason:'human decision',comment:prev.comment||'',reviewer:currentReviewerName(),reviewedAt:new Date().toISOString(),seeded:prev.seeded});
+  if(learned&&prev.by==='local')scheduleLocalRetrain();
   if(r._conflict)r._conflict=false; // lead resolved the disagreement
   saveSoon();
   if(currentMode()==='local'&&!ST.engine){renderScreen();renderSpine();return;}
@@ -1568,6 +1615,7 @@ function renderScreen(){
   </div>
   <div id="screen-stats"></div>
   ${mode==='llm'?renderLLMControls():renderLocalControls()}
+  ${mode==='local'?`<div class="toolbar"><span class="muted" id="screen-time">Timer appears after Viveka Local scores or re-thresholds.</span></div>`:''}
   <div class="toolbar">
     <div class="seg" id="screen-seg">
       ${['all','pending','include','maybe','exclude'].map(f=>`<button class="${SCREEN_FILTER===f?'on':''}" onclick="setScreenFilter('${f}')">${f[0].toUpperCase()+f.slice(1)}</button>`).join('')}
@@ -1583,6 +1631,7 @@ function renderLLMControls(){
   return `<div class="toolbar">
     <button class="btn flow sm" id="screen-btn" onclick="ASRMA.screenAll()">⊹ Auto-screen with Viveka</button>
     <div class="pbar" style="width:140px"><i id="screen-bar"></i></div>
+    <span class="muted" id="screen-time">Timer appears while Viveka Cloud is screening.</span>
     <select class="inp" style="width:auto" onchange="ST.settings.strictness=this.value;save()">
       ${['lenient','balanced','strict'].map(s=>`<option value="${s}" ${ST.settings.strictness===s?'selected':''}>${s} strictness</option>`).join('')}</select>
     <span class="muted">Uses ~1 LLM call per paper.</span>
@@ -1713,6 +1762,7 @@ function vecFor(r,eng){const sig=engSig(eng);const c=_vecCache.get(r.id);
   const v=tfidf(ltok(docText(r)),eng);_vecCache.set(r.id,{sig,v});return v;}
 function scoreAllLocal(vmap){
   const eng=ST.engine;if(!eng)return;
+  const started=Date.now();let scored=0;
   const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
   const maybeBand=ST.settings.localMaybeBand!=null?ST.settings.localMaybeBand:0.08;
   ST.refs.forEach(r=>{
@@ -1722,8 +1772,13 @@ function scoreAllLocal(vmap){
     const p=localProbability(v,eng);
     const dec=p>=thr?'include':(p>=thr-maybeBand?'maybe':'exclude');
     const distance=dec==='exclude'?Math.max(0,(thr-maybeBand)-p):Math.abs(p-thr);
-    r.ta={a:dec,final:dec,prob:p,conf:Math.min(99,Math.round(Math.max(8,distance*220))),reason:'local recall score '+(p*100).toFixed(0)+'% at '+Math.round(thr*100)+'% threshold'+(dec==='maybe'?' (borderline - human review)':''),by:'local'};
+    scored++;
+    r.ta={a:dec,final:dec,prob:p,conf:Math.min(99,Math.round(Math.max(8,distance*220))),reason:'local recall score '+(p*100).toFixed(0)+'% at '+Math.round(thr*100)+'% threshold'+(dec==='maybe'?' (borderline - human review)':''),by:'local',ms:0};
   });
+  eng.lastScoreMs=Date.now()-started;
+  eng.lastScoreN=scored;
+  eng.lastScorePerMs=scored?eng.lastScoreMs/scored:0;
+  progressTick('screen-time',scored,scored||1,started,'Viveka Local');
 }
 let _thrDeb=null;
 function reThreshold(v){
@@ -1815,6 +1870,7 @@ function renderScreenStats(){
   const local=currentMode()==='local';
   const mine=splitOn?myAssignedRefs().length:0;
   const minePend=splitOn?myPendingAssignedCount():0;
+  const disc=ensureAudit().filter(x=>x.stage==='ta').length;
   const scopeNote=splitOn?`<div class="muted" style="margin:6px 0 12px">${assignedOnly?'Showing only studies assigned to you. Turn this off to view the full project.':'Showing the full project. Your assigned queue has '+mine+' studies, '+minePend+' still pending.'}</div>`:'';
   el.innerHTML=`<div class="tiles">
     <div class="tile"><div class="v">${total}</div><div class="k">${assignedOnly?'assigned queue':'to screen'}</div></div>
@@ -1826,6 +1882,7 @@ function renderScreenStats(){
     ${local?`<div class="tile syn"><div class="v">${byHuman}</div><div class="k">you confirmed</div></div>
       <div class="tile flow"><div class="v">${byEngine}</div><div class="k">engine-scored</div></div>`
       :`<div class="tile"><div class="v">${pend}</div><div class="k">pending</div></div>`}
+    ${disc?`<div class="tile maybe"><div class="v">${disc}</div><div class="k">AI discrepancies logged</div></div>`:''}
   </div>${(inc||maybe)?`<div class="row" style="margin-bottom:6px"><button class="btn" onclick="ASRMA.go('fulltext')">Full-text screening (${inc+maybe}) →</button></div>`:''}`;
   if(scopeNote)el.insertAdjacentHTML('beforeend',scopeNote);
 }
@@ -1973,10 +2030,14 @@ async function fetchAllFullText(){
     if(done%3===0)renderFulltextList();}
   renderFulltext();renderSpine();toast('Retrieved metadata for '+done+' studies','ok');
 }
-async function ftScreen(id){
+async function ftScreen(id,mode){
+  mode=mode||'cloud';
+  const silent=arguments.length>2&&arguments[2]===true;
+  if(mode==='local')return ftScreenLocal(id,silent);
   const r=ST.refs.find(x=>x.id===id);if(!r)return;
   agentBusy(true);
   try{
+    const started=Date.now();
     const ctx=r.ft&&r.ft.pdfText?('FULL TEXT (excerpt):\n'+r.ft.pdfText.slice(0,9000)):('ABSTRACT:\n'+r.abstract);
     const p=ST.project;
     const reviewCtx=buildReviewContext(p);
@@ -1985,17 +2046,57 @@ ${reviewCtx}
 Full-text eligibility assessment for: ${p.question}
 INCLUDE if: ${p.inc}
 EXCLUDE if: ${p.exc}
+${correctionMemory('ft')}
 STUDY: ${r.title}
 ${ctx}
 Return ONLY JSON: {"v":"include|exclude","reason":"<clause>","excl_cat":"<if exclude: wrong population|wrong intervention|wrong comparator|wrong outcome|wrong design|no usable data|other>"}`,400,ST.agent.advModel));
     r.ft=r.ft||{};r.ft.decision=(res.v||'').includes('inc')?'include':'exclude';
-    r.ft.reason=res.reason;r.ft.exclCat=res.excl_cat||'';r.ft.by='agent';r.ft.reviewer='Viveka';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';
-    save();renderFulltext();renderSpine();
+    r.ft.reason=res.reason;r.ft.exclCat=res.excl_cat||'';r.ft.by='agent';r.ft.model=ST.agent.advModel;r.ft.reviewer='Viveka';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';r.ft.ms=Date.now()-started;
+    if(!silent){save();renderFulltext();renderSpine();}
   }catch(e){toast(e.message,'err')}
   agentBusy(false);
 }
+async function ftScreenLocal(id,silent){
+  const r=ST.refs.find(x=>x.id===id);if(!r)return;
+  if(!ST.engine){toast('Train Viveka Local in title/abstract screening first','err');return;}
+  const started=Date.now();
+  const text=(r.title||'')+' '+(r.title||'')+' '+((r.ft&&r.ft.pdfText)||r.abstract||'');
+  const v=tfidf(ltok(text),ST.engine);
+  const p=localProbability(v,ST.engine);
+  const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
+  const band=ST.settings.localMaybeBand!=null?ST.settings.localMaybeBand:0.08;
+  const dec=p>=thr?'include':(p>=thr-band?'maybe':'exclude');
+  r.ft=r.ft||{};
+  r.ft.decision=dec;r.ft.reason='Viveka Local full-text score '+(p*100).toFixed(0)+'% at '+Math.round(thr*100)+'% threshold'+(dec==='maybe'?' (borderline - human review)':'');
+  r.ft.exclCat=dec==='exclude'?'other':'';r.ft.by='local';r.ft.reviewer='Viveka Local';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';r.ft.prob=p;r.ft.ms=Date.now()-started;
+  if(!silent)save();return r;
+}
+async function screenAllFullText(mode){
+  mode=mode||'cloud';
+  const listAll=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  if(!listAll.length){toast('No title/abstract included studies for full text','err');return;}
+  if(mode==='cloud'&&!ST.agent.trained){toast('Train Viveka Cloud first','err');ASRMA.go('agents');return;}
+  if(mode==='local'&&!ST.engine){toast('Train Viveka Local first','err');ASRMA.go('screen');return;}
+  const pending=listAll.filter(r=>!(r.ft&&r.ft.decision));
+  const list=pending.length?pending:listAll;
+  if(!pending.length&&!confirm('Re-assess all '+list.length+' full-text studies with Viveka '+(mode==='local'?'Local':'Cloud')+'?'))return;
+  const btn=document.getElementById(mode==='local'?'ft-local-btn':'ft-cloud-btn');if(btn)btn.disabled=true;
+  agentBusy(mode==='cloud');
+  const bar=document.getElementById('ft-screen-bar');let done=0;const started=Date.now();
+  progressTick('ft-screen-time',0,list.length,started,'Full-text '+(mode==='local'?'Local':'Cloud'));
+  for(const r of list){
+    try{await ftScreen(r.id,mode,true);}catch(e){r.ft=r.ft||{};r.ft.decision='maybe';r.ft.reason='error: '+e.message;r.ft.by=mode==='local'?'local':'agent';}
+    done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';
+    progressTick('ft-screen-time',done,list.length,started,'Full-text '+(mode==='local'?'Local':'Cloud'));
+    if(done%3===0){saveSoon();renderFTStats();}
+  }
+  saveNow();agentBusy(false);renderFulltext();renderSpine();toast('Full-text assessed '+done+' studies with Viveka '+(mode==='local'?'Local':'Cloud'),'ok');
+}
 function ftDecide(id,dec,cat){const r=ST.refs.find(x=>x.id===id);if(!r)return;
+  const prev=r.ft||{};
+  const learned=logAIDiscrepancy('ft',r,prev,dec);
   r.ft=r.ft||{};r.ft.decision=dec;r.ft.by='human';r.ft.reviewer=currentReviewerName();r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';if(cat!==undefined)r.ft.exclCat=cat;
+  if(learned&&prev.by==='local')scheduleLocalRetrain();
   save();renderFulltextList();renderFTStats();renderSpine();}
 function renderFulltext(){
   document.getElementById('pane-fulltext').innerHTML=`
@@ -2007,6 +2108,12 @@ function renderFulltext(){
     <button class="btn flow sm" id="ft-fetch-btn" onclick="ASRMA.fetchAllFullText()">🌐 Fetch full text</button>
     <div class="pbar" style="width:160px"><i id="ft-bar"></i></div>
     <span class="muted">Open-access papers retrieved automatically; others link out.</span>
+  </div>
+  <div class="toolbar">
+    <button class="btn flow sm" id="ft-cloud-btn" onclick="screenAllFullText('cloud')">⊹ Full-text screen all · Cloud</button>
+    <button class="btn gh sm" id="ft-local-btn" onclick="screenAllFullText('local')">⚙ Full-text screen all · Local</button>
+    <div class="pbar" style="width:160px"><i id="ft-screen-bar"></i></div>
+    <span class="muted" id="ft-screen-time">Timer appears while full-text screening runs.</span>
   </div>
   <div id="ft-list"></div>`;
   renderFTStats();renderFulltextList();
@@ -2047,20 +2154,24 @@ function renderFulltextList(){
         <button class="vbtn inc ${dec==='include'?'act-inc':''}" onclick="ftDecide('${r.id}','include')">✓</button>
       </div></div>`;}).join('');
 }
-window.ftScreen=ftScreen;window.ftDecide=ftDecide;
+window.ftScreen=ftScreen;window.ftScreenLocal=ftScreenLocal;window.screenAllFullText=screenAllFullText;window.ftDecide=ftDecide;
 function renderFTStats(){
   const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
   const inc=list.filter(r=>r.ft&&r.ft.decision==='include').length;
+  const maybe=list.filter(r=>r.ft&&r.ft.decision==='maybe').length;
   const exc=list.filter(r=>r.ft&&r.ft.decision==='exclude').length;
   const oa=list.filter(r=>r.ft&&r.ft.oa).length;
   const estTotal=list.reduce((sum,r)=>sum+ftEstimateMinutes(r),0);
   const estPending=list.filter(r=>!(r.ft&&r.ft.decision)).reduce((sum,r)=>sum+ftEstimateMinutes(r),0);
+  const disc=ensureAudit().filter(x=>x.stage==='ft').length;
   const el=document.getElementById('ft-stats');if(!el)return;
   el.innerHTML=`<div class="tiles">
     <div class="tile"><div class="v">${list.length}</div><div class="k">at full text</div></div>
     <div class="tile flow"><div class="v">${oa}</div><div class="k">open access</div></div>
     <div class="tile inc"><div class="v">${inc}</div><div class="k">included</div></div>
+    <div class="tile maybe"><div class="v">${maybe}</div><div class="k">maybe</div></div>
     <div class="tile exc"><div class="v">${exc}</div><div class="k">excluded</div></div>
+    ${disc?`<div class="tile maybe"><div class="v">${disc}</div><div class="k">AI discrepancies logged</div></div>`:''}
   </div><div class="muted" style="margin:-6px 0 14px">Estimated full-text review time: <b>${fmtMinutes(estTotal)}</b> total · <b>${fmtMinutes(estPending)}</b> still pending.</div>${inc?`<div class="row" style="margin-bottom:6px"><button class="btn" onclick="ASRMA.go('extract')">Extract data (${inc}) →</button></div>`:''}`;
 }
 function renderFulltextList(){
@@ -2084,6 +2195,40 @@ function renderFulltextList(){
         <button class="btn gh sm" onclick="pasteFullText('${r.id}')" title="Paste text">📝 Paste</button>
         <button class="btn flow sm" onclick="ftScreen('${r.id}')">⊹ Assess</button>
         <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" onclick="ftDecide('${r.id}','exclude')">✗</button>
+        <button class="vbtn inc ${dec==='include'?'act-inc':''}" onclick="ftDecide('${r.id}','include')">✓</button>
+      </div>
+      ${ft.reviewedAt?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ft))}</div>`:''}
+      ${ft.pdfText?`<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--flow);font-weight:700">Preview retrieved full text</summary><div style="margin-top:8px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--wash);max-height:220px;overflow:auto;white-space:pre-wrap;font-size:12px;line-height:1.55">${esc(ft.pdfText.slice(0,2200))}</div></details>`:''}
+      <div class="fg" style="margin:10px 0 0">
+        <label class="fl">Comment / reason</label>
+        <textarea class="inp" style="min-height:64px" placeholder="Add reviewer comments, exclusion rationale, or notes for extraction" oninput="setDecisionComment('ft','${r.id}',this.value)">${esc(ft.comment||'')}</textarea>
+      </div></div>`;}).join('');
+}
+
+function renderFulltextList(){
+  const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  const el=document.getElementById('ft-list');if(!el)return;
+  if(!list.length){el.innerHTML='<div class="empty"><div class="ico">▤</div><h3>No studies at full text</h3><div>Include some studies in title/abstract screening first.</div></div>';return;}
+  el.innerHTML=list.map(r=>{const ft=r.ft||{};const dec=ft.decision;
+    return`<div class="study ${dec||''}">
+      <div class="st-title">${esc(r.title)}</div>
+      <div class="st-meta"><span>${esc(r.year||'')}</span><span>${esc(r.journal||'')}</span>
+        ${ft.oa?'<span style="color:var(--inc);font-weight:700">OA</span>':''}
+        ${ft.fulltextUrl?`<a href="${esc(ft.fulltextUrl)}" target="_blank">full text</a>`:r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi</a>`:''}
+        ${ft.pdfText?`<span style="color:var(--flow)">text attached (${(ft.pdfText.length/1000).toFixed(0)}k chars)</span>`:'<span style="color:var(--maybe)">no full text yet</span>'}
+        <span style="color:var(--t3)">estimated human time: ~${fmtMinutes(ftEstimateMinutes(r))}</span>
+        ${ft.ms?`<span style="color:var(--t3)">Viveka time: ${fmtDuration(ft.ms)}</span>`:''}</div>
+      <div class="st-foot">
+        ${dec?`<span class="dchip ${dec}">${dec==='include'?'Included':dec==='maybe'?'Maybe':'Excluded'}</span>
+          ${ft.exclCat?`<span class="pill">${esc(ft.exclCat)}</span>`:''}
+          <span class="muted" style="flex:1">${esc(ft.reason||'')}</span>`:'<span class="dchip pend">not assessed</span><span class="spacer"></span>'}
+        <button class="btn gh sm" onclick="ASRMA.fetchFullText('${r.id}').then(()=>{renderFulltextList()})" title="Fetch open-access text online">Fetch</button>
+        <button class="btn gh sm" onclick="attachFullText('${r.id}')" title="Upload a PDF or .txt">Attach</button>
+        <button class="btn gh sm" onclick="pasteFullText('${r.id}')" title="Paste text">Paste</button>
+        <button class="btn flow sm" onclick="ftScreen('${r.id}','cloud')">Viveka Cloud</button>
+        <button class="btn gh sm" onclick="ftScreen('${r.id}','local').then(()=>{renderFulltextList();renderFTStats();})">Viveka Local</button>
+        <button class="vbtn maybe ${dec==='maybe'?'act-maybe':''}" onclick="ftDecide('${r.id}','maybe')">?</button>
+        <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" onclick="ftDecide('${r.id}','exclude')">x</button>
         <button class="vbtn inc ${dec==='include'?'act-inc':''}" onclick="ftDecide('${r.id}','include')">✓</button>
       </div>
       ${ft.reviewedAt?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ft))}</div>`:''}
