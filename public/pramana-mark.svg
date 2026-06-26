@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="Pramana">
+  <defs>
+    <linearGradient id="g" x1="18" y1="14" x2="112" y2="116" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0d9488"/>
+      <stop offset="1" stop-color="#4f46e5"/>
+    </linearGradient>
+    <filter id="s" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="8" stdDeviation="8" flood-color="#1c2740" flood-opacity=".18"/>
+    </filter>
+  </defs>
+  <rect width="128" height="128" rx="28" fill="#f6f8fc"/>
+  <rect x="14" y="14" width="100" height="100" rx="24" fill="url(#g)" filter="url(#s)"/>
+  <path d="M39 34h30c20 0 33 12 33 30S89 94 69 94H39V34zm17 16v28h13c10 0 16-5 16-14s-6-14-16-14H56z" fill="#fff"/>
+  <path d="M31 93c16-6 28-17 37-33 7-12 14-19 25-22" fill="none" stroke="#f4d27a" stroke-width="7" stroke-linecap="round"/>
+  <circle cx="94" cy="38" r="8" fill="#f4d27a"/>
+</svg>
