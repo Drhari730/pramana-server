@@ -1669,6 +1669,13 @@ async function screenOne(id,useAdv){
   const r=ST.refs.find(x=>x.id===id);if(!r)return;
   const started=Date.now();
   const model=useAdv?ST.agent.advModel:ST.agent.model;
+  if(window.BK&&BK.isServer&&BK.isServer()&&serverAIReady(model)&&ST.id){
+    if(typeof _srvTimer!=='undefined'&&_srvTimer)await serverSaveNow();
+    const res=await BK.api('POST','/api/projects/'+ST.id+'/ai/screen',{stage:'ta',refId:id},70000);
+    const dec=normDecision(res.decision||res.v);
+    r.ta={a:dec,b:null,final:dec,conf:res.conf||50,reason:res.reason||'',comment:(r.ta&&r.ta.comment)||'',pico:res.pico||{},by:'agent',model:res.model||model,reviewer:'Viveka',reviewedAt:new Date().toISOString(),ms:Date.now()-started,server:true};
+    return r;
+  }
   const res=parseJSON(await LLM(buildScreenPrompt(r.title,r.abstract,'screen'),320,model));
   const dec=normDecision(res.v);
   r.ta={a:dec,b:null,final:dec,conf:res.conf||50,reason:res.reason||'',comment:(r.ta&&r.ta.comment)||'',pico:res.pico||{},by:'agent',model,reviewer:'Viveka',reviewedAt:new Date().toISOString(),ms:Date.now()-started};
@@ -2204,6 +2211,15 @@ async function ftScreen(id,mode){
   agentBusy(true);
   try{
     const started=Date.now();
+    if(window.BK&&BK.isServer&&BK.isServer()&&serverAIReady(ST.agent.advModel)&&ST.id){
+      if(typeof _srvTimer!=='undefined'&&_srvTimer)await serverSaveNow();
+      const res=await BK.api('POST','/api/projects/'+ST.id+'/ai/screen',{stage:'fulltext',refId:id},70000);
+      r.ft=r.ft||{};r.ft.decision=normDecision(res.decision||res.v);
+      r.ft.reason=res.reason||'';r.ft.exclCat=res.exclCat||'';r.ft.by='agent';r.ft.model=res.model||ST.agent.advModel;r.ft.reviewer='Viveka';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';r.ft.ms=Date.now()-started;r.ft.server=true;
+      if(!silent){save();renderFulltext();renderSpine();}
+      agentBusy(false);
+      return r;
+    }
     const ctx=r.ft&&r.ft.pdfText?('FULL TEXT (excerpt):\n'+r.ft.pdfText.slice(0,9000)):('ABSTRACT:\n'+r.abstract);
     const p=ST.project;
     const reviewCtx=buildReviewContext(p);

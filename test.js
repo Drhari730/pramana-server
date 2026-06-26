@@ -63,6 +63,9 @@ async function mockQuery(text, params=[]) {
   if (s==='SELECT id,title,data,version,updated_at,updated_by FROM projects WHERE id=$1') {
     return T.projects.filter(p=>p.id===params[0]).map(p=>clone(p));
   }
+  if (s==='SELECT data,version FROM projects WHERE id=$1') {
+    return T.projects.filter(p=>p.id===params[0]).map(p=>({data:clone(p.data),version:p.version}));
+  }
   if (s==='SELECT version FROM projects WHERE id=$1')
     return T.projects.filter(p=>p.id===params[0]).map(p=>({version:p.version}));
   if (s==='SELECT title FROM projects WHERE id=$1')
@@ -257,6 +260,14 @@ async function run() {
   ok('config reports server AI disabled when no key set', r.status===200 && r.body.aiServerEnabled===false);
   r = await lead('POST','/api/ai/generate',{model:'gemini-flash',prompt:'Return OK',maxTok:16});
   ok('server AI endpoint requires configured provider key', r.status===503 && /not configured/i.test(r.body.error||''));
+
+  console.log('\n=== SERVER AI PHASE 2 SCREENING ===');
+  r = await outsider('POST','/api/projects/'+pid+'/ai/screen',{stage:'ta',refId:'r2'});
+  ok('non-member blocked from server-side screening', r.status===403);
+  r = await lead('POST','/api/projects/'+pid+'/ai/screen',{stage:'ta',refId:'missing'});
+  ok('server-side screening rejects missing study', r.status===404);
+  r = await lead('POST','/api/projects/'+pid+'/ai/screen',{stage:'ta',refId:'r2'});
+  ok('server-side screening uses configured project and requires provider key', r.status===503 && /not configured/i.test(r.body.error||''));
 
   console.log('\n=== RATE LIMITING ===');
   const rlc = makeClient();

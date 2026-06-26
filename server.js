@@ -16,6 +16,7 @@
      POST /api/invites/accept  {token}                 join a project (must be logged in)
      DELETE /api/projects/:id/members/:userId          remove a member (owner)
      POST /api/ai/generate     {prompt,maxTok,model}   server-side AI proxy
+     POST /api/projects/:id/ai/screen {stage,refId}     server-side Viveka screening
    Static: serves the front-end (index.html) from ./public
    ============================================================ */
 const path = require('path');
@@ -185,6 +186,119 @@ async function serverLLM(prompt, maxTok, model) {
   }
   if (!txt) throw new Error('Empty AI response');
   return txt;
+}
+
+function parseAIJSON(text) {
+  let s = String(text || '').trim();
+  s = s.replace(/^```(?:json)?/i, '').replace(/```$/i, '').trim();
+  try { return JSON.parse(s); } catch (e) {}
+  const start = s.indexOf('{');
+  const end = s.lastIndexOf('}');
+  if (start >= 0 && end > start) return JSON.parse(s.slice(start, end + 1));
+  throw new Error('AI returned non-JSON output');
+}
+function normDecision(v) {
+  const s = String(v || '').toLowerCase();
+  if (s.includes('inc')) return 'include';
+  if (s.includes('may') || s.includes('unclear') || s.includes('border')) return 'maybe';
+  if (s.includes('exc')) return 'exclude';
+  return 'maybe';
+}
+function safeText(v, limit) {
+  const s = String(v || '').replace(/\s+/g, ' ').trim();
+  return limit ? s.slice(0, limit) : s;
+}
+function reviewContext(project) {
+  const p = project || {};
+  return [
+    `REVIEW TYPE: ${safeText(p.type || p.reviewTypeId || 'Systematic review')}`,
+    `FRAMEWORK: ${safeText(p.framework || 'PICO/PCC as configured')}`,
+    `TITLE: ${safeText(p.title || '')}`,
+    `QUESTION: ${safeText(p.question || '')}`,
+    `AXIS 1 / POPULATION: ${safeText(p.p || 'any')}`,
+    `AXIS 2 / INTERVENTION-CONCEPT-EXPOSURE: ${safeText(p.i || 'any')}`,
+    `AXIS 3 / COMPARATOR-CONTEXT: ${safeText(p.c || 'any')}`,
+    `AXIS 4 / OUTCOME: ${safeText(p.o || 'any')}`,
+    `INCLUSION CRITERIA: ${safeText(p.inc || 'matches protocol')}`,
+    `EXCLUSION CRITERIA: ${safeText(p.exc || 'outside protocol')}`
+  ].join('\n');
+}
+function correctionMemory(data, stage) {
+  const rows = (((data || {}).agent || {}).corrections || [])
+    .filter(x => !stage || x.stage === stage)
+    .slice(-10);
+  if (!rows.length) return '';
+  return '\nHUMAN CORRECTIONS / ACTIVE-LEARNING LESSONS:\n' +
+    'Use these as reviewer feedback. Do not repeat the same mistake pattern; apply a correction only when the current study is substantively similar.\n' +
+    rows.map((x, i) => `${i + 1}. ${safeText(x.title || 'Study', 180)}: prior AI said ${x.aiDecision}; human expert changed to ${x.humanDecision}. Prior reason: ${safeText(x.aiReason || 'not recorded', 240)}`).join('\n') +
+    '\n';
+}
+function rubricText(data) {
+  const rub = (((data || {}).agent || {}).rubric || []);
+  if (!Array.isArray(rub) || !rub.length) return 'Match the configured framework and eligibility criteria. Use MAYBE when the abstract is incomplete but plausibly eligible.';
+  return rub.map((r, i) => `${i + 1}. ${safeText(r, 260)}`).join('\n');
+}
+function buildServerScreenPrompt(data, ref, stage) {
+  const p = (data || {}).project || {};
+  const agent = (data || {}).agent || {};
+  const settings = (data || {}).settings || {};
+  const persona = safeText(agent.persona || 'You are a senior systematic reviewer trained in Cochrane/JBI/PRISMA methods.', 1600);
+  const strict = settings.strictness || 'balanced';
+  const ctx = reviewContext(p);
+  if (stage === 'fulltext') {
+    const ft = ref.ft || {};
+    const text = ft.pdfText
+      ? `FULL TEXT EXCERPT:\n${String(ft.pdfText).slice(0, 12000)}`
+      : `ABSTRACT ONLY:\n${safeText(ref.abstract || '(no abstract available)', 5000)}`;
+    return `${persona}
+
+You are performing full-text eligibility assessment. Use the protocol below, prior human corrections, and the article text.
+- If full text is available, exclusion must name the strongest PRISMA reason.
+- If only an abstract is available, be cautious and choose maybe unless a clear exclusion is present.
+- Do not invent details that are not present.
+
+${ctx}
+
+DECISION RUBRIC:
+${rubricText(data)}
+${correctionMemory(data, 'ft')}
+
+STUDY
+Title: ${safeText(ref.title, 500)}
+${text}
+
+Return ONLY JSON:
+{"v":"include|exclude|maybe","conf":0-100,"reason":"<specific full-text eligibility rationale>","excl_cat":"<wrong population|wrong intervention|wrong comparator|wrong outcome|wrong design|no usable data|other|>"}`
+  }
+  return `${persona}
+
+You are screening a title/abstract for this evidence synthesis. Act like a careful dual-reviewer panel:
+- First judge population, concept/intervention/exposure, comparator/context, outcome, and study design separately.
+- Avoid false exclusions at title/abstract stage. If incomplete but plausibly eligible, choose maybe for human/full-text review.
+- Only exclude when a clear exclusion rule is met.
+- Strictness: ${strict} (when unsure, ${strict === 'strict' ? 'lean exclude only if a clear exclusion is present' : strict === 'lenient' ? 'lean include/maybe for full-text check' : 'mark maybe'}).
+
+${ctx}
+
+DECISION RUBRIC:
+${rubricText(data)}
+${correctionMemory(data, 'ta')}
+
+STUDY
+Title: ${safeText(ref.title, 500)}
+Abstract: ${safeText(ref.abstract || '(no abstract available)', 5000)}
+
+Return ONLY JSON:
+{"v":"include|exclude|maybe","conf":0-100,"reason":"<specific one-clause eligibility rationale>","pico":{"p":true/false,"i":true/false,"o":true/false}}`;
+}
+async function projectDataForMember(projectId, userId) {
+  const role = await memberRole(projectId, userId);
+  if (!role) return null;
+  const rows = await db.q('SELECT data,version FROM projects WHERE id=$1', [projectId]);
+  if (!rows[0]) return null;
+  let data = rows[0].data || {};
+  if (typeof data === 'string') data = JSON.parse(data || '{}');
+  return { data, role, version: rows[0].version };
 }
 
 function getMailer() {
@@ -611,6 +725,47 @@ app.post('/api/ai/generate', requireAuth(async (req, res) => {
     res.json({ text, model: selectedModel, server: true });
   } catch (e) {
     const msg = e && e.message ? e.message : 'AI server failed';
+    const status = /not configured/i.test(msg) ? 503 : 502;
+    res.status(status).json({ error: msg });
+  }
+}));
+
+app.post('/api/projects/:id/ai/screen', requireAuth(async (req, res) => {
+  const { refId, stage } = req.body || {};
+  const normalizedStage = stage === 'fulltext' ? 'fulltext' : 'ta';
+  if (!refId) return res.status(400).json({ error: 'refId required' });
+  const project = await projectDataForMember(req.params.id, req.user.id);
+  if (!project) return res.status(403).json({ error: 'Not a member' });
+  const data = project.data || {};
+  const refs = Array.isArray(data.refs) ? data.refs : [];
+  const ref = refs.find(r => r && r.id === refId);
+  if (!ref) return res.status(404).json({ error: 'Study not found in project' });
+  const agent = data.agent || {};
+  const selectedModel = normalizedStage === 'fulltext'
+    ? (agent.advModel || agent.model || 'gemini-flash')
+    : (agent.model || 'gemini-flash');
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0];
+  const rl = rateLimit('ai-screen:' + req.user.id + ':' + ip, 180, 60 * 60 * 1000);
+  if (!rl.ok) return res.status(429).json({ error: `AI screening limit reached. Try again in ${Math.ceil(rl.retryAfter/60)} minute(s).` });
+  try {
+    const prompt = buildServerScreenPrompt(data, ref, normalizedStage);
+    if (prompt.length > 32000) return res.status(413).json({ error: 'Study text is too large for server screening' });
+    const raw = await serverLLM(prompt, normalizedStage === 'fulltext' ? 520 : 380, selectedModel);
+    const parsed = parseAIJSON(raw);
+    const decision = normDecision(parsed.v);
+    res.json({
+      ok: true,
+      stage: normalizedStage,
+      server: true,
+      model: selectedModel,
+      decision,
+      conf: Number(parsed.conf || 50),
+      reason: safeText(parsed.reason || '', 1000),
+      pico: parsed.pico || {},
+      exclCat: safeText(parsed.excl_cat || parsed.exclCat || '', 120)
+    });
+  } catch (e) {
+    const msg = e && e.message ? e.message : 'AI screening failed';
     const status = /not configured/i.test(msg) ? 503 : 502;
     res.status(status).json({ error: msg });
   }
