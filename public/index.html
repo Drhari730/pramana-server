@@ -752,6 +752,7 @@ async function LLM(prompt,maxTok,model){
   const serverModel=serverModelFor(model);
   if(serverModel){
     const r=await BK.api('POST','/api/ai/generate',{prompt,maxTok,model:serverModel},70000);
+    syncAICredits(r);
     if(!r||!r.text)throw new Error('Empty server AI response');
     return r.text;
   }
@@ -1672,6 +1673,7 @@ async function screenOne(id,useAdv){
   if(window.BK&&BK.isServer&&BK.isServer()&&serverAIReady(model)&&ST.id){
     if(typeof _srvTimer!=='undefined'&&_srvTimer)await serverSaveNow();
     const res=await BK.api('POST','/api/projects/'+ST.id+'/ai/screen',{stage:'ta',refId:id},70000);
+    syncAICredits(res);
     const dec=normDecision(res.decision||res.v);
     r.ta={a:dec,b:null,final:dec,conf:res.conf||50,reason:res.reason||'',comment:(r.ta&&r.ta.comment)||'',pico:res.pico||{},by:'agent',model:res.model||model,reviewer:'Viveka',reviewedAt:new Date().toISOString(),ms:Date.now()-started,server:true};
     return r;
@@ -2214,6 +2216,7 @@ async function ftScreen(id,mode){
     if(window.BK&&BK.isServer&&BK.isServer()&&serverAIReady(ST.agent.advModel)&&ST.id){
       if(typeof _srvTimer!=='undefined'&&_srvTimer)await serverSaveNow();
       const res=await BK.api('POST','/api/projects/'+ST.id+'/ai/screen',{stage:'fulltext',refId:id},70000);
+      syncAICredits(res);
       r.ft=r.ft||{};r.ft.decision=normDecision(res.decision||res.v);
       r.ft.reason=res.reason||'';r.ft.exclCat=res.exclCat||'';r.ft.by='agent';r.ft.model=res.model||ST.agent.advModel;r.ft.reviewer='Viveka';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';r.ft.ms=Date.now()-started;r.ft.server=true;
       if(!silent){save();renderFulltext();renderSpine();}
@@ -4137,6 +4140,7 @@ const BK = {
     }
     clearTimeout(timer);
     let j={}; try{ j = await r.json(); }catch(e){}
+    if(j&&j.aiCredits!=null)syncAICredits(j);
     if(!r.ok){ const err=new Error(j.error||('HTTP '+r.status)); err.status=r.status; err.body=j; throw err; }
     return j;
   },
@@ -4572,6 +4576,34 @@ async function afterLogin(){
   goHome();
 }
 async function doLogout(){ try{ await BK.api('POST','/api/auth/logout'); }catch(e){} BK.user=null; location.reload(); }
+function syncAICredits(payload){
+  if(payload&&payload.aiCredits!=null&&BK.user){
+    BK.user.aiCredits=Number(payload.aiCredits);
+    updateUserChip();
+  }
+}
+async function adminUsageModal(){
+  try{
+    const r=await BK.api('GET','/api/admin/usage');
+    const rows=(r.users||[]).map(u=>`<tr><td><b>${esc(u.name||'')}</b><br><span class="muted">${esc(u.email||'')}</span></td><td>${Number(u.ai_credits||0)}</td><td>${Number(u.credits_used||0)}</td><td>${Number(u.ai_calls||0)}</td><td><button class="btn gh sm" onclick="adminAddCredits('${esc(u.id)}')">Add</button></td></tr>`).join('');
+    const recent=(r.recent||[]).slice(0,30).map(x=>`<tr><td>${esc(x.email||'')}</td><td>${esc(x.feature||'')}</td><td>${esc(x.model||'')}</td><td>${Number(x.credits||0)}</td><td class="muted">${esc(new Date(x.created_at).toLocaleString())}</td></tr>`).join('');
+    modal(`<div class="modal-h">Admin - AI Credits<button class="x" onclick="closeModal()">x</button></div>
+      <div class="modal-b" style="max-width:920px">
+        <div class="banner info" style="margin-bottom:14px"><span class="bi">i</span><div>Manual screening, imports, PRISMA, and meta-analysis are free. Only Viveka Cloud AI uses credits. New accounts start with 50 credits.</div></div>
+        <h3 style="margin:0 0 10px">Users and balances</h3>
+        <table class="tbl"><thead><tr><th>User</th><th>Balance</th><th>AI credits used</th><th>AI calls</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="5">No users found.</td></tr>'}</tbody></table>
+        <h3 style="margin:18px 0 10px">Recent AI usage</h3>
+        <table class="tbl"><thead><tr><th>User</th><th>Feature</th><th>Model</th><th>Credits</th><th>Time</th></tr></thead><tbody>${recent||'<tr><td colspan="5">No AI usage yet.</td></tr>'}</tbody></table>
+      </div>`);
+  }catch(e){toast(e.message,'err');}
+}
+async function adminAddCredits(userId){
+  const n=prompt('How many Viveka AI credits to add? Example: 50');
+  const delta=Math.trunc(Number(n||0));
+  if(!delta)return;
+  try{await BK.api('POST','/api/admin/users/'+userId+'/credits',{delta,reason:'testing-topup'});toast('Credits added','ok');adminUsageModal();}
+  catch(e){toast(e.message,'err');}
+}
 function updateUserChip(){
   let chip=document.getElementById('user-chip');
   if(!BK.isServer()||!BK.user){if(chip)chip.remove();return;}
@@ -4581,9 +4613,14 @@ function updateUserChip(){
     document.getElementById('hdr-r').prepend(chip);
   }
   const initials=(BK.user.name||BK.user.email||'?').split(/\s+/).map(w=>w[0]).slice(0,2).join('').toUpperCase();
-  chip.innerHTML=`<div style="width:28px;height:28px;border-radius:50%;background:var(--syn);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;cursor:pointer" title="${esc(BK.user.email)}\nClick to log out" onclick="doLogout()">${esc(initials)}</div>`;
+  const credits=BK.user.aiCredits!=null?Number(BK.user.aiCredits):0;
+  chip.innerHTML=`<div style="display:flex;align-items:center;gap:8px">
+    <div class="pill s" title="Manual screening, import, PRISMA, and meta-analysis are free. Only Viveka Cloud AI uses credits.">Viveka Credits: ${credits}</div>
+    ${BK.user.isAdmin?'<button class="hbtn" onclick="adminUsageModal()" title="Admin usage and AI credits">Admin</button>':''}
+    <div style="width:28px;height:28px;border-radius:50%;background:var(--syn);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;cursor:pointer" title="${esc(BK.user.email)}\nClick to log out" onclick="doLogout()">${esc(initials)}</div>
+  </div>`;
 }
-window.showAuthScreen=showAuthScreen;window.authTab=authTab;window.authSubmit=authSubmit;window.doLogout=doLogout;
+window.showAuthScreen=showAuthScreen;window.authTab=authTab;window.authSubmit=authSubmit;window.doLogout=doLogout;window.adminUsageModal=adminUsageModal;window.adminAddCredits=adminAddCredits;
 
 /* ---------- SERVER-BACKED PROJECT OPS ---------- */
 async function serverListProjects(){

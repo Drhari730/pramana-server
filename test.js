@@ -10,7 +10,7 @@ process.env.DEEPSEEK_API_KEY = '';
 process.env.ZAI_API_KEY = '';
 
 /* ---- tiny in-memory tables ---- */
-const T = { users: [], projects: [], members: [], invites: [], resets: [] };
+const T = { users: [], projects: [], members: [], invites: [], resets: [], usage: [] };
 function clone(o){ return JSON.parse(JSON.stringify(o)); }
 
 /* A hand-written matcher for the exact queries server.js issues.
@@ -23,19 +23,42 @@ async function mockQuery(text, params=[]) {
   // users
   if (s==='SELECT id,email,name FROM users WHERE id=$1')
     return T.users.filter(u=>u.id===params[0]).map(u=>({id:u.id,email:u.email,name:u.name}));
+  if (s==='SELECT id,email,name,ai_credits FROM users WHERE id=$1')
+    return T.users.filter(u=>u.id===params[0]).map(u=>({id:u.id,email:u.email,name:u.name,ai_credits:u.ai_credits||0}));
   if (s==='SELECT id FROM users WHERE email=$1')
     return T.users.filter(u=>u.email===params[0]).map(u=>({id:u.id}));
   if (s==='SELECT id,email,name FROM users WHERE email=$1')
     return T.users.filter(u=>u.email===params[0]).map(u=>({id:u.id,email:u.email,name:u.name}));
+  if (s==='SELECT id,email,name,ai_credits FROM users WHERE email=$1')
+    return T.users.filter(u=>u.email===params[0]).map(u=>({id:u.id,email:u.email,name:u.name,ai_credits:u.ai_credits||0}));
   if (s==='SELECT id,email,name,password_hash FROM users WHERE email=$1')
+    return T.users.filter(u=>u.email===params[0]).map(u=>clone(u));
+  if (s==='SELECT id,email,name,password_hash,ai_credits FROM users WHERE email=$1')
     return T.users.filter(u=>u.email===params[0]).map(u=>clone(u));
   if (s.startsWith('INSERT INTO users')) {
     const cols = s.match(/\(([^)]+)\) VALUES/)[1].split(',').map(c=>c.trim());
-    const row={}; cols.forEach((c,i)=>row[c==='password_hash'?'password_hash':c]=params[i]); T.users.push(row); return [];
+    const row={ai_credits:50}; cols.forEach((c,i)=>row[c==='password_hash'?'password_hash':c]=params[i]); T.users.push(row); return [];
+  }
+  if (s==='SELECT ai_credits FROM users WHERE id=$1')
+    return T.users.filter(u=>u.id===params[0]).map(u=>({ai_credits:u.ai_credits||0}));
+  if (s==='UPDATE users SET ai_credits=ai_credits-$1 WHERE id=$2 AND ai_credits >= $1 RETURNING ai_credits'){
+    const u=T.users.find(u=>u.id===params[1]);
+    if(!u || (u.ai_credits||0)<params[0]) return [];
+    u.ai_credits=(u.ai_credits||0)-params[0];
+    return [{ai_credits:u.ai_credits}];
+  }
+  if (s.startsWith('UPDATE users SET ai_credits=GREATEST')) {
+    const u=T.users.find(u=>u.id===params[1]);
+    if(!u)return [];
+    u.ai_credits=Math.max(0,(u.ai_credits||0)+params[0]);
+    return [{id:u.id,email:u.email,name:u.name,ai_credits:u.ai_credits}];
   }
   if (s==='SELECT id,password_hash FROM users WHERE email=$1')
     return T.users.filter(u=>u.email===params[0]).map(u=>({id:u.id,password_hash:u.password_hash}));
   if (s==='UPDATE users SET password_hash=$1 WHERE id=$2'){ const u=T.users.find(u=>u.id===params[1]); if(u)u.password_hash=params[0]; return []; }
+
+  // ai_usage
+  if (s.startsWith('INSERT INTO ai_usage')){ T.usage.push({id:params[0],user_id:params[1],project_id:params[2],feature:params[3],model:params[4],credits:params[5]}); return []; }
 
   // password_resets
   if (s.startsWith('INSERT INTO password_resets')){ T.resets.push({token:params[0],user_id:params[1],expires_at:params[2],used:false}); return []; }
@@ -145,6 +168,7 @@ async function run() {
   ok('duplicate email rejected', r.status===409);
   r = await lead('GET','/api/me');
   ok('session works (cookie)', r.status===200 && r.body.user.email==='lead@uni.edu');
+  ok('new account starts with 50 Viveka AI credits', r.status===200 && r.body.user.aiCredits===50);
   const bad = makeClient();
   r = await bad('POST','/api/auth/login',{email:'lead@uni.edu',password:'wrong'});
   ok('wrong password rejected', r.status===401);
@@ -260,6 +284,8 @@ async function run() {
   ok('config reports server AI disabled when no key set', r.status===200 && r.body.aiServerEnabled===false);
   r = await lead('POST','/api/ai/generate',{model:'gemini-flash',prompt:'Return OK',maxTok:16});
   ok('server AI endpoint requires configured provider key', r.status===503 && /not configured/i.test(r.body.error||''));
+  r = await lead('GET','/api/me');
+  ok('failed AI call does not deduct credits', r.status===200 && r.body.user.aiCredits===50);
 
   console.log('\n=== SERVER AI PHASE 2 SCREENING ===');
   r = await outsider('POST','/api/projects/'+pid+'/ai/screen',{stage:'ta',refId:'r2'});

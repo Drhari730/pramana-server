@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS users (
   name          TEXT,
   password_hash TEXT,               -- null for google-only accounts
   google_id     TEXT,
+  ai_credits    INTEGER NOT NULL DEFAULT 50,
   created_at    TIMESTAMPTZ DEFAULT now()
 );
 
@@ -81,11 +82,24 @@ CREATE TABLE IF NOT EXISTS password_resets (
   created_at  TIMESTAMPTZ DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_resets_user ON password_resets(user_id);
+
+CREATE TABLE IF NOT EXISTS ai_usage (
+  id          TEXT PRIMARY KEY,
+  user_id     TEXT REFERENCES users(id) ON DELETE CASCADE,
+  project_id  TEXT REFERENCES projects(id) ON DELETE SET NULL,
+  feature     TEXT NOT NULL,
+  model       TEXT,
+  credits     INTEGER NOT NULL,
+  created_at  TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_user ON ai_usage(user_id);
+CREATE INDEX IF NOT EXISTS idx_ai_usage_project ON ai_usage(project_id);
 `;
 
 async function initSchema() {
   // pg can run multiple statements in one query call
   await getPool().query(SCHEMA);
+  await getPool().query('ALTER TABLE users ADD COLUMN IF NOT EXISTS ai_credits INTEGER NOT NULL DEFAULT 50');
 }
 
 module.exports = { q, initSchema, setQueryImpl, getPool, SCHEMA };

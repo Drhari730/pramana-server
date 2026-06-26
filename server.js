@@ -60,7 +60,7 @@ async function currentUser(req) {
   if (!t) return null;
   try {
     const { uid } = jwt.verify(t, JWT_SECRET);
-    const rows = await db.q('SELECT id,email,name FROM users WHERE id=$1', [uid]);
+    const rows = await db.q('SELECT id,email,name,ai_credits FROM users WHERE id=$1', [uid]);
     return rows[0] || null;
   } catch (e) { return null; }
 }
@@ -75,6 +75,48 @@ function requireAuth(handler) {
 async function memberRole(projectId, userId) {
   const rows = await db.q('SELECT role FROM members WHERE project_id=$1 AND user_id=$2', [projectId, userId]);
   return rows[0] ? rows[0].role : null;
+}
+function publicUser(u) {
+  if (!u) return u;
+  return { id: u.id, email: u.email, name: u.name, aiCredits: Number(u.ai_credits ?? u.aiCredits ?? 0), isAdmin: isAdmin(u) };
+}
+function adminEmails() {
+  return String(process.env.ADMIN_EMAILS || 'pramana.ai.srma@gmail.com')
+    .split(',')
+    .map(s => s.trim().toLowerCase())
+    .filter(Boolean);
+}
+function isAdmin(user) {
+  return !!(user && adminEmails().includes(String(user.email || '').toLowerCase()));
+}
+function requireAdmin(handler) {
+  return requireAuth(async (req, res) => {
+    if (!isAdmin(req.user)) return res.status(403).json({ error: 'Admin only' });
+    return handler(req, res);
+  });
+}
+async function aiBalance(userId) {
+  const rows = await db.q('SELECT ai_credits FROM users WHERE id=$1', [userId]);
+  return Number((rows[0] && rows[0].ai_credits) || 0);
+}
+async function chargeAICredits(userId, credits, feature, model, projectId) {
+  const cost = Math.max(1, Number(credits) || 1);
+  const bal = await aiBalance(userId);
+  if (bal < cost) {
+    const err = new Error(`Not enough Viveka AI credits. You have ${bal}, need ${cost}. Manual work is still free.`);
+    err.status = 402;
+    err.balance = bal;
+    throw err;
+  }
+  const rows = await db.q('UPDATE users SET ai_credits=ai_credits-$1 WHERE id=$2 AND ai_credits >= $1 RETURNING ai_credits', [cost, userId]);
+  if (!rows[0]) {
+    const err = new Error('Not enough Viveka AI credits. Manual work is still free.');
+    err.status = 402;
+    throw err;
+  }
+  await db.q('INSERT INTO ai_usage (id,user_id,project_id,feature,model,credits) VALUES ($1,$2,$3,$4,$5,$6)',
+    [uid('au_'), userId, projectId || null, feature, model || '', cost]);
+  return Number(rows[0].ai_credits || 0);
 }
 
 /* ---------------- email (Brevo via nodemailer SMTP) ---------------- */
@@ -477,7 +519,7 @@ app.post('/api/auth/register', async (req, res) => {
   const id = uid('u_');
   const hash = await bcrypt.hash(password, 10);
   await db.q('INSERT INTO users (id,email,name,password_hash) VALUES ($1,$2,$3,$4)', [id, email.toLowerCase(), name || email.split('@')[0], hash]);
-  const user = { id, email: email.toLowerCase(), name: name || email.split('@')[0] };
+  const user = { id, email: email.toLowerCase(), name: name || email.split('@')[0], ai_credits: 50 };
   await autoAcceptInvites(user);
   setAuthCookie(res, user);
   let welcomeEmailQueued = false, emailError;
@@ -485,7 +527,7 @@ app.post('/api/auth/register', async (req, res) => {
     queueEmail('Welcome email', user.email, () => sendWelcomeEmail(user.email, user.name));
     welcomeEmailQueued = true;
   }
-  res.json({ user, welcomeEmailQueued, emailError });
+  res.json({ user: publicUser(user), welcomeEmailQueued, emailError });
 });
 
 app.post('/api/auth/login', async (req, res) => {
@@ -494,13 +536,13 @@ app.post('/api/auth/login', async (req, res) => {
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0];
   const rl = rateLimit('login:' + (email||'').toLowerCase() + ':' + ip, 8, 15 * 60 * 1000);
   if (!rl.ok) return res.status(429).json({ error: `Too many login attempts. Try again in ${Math.ceil(rl.retryAfter/60)} minute(s).` });
-  const rows = await db.q('SELECT id,email,name,password_hash FROM users WHERE email=$1', [(email||'').toLowerCase()]);
+  const rows = await db.q('SELECT id,email,name,password_hash,ai_credits FROM users WHERE email=$1', [(email||'').toLowerCase()]);
   const u = rows[0];
   if (!u || !u.password_hash || !(await bcrypt.compare(password || '', u.password_hash)))
     return res.status(401).json({ error: 'Wrong email or password' });
-  const user = { id: u.id, email: u.email, name: u.name };
+  const user = { id: u.id, email: u.email, name: u.name, ai_credits: u.ai_credits };
   setAuthCookie(res, user);
-  res.json({ user });
+  res.json({ user: publicUser(user) });
 });
 
 app.post('/api/auth/google', async (req, res) => {
@@ -512,21 +554,21 @@ app.post('/api/auth/google', async (req, res) => {
     const ticket = await client.verifyIdToken({ idToken: credential, audience: GOOGLE_CLIENT_ID });
     const p = ticket.getPayload();
     const email = (p.email || '').toLowerCase();
-    let rows = await db.q('SELECT id,email,name FROM users WHERE email=$1', [email]);
+    let rows = await db.q('SELECT id,email,name,ai_credits FROM users WHERE email=$1', [email]);
     let user = rows[0];
     if (!user) {
       const id = uid('u_');
       await db.q('INSERT INTO users (id,email,name,google_id) VALUES ($1,$2,$3,$4)', [id, email, p.name || email.split('@')[0], p.sub]);
-      user = { id, email, name: p.name || email.split('@')[0] };
+      user = { id, email, name: p.name || email.split('@')[0], ai_credits: 50 };
     }
     await autoAcceptInvites(user);
     setAuthCookie(res, user);
-    res.json({ user });
+    res.json({ user: publicUser(user) });
   } catch (e) { res.status(401).json({ error: 'Google verification failed' }); }
 });
 
 app.post('/api/auth/logout', (req, res) => { res.clearCookie('pramana_token'); res.json({ ok: true }); });
-app.get('/api/me', requireAuth(async (req, res) => res.json({ user: req.user })));
+app.get('/api/me', requireAuth(async (req, res) => res.json({ user: publicUser(req.user) })));
 
 /* ---- password reset ---- */
 app.post('/api/auth/forgot', async (req, res) => {
@@ -566,9 +608,9 @@ app.post('/api/auth/reset', async (req, res) => {
   await db.q('UPDATE users SET password_hash=$1 WHERE id=$2', [hash, r.user_id]);
   await db.q('UPDATE password_resets SET used=true WHERE token=$1', [token]);
   // log them in immediately
-  const urows = await db.q('SELECT id,email,name FROM users WHERE id=$1', [r.user_id]);
+  const urows = await db.q('SELECT id,email,name,ai_credits FROM users WHERE id=$1', [r.user_id]);
   setAuthCookie(res, urows[0]);
-  res.json({ ok: true, user: urows[0] });
+  res.json({ ok: true, user: publicUser(urows[0]) });
 });
 
 // when a user signs up/in, auto-join any pending invites for their email
@@ -715,18 +757,22 @@ app.delete('/api/projects/:id/members/:userId', requireAuth(async (req, res) => 
 app.post('/api/ai/generate', requireAuth(async (req, res) => {
   const { prompt, maxTok, model } = req.body || {};
   const selectedModel = model || 'gemini-flash';
+  const creditCost = 5;
   if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'Prompt required' });
   if (prompt.length > 30000) return res.status(413).json({ error: 'Prompt is too large for this Phase 1 server endpoint' });
+  const balance = await aiBalance(req.user.id);
+  if (balance < creditCost) return res.status(402).json({ error: `Not enough Viveka AI credits. You have ${balance}, need ${creditCost}. Manual work is still free.`, aiCredits: balance });
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0];
   const rl = rateLimit('ai:' + req.user.id + ':' + ip, 120, 60 * 60 * 1000);
   if (!rl.ok) return res.status(429).json({ error: `AI limit reached. Try again in ${Math.ceil(rl.retryAfter/60)} minute(s).` });
   try {
     const text = await serverLLM(prompt, maxTok, selectedModel);
-    res.json({ text, model: selectedModel, server: true });
+    const aiCredits = await chargeAICredits(req.user.id, creditCost, 'generate', selectedModel, null);
+    res.json({ text, model: selectedModel, server: true, aiCredits, creditsUsed: creditCost });
   } catch (e) {
     const msg = e && e.message ? e.message : 'AI server failed';
-    const status = /not configured/i.test(msg) ? 503 : 502;
-    res.status(status).json({ error: msg });
+    const status = e.status || (/not configured/i.test(msg) ? 503 : 502);
+    res.status(status).json({ error: msg, aiCredits: e.balance });
   }
 }));
 
@@ -744,6 +790,9 @@ app.post('/api/projects/:id/ai/screen', requireAuth(async (req, res) => {
   const selectedModel = normalizedStage === 'fulltext'
     ? (agent.advModel || agent.model || 'gemini-flash')
     : (agent.model || 'gemini-flash');
+  const creditCost = normalizedStage === 'fulltext' ? 5 : 1;
+  const balance = await aiBalance(req.user.id);
+  if (balance < creditCost) return res.status(402).json({ error: `Not enough Viveka AI credits. You have ${balance}, need ${creditCost}. Manual screening is still free.`, aiCredits: balance });
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0];
   const rl = rateLimit('ai-screen:' + req.user.id + ':' + ip, 180, 60 * 60 * 1000);
   if (!rl.ok) return res.status(429).json({ error: `AI screening limit reached. Try again in ${Math.ceil(rl.retryAfter/60)} minute(s).` });
@@ -753,11 +802,14 @@ app.post('/api/projects/:id/ai/screen', requireAuth(async (req, res) => {
     const raw = await serverLLM(prompt, normalizedStage === 'fulltext' ? 520 : 380, selectedModel);
     const parsed = parseAIJSON(raw);
     const decision = normDecision(parsed.v);
+    const aiCredits = await chargeAICredits(req.user.id, creditCost, 'screen:' + normalizedStage, selectedModel, req.params.id);
     res.json({
       ok: true,
       stage: normalizedStage,
       server: true,
       model: selectedModel,
+      aiCredits,
+      creditsUsed: creditCost,
       decision,
       conf: Number(parsed.conf || 50),
       reason: safeText(parsed.reason || '', 1000),
@@ -766,9 +818,42 @@ app.post('/api/projects/:id/ai/screen', requireAuth(async (req, res) => {
     });
   } catch (e) {
     const msg = e && e.message ? e.message : 'AI screening failed';
-    const status = /not configured/i.test(msg) ? 503 : 502;
-    res.status(status).json({ error: msg });
+    const status = e.status || (/not configured/i.test(msg) ? 503 : 502);
+    res.status(status).json({ error: msg, aiCredits: e.balance });
   }
+}));
+
+/* ---------------- ADMIN: credits and usage ---------------- */
+app.get('/api/admin/usage', requireAdmin(async (req, res) => {
+  const users = await db.q(
+    `SELECT u.id,u.email,u.name,u.ai_credits,u.created_at,
+            COALESCE(SUM(CASE WHEN a.credits > 0 THEN a.credits ELSE 0 END),0) AS credits_used,
+            COUNT(a.id) AS ai_calls
+     FROM users u
+     LEFT JOIN ai_usage a ON a.user_id=u.id
+     GROUP BY u.id,u.email,u.name,u.ai_credits,u.created_at
+     ORDER BY u.created_at DESC
+     LIMIT 500`, []);
+  const recent = await db.q(
+    `SELECT a.id,a.user_id,u.email,u.name,a.project_id,a.feature,a.model,a.credits,a.created_at
+     FROM ai_usage a
+     JOIN users u ON u.id=a.user_id
+     ORDER BY a.created_at DESC
+     LIMIT 200`, []);
+  res.json({ users, recent });
+}));
+
+app.post('/api/admin/users/:id/credits', requireAdmin(async (req, res) => {
+  const delta = Math.trunc(Number((req.body || {}).delta || 0));
+  const reason = safeText((req.body || {}).reason || 'manual-admin-adjustment', 120);
+  if (!delta) return res.status(400).json({ error: 'delta required' });
+  const rows = await db.q('UPDATE users SET ai_credits=GREATEST(0,ai_credits+$1) WHERE id=$2 RETURNING id,email,name,ai_credits', [delta, req.params.id]);
+  if (!rows[0]) return res.status(404).json({ error: 'User not found' });
+  if (delta > 0) {
+    await db.q('INSERT INTO ai_usage (id,user_id,project_id,feature,model,credits) VALUES ($1,$2,$3,$4,$5,$6)',
+      [uid('au_'), req.params.id, null, 'admin-credit:' + reason, 'manual', -delta]);
+  }
+  res.json({ user: publicUser(rows[0]) });
 }));
 
 /* ---------------- config + static ---------------- */
