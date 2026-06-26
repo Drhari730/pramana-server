@@ -4195,6 +4195,7 @@ function pramanaFooter(){
       <div><b style="color:#10213a">Pramāṇa — Evidence Synthesis</b><br>${PRAMANA_CREDIT}<br><span style="color:#0f8b8d;font-weight:800">🇮🇳 Proudly Made in India</span></div>
       <div style="display:flex;gap:12px;flex-wrap:wrap;font-weight:700">
         <a href="#" onclick="showPramanaPage('about');return false" style="color:#3657d6;text-decoration:none">About</a>
+        <a href="#" onclick="showPramanaPage('workflow');return false" style="color:#3657d6;text-decoration:none">How It Works</a>
         <a href="#" onclick="showPramanaPage('terms');return false" style="color:#3657d6;text-decoration:none">Terms of Use</a>
         <a href="#" onclick="showPramanaPage('privacy');return false" style="color:#3657d6;text-decoration:none">Privacy Policy</a>
         <a href="#" onclick="showPramanaPage('contact');return false" style="color:#3657d6;text-decoration:none">Contact (${PRAMANA_CONTACT})</a>
@@ -4205,6 +4206,36 @@ function pramanaFooter(){
 }
 function pagePara(s){return '<p style="margin:0 0 14px;line-height:1.7;color:#32445b">'+s+'</p>';}
 function showPramanaPage(kind){
+  if(kind==='workflow'){
+    const step=(n,t,d)=>`<div style="display:grid;grid-template-columns:38px 1fr;gap:12px;align-items:flex-start;padding:14px;border:1px solid #dbe4f2;border-radius:14px;background:rgba(255,255,255,.78)"><div style="width:32px;height:32px;border-radius:12px;background:#eef4ff;color:#3657d6;font-weight:900;display:grid;place-items:center">${n}</div><div><div style="font-weight:900;color:#10213a;margin-bottom:4px">${t}</div><div style="color:#40566f;line-height:1.55;font-size:13px">${d}</div></div></div>`;
+    modal('<div class="modal-h">How Pramana Works<button class="x" onclick="closeModal()">&times;</button></div>'+
+      `<div class="modal-b" style="max-width:900px">
+        ${pagePara('Pramana is built as a complete evidence-synthesis workflow. A user can start with a research question, move through screening and extraction, run analysis, and export a PRISMA-ready report while the project stays shared with invited collaborators.')}
+        <h3 style="margin:18px 0 10px;color:#10213a">Full Working Flow</h3>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px">
+          ${step('1','Set up the review','Choose the review type and framework, enter the research question, define PICO, PCC, PEO, or other fields, and write inclusion and exclusion criteria.')}
+          ${step('2','Train Viveka','Label a small balanced seed of included and excluded studies. Viveka Local learns from those expert decisions; Viveka Cloud can also screen with a server-side AI provider.')}
+          ${step('3','Search and import','Build database-ready search suggestions from the review question, then import records from RIS, BibTeX, PubMed or DOI sources, or CSV.')}
+          ${step('4','De-duplicate','Detect likely duplicate records before screening so the team works on a clean review set.')}
+          ${step('5','Assign team workload','Invite reviewers, split records by percentage, and let each reviewer use the assigned-only queue while the lead monitors progress.')}
+          ${step('6','Title and abstract screening','Screen manually, with Viveka Local, or with Viveka Cloud. Decisions, comments, reasons, and reviewer names stay logged in the shared project.')}
+          ${step('7','Full-text screening','Fetch open-access full text where available, attach or paste PDFs/text when needed, then screen full text with manual review or Viveka assistance.')}
+          ${step('8','Synthesis and report','Extract outcome data, assess risk of bias, calculate meta-analysis outputs, inspect forest/funnel plots, prepare GRADE, and update the PRISMA flow.')}
+        </div>
+        <h3 style="margin:22px 0 8px;color:#10213a">Accuracy and Viveka Local</h3>
+        ${pagePara('<b>Viveka Local</b> uses a high-recall TF-IDF phrase model with active learning. It does not promise a universal fixed accuracy percentage because performance depends on the review topic, abstract quality, eligibility criteria, and the quality of the labelled training seed.')}
+        ${pagePara('The model is tuned for systematic-review safety: it prioritises <b>recall/sensitivity</b>, meaning it tries to avoid missing potentially eligible studies. Borderline papers should be sent to <b>Maybe</b> or human review rather than silently excluded. This is why a high-recall setup can feel conservative, but it is safer for evidence synthesis.')}
+        ${pagePara('Recommended practice: label at least 5 clear includes and 5 clear excludes, ideally 20-40 mixed examples, then train. Review uncertain or discrepant papers, correct the decisions, and retrain. As expert decisions accumulate, active learning improves the project-specific classifier.')}
+        ${pagePara('The app reports training diagnostics such as recall, precision, and F1 where available. These are internal validation signals, not a substitute for human confirmation. Final inclusion and exclusion decisions remain the responsibility of the review team.')}
+        <h3 style="margin:22px 0 8px;color:#10213a">Viveka Cloud vs Viveka Local</h3>
+        ${pagePara('<b>Viveka Cloud</b> uses AI-provider calls through the server for stronger language reasoning, especially on small or complex reviews. <b>Viveka Local</b> runs in the browser with zero AI tokens after training and is best for large search sets where cost control matters.')}
+        ${pagePara('For best accuracy and cost balance, use cloud AI on difficult or borderline records and use Viveka Local for high-volume screening after a good seed has been labelled.')}
+        ${pramanaFooter()}
+      </div>`);
+    const pageModal=document.getElementById('modal');
+    if(pageModal)pageModal.style.maxWidth='920px';
+    return;
+  }
   const common='<div class="modal-h">'+(kind==='about'?'About Pramāṇa':kind==='terms'?'Terms of Use — Pramāṇa':kind==='privacy'?'Privacy Policy — Pramāṇa':'Contact')+'<button class="x" onclick="closeModal()">×</button></div>';
   let body='';
   if(kind==='about'){
@@ -4265,7 +4296,7 @@ function showPramanaPage(kind){
     body=`<div class="modal-b" style="max-width:680px">
       ${pagePara('<b>Email:</b> <a href="mailto:'+PRAMANA_CONTACT+'" style="color:#3657d6">'+PRAMANA_CONTACT+'</a>')}
       ${pagePara(PRAMANA_CREDIT)}
-      ${pagePara('A team of public-health researchers and biostatisticians on a mission to make evidence-based synthesis affordable and accessible across India. Rigorous methods, made usable. 🇮🇳 Proudly Made in India.')}
+      ${pagePara('Developed by Dr G. Hari Prakash with a mission to make evidence-based synthesis affordable and accessible across India. Rigorous methods, made usable. 🇮🇳 Proudly Made in India.')}
       ${pramanaFooter()}
     </div>`;
   }
@@ -4285,13 +4316,19 @@ function renderAuthMarkup(g){
       .pr-nav a,.pr-badge{display:inline-flex;align-items:center;gap:8px;padding:8px 13px;border-radius:999px;background:rgba(255,255,255,.78);border:1px solid #dbe4f2;text-decoration:none;color:#3657d6;font-size:11px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
       .pr-flow{overflow:hidden;border:1px solid #dbe4f2;background:rgba(255,255,255,.66);border-radius:999px;max-width:700px;padding:10px 12px;margin:12px 0 18px;color:#526881;font-size:12px;font-weight:800;white-space:nowrap}
       .pr-flow span{display:inline-block;animation:prFlow 7s ease-in-out infinite}
-      @media(max-width:900px){.pr-auth-shell{grid-template-columns:1fr}.pr-info-grid{grid-template-columns:1fr}#auth-screen{align-items:flex-start!important}.pr-hero h1{font-size:38px!important}}
+      .pr-workflow-mini{max-width:720px;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 18px}
+      .pr-workflow-mini div{background:rgba(255,255,255,.7);border:1px solid #dbe4f2;border-radius:12px;padding:12px;min-height:78px}
+      .pr-workflow-mini b{display:block;color:#3657d6;font-size:12px;margin-bottom:5px}
+      .pr-workflow-mini span{display:block;color:#24384f;font-size:12px;line-height:1.35;font-weight:800}
+      @media(max-width:900px){.pr-auth-shell{grid-template-columns:1fr}.pr-info-grid{grid-template-columns:1fr}.pr-workflow-mini{grid-template-columns:repeat(2,minmax(0,1fr))}#auth-screen{align-items:flex-start!important}.pr-hero h1{font-size:38px!important}}
+      @media(max-width:520px){.pr-workflow-mini{grid-template-columns:1fr}.pr-hero h1{font-size:32px!important}}
     </style>
     <div class="pr-auth-shell">
       <section class="pr-hero" style="padding-right:8px">
         <div class="pr-nav">
           <span class="pr-badge">PRAMĀṆA · EVIDENCE SYNTHESIS</span>
           <a href="#" onclick="showPramanaPage('about');return false">About</a>
+          <a href="#" onclick="showPramanaPage('workflow');return false">How it works</a>
           <a href="#" onclick="showPramanaPage('privacy');return false">Privacy</a>
           <a href="#" onclick="showPramanaPage('contact');return false">Contact</a>
         </div>
@@ -4301,11 +4338,20 @@ function renderAuthMarkup(g){
         <div class="pr-flow"><span>Protocol → Search → Import → De-duplicate → Screen → Extract → Meta-analysis → GRADE → PRISMA → Shared report</span></div>
         <div class="pr-info-grid">
           <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">How to use</div><div style="font-size:14px;line-height:1.6;color:#24384f">Create an account, open a review, import studies, screen records, extract outcomes, run the synthesis, and share the same project with your team. Everything stays in one place, always up to date.</div></div>
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">How it works</div><div style="font-size:14px;line-height:1.6;color:#24384f">Follow one guided flow: set protocol, train Viveka, search and import, de-duplicate, assign reviewers, screen titles/abstracts, screen full text, extract data, and export PRISMA-ready outputs.</div></div>
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Accuracy approach</div><div style="font-size:14px;line-height:1.6;color:#24384f">Viveka Local uses a high-recall TF-IDF phrase model with active learning. It is designed to reduce missed eligible studies by sending uncertain papers to human review.</div></div>
           <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Privacy</div><div style="font-size:14px;line-height:1.6;color:#24384f">Your project data stays inside your hosted workspace. Team access is controlled by invites, and password resets use secure one-time links. We don't sell data or run ads.</div></div>
           <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Developed by</div><div style="font-size:16px;font-weight:800;color:#10213a">Dr G. Hari Prakash</div></div>
           <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Contact</div><div style="font-size:16px;font-weight:800;color:#10213a">pramana.ai.srma@gmail.com</div></div>
         </div>
-        <div style="max-width:720px;border:1px solid #dbe4f2;background:rgba(255,255,255,.58);border-radius:14px;padding:14px 16px;color:#40566f;line-height:1.55">A team of public-health researchers and biostatisticians on a mission to make evidence-based synthesis affordable and accessible across India. Rigorous methods, made usable. 🇮🇳 Proudly Made in India.</div>
+        <div class="pr-workflow-mini" aria-label="Pramana workflow">
+          <div><b>01</b><span>Protocol and review framework</span></div>
+          <div><b>02</b><span>Search, import, and de-duplicate</span></div>
+          <div><b>03</b><span>Team split and live screening</span></div>
+          <div><b>04</b><span>Extraction, meta-analysis, GRADE, PRISMA</span></div>
+        </div>
+        <div style="max-width:720px;border:1px solid #b8dedf;background:#eefafa;border-radius:14px;padding:14px 16px;color:#075e63;line-height:1.55;margin-bottom:14px"><b>High-recall TF-IDF accuracy:</b> Viveka Local learns from your labelled seed and favours recall/sensitivity, so potentially eligible or uncertain studies are kept for human review instead of being silently excluded. Accuracy improves when reviewers correct decisions and retrain.</div>
+        <div style="max-width:720px;border:1px solid #dbe4f2;background:rgba(255,255,255,.58);border-radius:14px;padding:14px 16px;color:#40566f;line-height:1.55">Developed by Dr G. Hari Prakash with a mission to make evidence-based synthesis affordable and accessible across India. Rigorous methods, made usable. 🇮🇳 Proudly Made in India.</div>
       </section>
       <section>
         <div style="text-align:center;margin-bottom:18px">
