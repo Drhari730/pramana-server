@@ -235,6 +235,7 @@ textarea.inp{resize:vertical;min-height:64px;line-height:1.5}
 .pill{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;background:var(--wash2);color:var(--t2);margin:2px 4px 2px 0}
 .pill.f{background:rgba(13,148,136,.1);color:var(--flow)}
 .pill.s{background:rgba(79,70,229,.1);color:var(--syn)}
+.pill.x{background:var(--exc-w);color:var(--exc)}
 
 .muted{color:var(--t3);font-size:11.5px}
 .divider{height:1px;background:var(--line);margin:18px 0}
@@ -1526,7 +1527,7 @@ function myAssignedRefs(){
   return ST.refs.filter(r=>!r.dup&&isAssignedToMe(r));
 }
 function myPendingAssignedCount(){
-  return ST.refs.filter(r=>!r.dup&&isAssignedToMe(r)&&(!r.ta||r.ta.by==='local')).length;
+  return ST.refs.filter(r=>!r.dup&&isAssignedToMe(r)&&!myStageReview(r,'ta')).length;
 }
 function titleAbstractScopeRefs(){
   let refs=ST.refs.filter(r=>!r.dup);
@@ -1558,9 +1559,124 @@ function reviewedMeta(entry){
   const when=entry.reviewedAt?(' · '+new Date(entry.reviewedAt).toLocaleString()):'';
   return `${who}${when}`;
 }
+function ensureReviewWorkflow(){
+  ST.reviewWorkflow=ST.reviewWorkflow||{};
+  ST.reviewWorkflow.ta=Object.assign({blind:true,minReviewers:2,requireExcludeReason:true},ST.reviewWorkflow.ta||{});
+  ST.reviewWorkflow.ft=Object.assign({blind:false,minReviewers:1,requireExcludeReason:true},ST.reviewWorkflow.ft||{});
+  return ST.reviewWorkflow;
+}
+function reviewerKey(){
+  if(window.BK&&BK.isServer&&BK.isServer()&&BK.user)return BK.user.id||BK.user.email;
+  return 'local';
+}
+function reviewerInfo(){
+  if(window.BK&&BK.isServer&&BK.isServer()&&BK.user)return {id:reviewerKey(),name:BK.user.name||BK.user.email,email:BK.user.email||''};
+  return {id:'local',name:'Local reviewer',email:''};
+}
+function stageStore(r,stage){
+  r.reviews=r.reviews||{};
+  r.reviews[stage]=r.reviews[stage]||{};
+  return r.reviews[stage];
+}
+function stageReviews(r,stage){
+  const root=r.reviews||{};
+  const store=root[stage]||{};
+  const rows=Object.keys(store).map(k=>Object.assign({reviewerId:k},store[k])).filter(x=>x&&x.final);
+  if(stage==='ta'){
+    Object.keys(root).forEach(k=>{
+      if(k==='ta'||k==='ft')return;
+      const v=root[k];if(v&&v.final)rows.push(Object.assign({reviewerId:k,reviewer:k},v));
+    });
+  }
+  return rows;
+}
+function myStageReview(r,stage){
+  const store=(r.reviews&&r.reviews[stage])||{};
+  return store[reviewerKey()]||null;
+}
+function stageFinalObj(r,stage){return stage==='ft'?r.ft:r.ta;}
+function setStageFinalObj(r,stage,val){
+  if(stage==='ft'&&val&&val.final&&!val.decision)val.decision=val.final;
+  if(stage==='ft'){
+    if(!val){
+      const old=r.ft||{},keep={};
+      ['oa','pdfText','pdfName','fulltextUrl','source','doi','fetchedAt'].forEach(k=>{if(old[k]!=null)keep[k]=old[k];});
+      r.ft=Object.keys(keep).length?keep:null;
+    }else r.ft=Object.assign({},r.ft||{},val);
+  }else r.ta=val;
+}
+function conflictFlag(stage){return stage==='ft'?'_ftConflict':'_conflict';}
+function visibleStageDecision(r,stage){
+  const own=myStageReview(r,stage);
+  const final=stageFinalObj(r,stage);
+  const wf=ensureReviewWorkflow()[stage];
+  if(window.BK&&BK.isServer&&BK.isServer()&&BK.role==='reviewer'&&wf.blind){
+    if(own)return own;
+    if(final&&(final.by==='consensus'||final.by==='arbitrator'||final.by==='agent'||final.by==='local'))return final;
+    return null;
+  }
+  return own||final||null;
+}
+function requireDecisionReason(stage,r,dec){
+  const wf=ensureReviewWorkflow()[stage];
+  const existing=(myStageReview(r,stage)||stageFinalObj(r,stage)||{}).comment||'';
+  if(dec!=='exclude'||!wf.requireExcludeReason)return existing;
+  const txt=prompt('Reason/comment is required for exclusion:',existing||'');
+  if(!txt||!txt.trim()){toast('Exclusion reason is required','err');return null;}
+  return txt.trim();
+}
+function setReviewerStageDecision(r,stage,dec,comment,prev){
+  const info=reviewerInfo();
+  const store=stageStore(r,stage);
+  store[info.id]={final:dec,by:'human',reviewerId:info.id,reviewer:info.name,email:info.email,comment:comment||'',reason:comment||'human decision',conf:100,reviewedAt:new Date().toISOString(),seeded:prev&&prev.seeded};
+  computeStageConsensus(r,stage);
+  return store[info.id];
+}
+function computeStageConsensus(r,stage){
+  const wf=ensureReviewWorkflow()[stage];
+  const reviews=stageReviews(r,stage).filter(x=>x.by==='human');
+  const flag=conflictFlag(stage);
+  const current=stageFinalObj(r,stage)||{};
+  if(current.by==='arbitrator')return current;
+  if(reviews.length<Math.max(1,wf.minReviewers)){
+    if(!current.by||current.by==='conflict'||current.by==='consensus')setStageFinalObj(r,stage,null);
+    r[flag]=false;
+    return null;
+  }
+  const uniq=[...new Set(reviews.map(x=>x.final))];
+  if(uniq.length===1){
+    const first=reviews[0];
+    const final=Object.assign({},first,{by:'consensus',reviewer:'Reviewer consensus',reviewedBy:reviews.map(x=>x.reviewer||x.email||x.reviewerId).join(', '),reason:'Reviewer consensus: '+uniq[0],reviewedAt:new Date().toISOString()});
+    setStageFinalObj(r,stage,final);
+    r[flag]=false;
+    return final;
+  }
+  r[flag]=true;
+  setStageFinalObj(r,stage,{final:'maybe',by:'conflict',conf:50,reason:'Reviewer conflict: '+reviews.map(x=>(x.reviewer||x.email||x.reviewerId)+': '+x.final).join(' vs '),reviewedAt:new Date().toISOString(),reviewedBy:reviews.map(x=>x.reviewer||x.email||x.reviewerId).join(', ')});
+  return stageFinalObj(r,stage);
+}
+function resolveConsensus(stage,id,dec){
+  const r=refById(id);if(!r)return;
+  const info=reviewerInfo();
+  setStageFinalObj(r,stage,{final:dec,by:'arbitrator',conf:100,reason:'Consensus resolved by '+info.name,comment:'Consensus resolved by '+info.name,reviewer:info.name,reviewerId:info.id,reviewedAt:new Date().toISOString(),reviewedBy:stageReviews(r,stage).map(x=>x.reviewer||x.email||x.reviewerId).join(', ')});
+  r[conflictFlag(stage)]=false;
+  saveNow();showConsensusModal(stage);
+  if(stage==='ft'){renderFTStats();renderFulltextList();}else{renderScreenStats();renderScreenList();}
+  renderSpine();
+  toast('Consensus resolved','ok');
+}
+function reviewSummaryHTML(r,stage){
+  const reviews=stageReviews(r,stage);
+  if(!reviews.length)return '';
+  const wf=ensureReviewWorkflow()[stage];
+  if(window.BK&&BK.isServer&&BK.isServer()&&BK.role==='reviewer'&&wf.blind)return '<div class="muted" style="margin-top:8px;font-size:11.5px">Blind screening is on. You can see your own decision; other reviewer decisions stay hidden until consensus.</div>';
+  return '<div class="muted" style="margin-top:8px;font-size:11.5px"><b>Reviewer decisions:</b> '+reviews.map(x=>esc((x.reviewer||x.email||'reviewer')+': '+x.final+(x.comment?' - '+x.comment:''))).join(' | ')+'</div>';
+}
 function setDecisionComment(stage,id,val){
   const r=refById(id);if(!r)return;
-  if(stage==='ft'){r.ft=r.ft||{};r.ft.comment=val;}
+  const mine=myStageReview(r,stage);
+  if(mine)mine.comment=val;
+  else if(stage==='ft'){r.ft=r.ft||{};r.ft.comment=val;}
   else{r.ta=r.ta||{};r.ta.comment=val;}
   saveSoon();
 }
@@ -1689,7 +1805,8 @@ async function screenAll(resume){
   if(!ST.agent.trained){toast('Train the agent first','err');ASRMA.go('agents');return;}
   if(BATCH_CTRL.ta.running){updateBatchButtons();toast('Viveka Cloud is already screening - use Stop if you want to pause it','err');return;}
   const scope=titleAbstractScopeRefs();
-  const pend=scope.filter(r=>!r.ta);
+  const assignedMode=BK.isServer&&BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments();
+  const pend=assignedMode?scope.filter(r=>!myStageReview(r,'ta')):scope.filter(r=>!r.ta);
   const queue=resume?pend:(pend.length?pend:scope);
   if(!queue.length){toast('Nothing to screen','err');return;}
   if(!resume&&pend.length===0&&!confirm('Re-screen all '+queue.length+' studies?'))return;
@@ -1712,13 +1829,21 @@ async function screenAll(resume){
 }
 function setDecision(id,dec,ev){
   const r=refById(id);if(!r)return;
-  const prev=r.ta||{};
-  const learned=logAIDiscrepancy('ta',r,prev,dec);
-  r.ta=Object.assign({},prev,{final:dec,human:dec,by:'human',conf:100,reason:prev.reason&&prev.by==='agent'?prev.reason:'human decision',comment:prev.comment||'',reviewer:currentReviewerName(),reviewedAt:new Date().toISOString(),seeded:prev.seeded});
+  const prev=visibleStageDecision(r,'ta')||r.ta||{};
+  const comment=requireDecisionReason('ta',r,dec);
+  if(comment===null)return;
+  const learned=logAIDiscrepancy('ta',r,r.ta||prev,dec);
+  if(window.BK&&BK.isServer&&BK.isServer()){
+    setReviewerStageDecision(r,'ta',dec,comment,prev);
+  }else{
+    r.ta=Object.assign({},prev,{final:dec,human:dec,by:'human',conf:100,reason:comment||prev.reason||'human decision',comment:comment||prev.comment||'',reviewer:currentReviewerName(),reviewedAt:new Date().toISOString(),seeded:prev.seeded});
+    if(r._conflict)r._conflict=false;
+  }
   if(learned&&prev.by==='local')scheduleLocalRetrain();
-  if(r._conflict)r._conflict=false; // lead resolved the disagreement
   saveSoon();
   if(currentMode()==='local'&&!ST.engine){renderScreen();renderSpine();return;}
+  renderScreenList();renderScreenStats();renderSpine();
+  return;
   const card=(ev&&ev.target&&ev.target.closest)?ev.target.closest('.study'):document.querySelector('.study[data-id="'+id+'"]');
   if(card){
     card.className='study '+dec;
@@ -1769,6 +1894,7 @@ function renderScreen(){
     <span class="spacer"></span>
     ${splitOn?`<button class="btn gh sm" onclick="toggleMyAssignmentsOnly()" title="Show only studies assigned to you">${BK.myAssignmentsOnly?'My assigned only: on':'My assigned only: off'}</button>`:''}
     <button class="btn gh sm" onclick="teamBatchModal()" title="${BK.isServer()?'Assign studies across live project members':'Split articles between reviewers and merge their work'}">👥 Team & batches</button>
+    ${BK.isServer()?`<button class="btn gh sm" onclick="showConsensusModal('ta')" title="Reviewer progress, conflicts, and kappa">Consensus & IRR</button>`:''}
   </div>
   <div id="screen-stats"></div>
   <div class="toolbar"><button class="btn gh sm" onclick="resetTitleAbstractScreening()" title="Clear all title/abstract screening decisions">Reset title/abstract screening</button></div>
@@ -1870,9 +1996,22 @@ function recallThreshold(samples,eng,target){
   return Math.max(0.12,Math.min(0.45,pos[ix]));
 }
 
+function localTrainingLabels(){
+  const rows=[];
+  ST.refs.filter(r=>!r.dup).forEach(r=>{
+    const final=stageFinalObj(r,'ta');
+    if(final&&['include','exclude'].includes(final.final)&&['human','consensus','arbitrator'].includes(final.by||'')){
+      rows.push({r,label:final.final});return;
+    }
+    const mine=myStageReview(r,'ta');
+    if(mine&&['include','exclude'].includes(mine.final)){rows.push({r,label:mine.final});return;}
+    if(r.ta&&r.ta.by==='human'&&['include','exclude'].includes(r.ta.final))rows.push({r,label:r.ta.final});
+  });
+  return rows;
+}
 function localTrainable(){
-  const lab=ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.by==='human'&&(r.ta.final==='include'||r.ta.final==='exclude'));
-  const inc=lab.filter(r=>r.ta.final==='include').length,exc=lab.filter(r=>r.ta.final==='exclude').length;
+  const lab=localTrainingLabels();
+  const inc=lab.filter(x=>x.label==='include').length,exc=lab.filter(x=>x.label==='exclude').length;
   return {inc,exc,total:lab.length,ok:inc>=5&&exc>=5};
 }
 function crossValLocal(samples,dim){
@@ -1897,12 +2036,11 @@ function crossValLocal(samples,dim){
 }
 function trainLocalEngine(){
   const t=localTrainable();
-  if(!t.ok){toast('Label at least 3 includes and 3 excludes first','err');return;}
+  if(!t.ok){toast('Label at least 5 includes and 5 excludes first','err');return;}
   const docs=ST.refs.filter(r=>!r.dup).map(r=>({id:r.id,text:docText(r)}));
   const eng=buildVocab(docs);
   const vmap={};docs.forEach(d=>vmap[d.id]=tfidf(ltok(d.text),eng));
-  const samples=ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.by==='human'&&(r.ta.final==='include'||r.ta.final==='exclude'))
-    .map(r=>({v:vmap[r.id],y:r.ta.final==='include'?1:0}));
+  const samples=localTrainingLabels().map(x=>({v:vmap[x.r.id],y:x.label==='include'?1:0}));
   // honest performance estimate BEFORE fitting the final model
   const val=crossValLocal(samples,eng.vocab.length);
   const model=trainLR(samples,eng.vocab.length);
@@ -1936,7 +2074,8 @@ function scoreAllLocal(vmap){
   const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
   const maybeBand=ST.settings.localMaybeBand!=null?ST.settings.localMaybeBand:0.08;
   titleAbstractScopeRefs().forEach(r=>{
-    if(r.ta&&r.ta.by==='human')return; // never overwrite human labels
+    const final=stageFinalObj(r,'ta');
+    if(myStageReview(r,'ta')||(final&&['human','consensus','arbitrator','conflict'].includes(final.by)))return; // never overwrite reviewer labels
     const v=(vmap&&vmap[r.id])||vecFor(r,eng);
     const p=localProbability(v,eng);
     const dec=p>=thr?'include':(p>=thr-maybeBand?'maybe':'exclude');
@@ -2034,9 +2173,10 @@ function renderScreenStats(){
   const pool=assignedOnly?allUnique.filter(r=>isAssignedToMe(r)):allUnique;
   let total=0,inc=0,maybe=0,exc=0,pend=0,byHuman=0,byEngine=0;
   for(const r of pool){total++;
-    if(!r.ta){pend++;continue;}
-    const f=r.ta.final;if(f==='include')inc++;else if(f==='maybe')maybe++;else if(f==='exclude')exc++;
-    if(r.ta.by==='human')byHuman++;else if(r.ta.by==='local')byEngine++;}
+    const ta=(assignedOnly&&splitOn)?myStageReview(r,'ta'):visibleStageDecision(r,'ta');
+    if(!ta){pend++;continue;}
+    const f=ta.final;if(f==='include')inc++;else if(f==='maybe')maybe++;else if(f==='exclude')exc++;
+    if(ta.by==='human')byHuman++;else if(ta.by==='local')byEngine++;}
   const local=currentMode()==='local';
   const mine=splitOn?myAssignedRefs().length:0;
   const minePend=splitOn?myPendingAssignedCount():0;
@@ -2063,8 +2203,14 @@ function filteredRefs(){
   let u=ST.refs.filter(r=>!r.dup);
   if(SCREEN_FILTER==='al'){const s=window._alSet||new Set();u=u.filter(r=>s.has(r.id));}
   else if(SCREEN_FILTER==='conflict'){u=u.filter(r=>r._conflict);}
-  else if(SCREEN_FILTER==='pending')u=u.filter(r=>!r.ta||r.ta.by==='local');
-  else if(SCREEN_FILTER!=='all')u=u.filter(r=>r.ta&&r.ta.final===SCREEN_FILTER);
+  else if(SCREEN_FILTER==='pending')u=u.filter(r=>{
+    const ta=(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())?myStageReview(r,'ta'):visibleStageDecision(r,'ta');
+    return !ta||ta.by==='local';
+  });
+  else if(SCREEN_FILTER!=='all')u=u.filter(r=>{
+    const ta=(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())?myStageReview(r,'ta'):visibleStageDecision(r,'ta');
+    return ta&&ta.final===SCREEN_FILTER;
+  });
   if(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())u=u.filter(r=>isAssignedToMe(r));
   if(SCREEN_Q){const q=SCREEN_Q.toLowerCase();u=u.filter(r=>(r.title+' '+r.authors).toLowerCase().includes(q));}
   if(currentMode()==='local'&&ST.engine)u=u.slice().sort((a,b)=>((b.ta&&b.ta.prob)||0)-((a.ta&&a.ta.prob)||0));
@@ -2086,7 +2232,7 @@ let _searchDeb=null;
 function onSearchInput(v){SCREEN_Q=v;clearTimeout(_searchDeb);_searchDeb=setTimeout(()=>{SCREEN_PAGE=1;renderScreenList();},220);}
 window.moreCards=moreCards;window.onSearchInput=onSearchInput;
 function studyCard(r){
-  const ta=r.ta;const dec=ta?ta.final:'';
+  const ta=visibleStageDecision(r,'ta');const dec=ta?ta.final:'';
   let chip='';
   if(ta){
     if(ta.by==='agent')chip=`<span class="dchip ai" title="Screening reviewer">⊹ Viveka ${ta.conf}%</span>`;
@@ -2115,7 +2261,7 @@ function studyCard(r){
 async function reAsk(id){agentBusy(true);try{await screenOne(id,true);saveSoon();patchCard(id);renderScreenStats();toast('Re-screened (advanced)','ok');}catch(e){toast(e.message,'err')}agentBusy(false);}
 window.setScreenFilter=setScreenFilter;window.reAsk=reAsk;window.setDecisionComment=setDecisionComment;
 function studyCard(r){
-  const ta=r.ta;const dec=ta?ta.final:'';let chip='';
+  const ta=visibleStageDecision(r,'ta');const dec=ta?ta.final:'';let chip='';
   if(ta){
     if(ta.by==='agent')chip=`<span class="dchip ai" title="Screening reviewer">⊹ Viveka ${ta.conf}%</span>`;
     else if(ta.by==='local')chip=`<span class="dchip ai" title="Viveka Local score">⚙ Viveka Local ${Math.round((ta.prob||0)*100)}%</span>`;
@@ -2139,6 +2285,7 @@ function studyCard(r){
       ${currentMode()==='llm'?`<button class="vbtn" title="Re-ask Viveka (advanced model)" onclick="reAsk('${r.id}')">⊹</button>`:''}
     </div>
     ${ta?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ta))}</div>`:''}
+    ${reviewSummaryHTML(r,'ta')}
     <div class="fg" style="margin:10px 0 0">
       <label class="fl">Comment / reason</label>
       <textarea class="inp" style="min-height:56px" placeholder="Add reviewer comments, conflict notes, or a decision reason" oninput="setDecisionComment('ta','${r.id}',this.value)">${esc((ta&&ta.comment)||'')}</textarea>
@@ -2267,7 +2414,7 @@ async function screenAllFullText(mode,resume){
   if(mode==='local'&&!ST.engine){toast('Train Viveka Local first','err');ASRMA.go('screen');return;}
   const key=mode==='local'?'ftLocal':'ftCloud';
   if(BATCH_CTRL[key].running){toast('Full-text screening is already running','err');return;}
-  const pending=listAll.filter(r=>!(r.ft&&r.ft.decision));
+  const pending=listAll.filter(r=>{const ft=visibleStageDecision(r,'ft')||r.ft;return !(ft&&(ft.decision||ft.final));});
   const list=pending.length?pending:listAll;
   if(resume&&!pending.length){toast('No pending full-text articles to resume','ok');return;}
   if(!resume&&!pending.length&&!confirm('Re-assess all '+list.length+' full-text studies with Viveka '+(mode==='local'?'Local':'Cloud')+'?'))return;
@@ -2287,9 +2434,18 @@ async function screenAllFullText(mode,resume){
   batchEnd(key);saveNow();agentBusy(false);renderFulltext();renderSpine();toast((stopped?'Stopped after ':'Full-text assessed ')+done+' studies with Viveka '+(mode==='local'?'Local':'Cloud'),'ok');
 }
 function ftDecide(id,dec,cat){const r=ST.refs.find(x=>x.id===id);if(!r)return;
-  const prev=r.ft||{};
+  const prev=visibleStageDecision(r,'ft')||r.ft||{};
+  const comment=requireDecisionReason('ft',r,dec);
+  if(comment===null)return;
   const learned=logAIDiscrepancy('ft',r,prev,dec);
-  r.ft=r.ft||{};r.ft.decision=dec;r.ft.by='human';r.ft.reviewer=currentReviewerName();r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';if(cat!==undefined)r.ft.exclCat=cat;
+  if(window.BK&&BK.isServer&&BK.isServer()){
+    setReviewerStageDecision(r,'ft',dec,comment,prev);
+    r.ft=r.ft||{};
+    if(cat!==undefined)r.ft.exclCat=cat;
+  }else{
+    r.ft=r.ft||{};r.ft.decision=dec;r.ft.final=dec;r.ft.by='human';r.ft.reviewer=currentReviewerName();r.ft.reviewedAt=new Date().toISOString();r.ft.comment=comment||r.ft.comment||'';if(cat!==undefined)r.ft.exclCat=cat;
+    if(r._ftConflict)r._ftConflict=false;
+  }
   if(learned&&prev.by==='local')scheduleLocalRetrain();
   save();renderFulltextList();renderFTStats();renderSpine();}
 function renderFulltext(){
@@ -2404,6 +2560,7 @@ function renderFulltextList(){
         <button class="vbtn inc ${dec==='include'?'act-inc':''}" onclick="ftDecide('${r.id}','include')">✓</button>
       </div>
       ${ft.reviewedAt?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ft))}</div>`:''}
+      ${reviewSummaryHTML(r,'ft')}
       ${ft.pdfText?`<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--flow);font-weight:700">Preview retrieved full text</summary><div style="margin-top:8px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--wash);max-height:220px;overflow:auto;white-space:pre-wrap;font-size:12px;line-height:1.55">${esc(ft.pdfText.slice(0,2200))}</div></details>`:''}
       <div class="fg" style="margin:10px 0 0">
         <label class="fl">Comment / reason</label>
@@ -2488,8 +2645,8 @@ function fullTextBaseRefs(){
 }
 function filteredFullTextRefs(){
   let list=fullTextBaseRefs();
-  if(FT_FILTER==='pending')list=list.filter(r=>!(r.ft&&r.ft.decision));
-  else if(FT_FILTER!=='all')list=list.filter(r=>r.ft&&r.ft.decision===FT_FILTER);
+  if(FT_FILTER==='pending')list=list.filter(r=>{const ft=visibleStageDecision(r,'ft')||r.ft;return !(ft&&(ft.decision||ft.final));});
+  else if(FT_FILTER!=='all')list=list.filter(r=>{const ft=visibleStageDecision(r,'ft')||r.ft;return ft&&(ft.decision||ft.final)===FT_FILTER;});
   return list;
 }
 function setFTFilter(f){
@@ -2503,7 +2660,7 @@ function resetTitleAbstractScreening(){
   const scope=titleAbstractScopeRefs();
   if(!scope.length){toast('No title/abstract records to reset','err');return;}
   if(!confirm('Reset title/abstract screening decisions for '+scope.length+' visible records? Imported records and assignments will stay.'))return;
-  scope.forEach(r=>{delete r.ta;delete r._conflict;});
+  scope.forEach(r=>{delete r.ta;delete r._conflict;if(r.reviews)delete r.reviews.ta;});
   saveNow();renderScreen();renderSpine();toast('Title/abstract screening reset','ok');
 }
 function resetFullTextScreening(){
@@ -2516,6 +2673,8 @@ function resetFullTextScreening(){
     const keep={};
     ['oa','pdfText','pdfName','fulltextUrl','source','doi','fetchedAt'].forEach(k=>{if(r.ft[k]!=null)keep[k]=r.ft[k];});
     r.ft=keep;
+    delete r._ftConflict;
+    if(r.reviews)delete r.reviews.ft;
   });
   saveNow();renderFulltext();renderSpine();toast('Full-text screening reset','ok');
 }
@@ -2540,6 +2699,7 @@ renderFulltext=function(){
     <button class="btn gh sm" id="ft-local-stop-btn" onclick="stopBatch('ftLocal')" disabled>Stop Local</button>
     <button class="btn gh sm" onclick="screenAllFullText('cloud',true)">Resume Cloud</button>
     <button class="btn gh sm" onclick="screenAllFullText('local',true)">Resume Local</button>
+    ${BK.isServer()?`<button class="btn gh sm" onclick="showConsensusModal('ft')">Consensus & IRR</button>`:''}
     <button class="btn gh sm" onclick="resetFullTextScreening()">Reset current full-text filter</button>
     <div class="pbar" style="width:160px"><i id="ft-screen-bar"></i></div>
     <span class="muted" id="ft-screen-time">Timer appears while full-text screening runs.</span>
@@ -2554,13 +2714,14 @@ renderFulltext=function(){
 };
 renderFTStats=function(){
   const list=fullTextBaseRefs();
-  const inc=list.filter(r=>r.ft&&r.ft.decision==='include').length;
-  const maybe=list.filter(r=>r.ft&&r.ft.decision==='maybe').length;
-  const exc=list.filter(r=>r.ft&&r.ft.decision==='exclude').length;
-  const pend=list.filter(r=>!(r.ft&&r.ft.decision)).length;
+  const decOf=r=>{const ft=visibleStageDecision(r,'ft')||r.ft;return ft&&(ft.decision||ft.final);};
+  const inc=list.filter(r=>decOf(r)==='include').length;
+  const maybe=list.filter(r=>decOf(r)==='maybe').length;
+  const exc=list.filter(r=>decOf(r)==='exclude').length;
+  const pend=list.filter(r=>!decOf(r)).length;
   const oa=list.filter(r=>r.ft&&r.ft.oa).length;
   const estTotal=list.reduce((sum,r)=>sum+ftEstimateMinutes(r),0);
-  const estPending=list.filter(r=>!(r.ft&&r.ft.decision)).reduce((sum,r)=>sum+ftEstimateMinutes(r),0);
+  const estPending=list.filter(r=>!decOf(r)).reduce((sum,r)=>sum+ftEstimateMinutes(r),0);
   const disc=ensureAudit().filter(x=>x.stage==='ft').length;
   const tile=(f,val,label,cls)=>`<div class="tile ${cls||''}" style="cursor:pointer" onclick="setFTFilter('${f}')"><div class="v">${val}</div><div class="k">${label}</div></div>`;
   const el=document.getElementById('ft-stats');if(!el)return;
@@ -2579,7 +2740,7 @@ renderFulltextList=function(){
   const el=document.getElementById('ft-list');if(!el)return;
   if(!list.length){el.innerHTML='<div class="empty"><div class="ico">FT</div><h3>No full-text studies in this filter</h3><div>Switch to All, Pending, Include, Maybe, or Exclude.</div></div>';return;}
   const shown=Math.min(list.length,FT_PAGE*FT_PAGE_SIZE);
-  el.innerHTML=list.slice(0,shown).map(r=>{const ft=r.ft||{};const dec=ft.decision;
+  el.innerHTML=list.slice(0,shown).map(r=>{const ft=Object.assign({},r.ft||{},visibleStageDecision(r,'ft')||{});const dec=ft.decision||ft.final;
     return`<div class="study ${dec||''}">
       <div class="st-title">${esc(r.title)}</div>
       <div class="st-meta"><span>${esc(r.year||'')}</span><span>${esc(r.journal||'')}</span>
@@ -3913,8 +4074,69 @@ function mergeBatch(b){
   toast('Merged '+merged+' decisions'+(conflicts?(' — '+conflicts+' conflicts'):''),conflicts?'err':'ok');
 }
 function tbConflicts(){return ST.refs.filter(r=>!r.dup&&r._conflict);}
+function reviewerProgress(stage){
+  const members=(BK.members&&BK.members.length?BK.members:(ensureLiveSplit().ta.members||[])).slice();
+  const refs=ST.refs.filter(r=>!r.dup);
+  return members.map(m=>{
+    const assigned=refs.filter(r=>!taAssignedIds(r).length||taAssignedIds(r).includes(m.id)||taAssignedIds(r).includes(m.email));
+    const reviews=refs.filter(r=>stageReviews(r,stage).some(x=>x.reviewerId===m.id||x.email===m.email));
+    const counts={include:0,maybe:0,exclude:0};
+    reviews.forEach(r=>{const d=stageReviews(r,stage).find(x=>x.reviewerId===m.id||x.email===m.email);if(d&&counts[d.final]!=null)counts[d.final]++;});
+    return {id:m.id,name:m.name||m.email,email:m.email,role:m.role,assigned:assigned.length,reviewed:reviews.length,pending:Math.max(0,assigned.length-reviews.length),counts};
+  });
+}
+function calcIRR(stage){
+  const cats=['include','maybe','exclude'];
+  let pairs=0,agree=0;const marg={include:0,maybe:0,exclude:0};const byPair={};
+  ST.refs.filter(r=>!r.dup).forEach(r=>{
+    const rev=stageReviews(r,stage).filter(x=>cats.includes(x.final));
+    for(let i=0;i<rev.length;i++)for(let j=i+1;j<rev.length;j++){
+      const a=rev[i],b=rev[j];pairs++;if(a.final===b.final)agree++;
+      marg[a.final]++;marg[b.final]++;
+      const key=[a.reviewer||a.email||a.reviewerId,b.reviewer||b.email||b.reviewerId].sort().join(' / ');
+      byPair[key]=byPair[key]||{n:0,agree:0};byPair[key].n++;if(a.final===b.final)byPair[key].agree++;
+    }
+  });
+  const po=pairs?agree/pairs:0;
+  const denom=pairs*2||1;
+  const pe=cats.reduce((s,c)=>s+Math.pow(marg[c]/denom,2),0);
+  const k=pe<1?(po-pe)/(1-pe):0;
+  return {pairs,agreePct:pairs?Math.round(po*100):0,kappa:pairs?Number(k.toFixed(3)):null,byPair};
+}
+function showConsensusModal(stage){
+  stage=stage||'ta';
+  const irr=calcIRR(stage);
+  const conflicts=ST.refs.filter(r=>!r.dup&&r[conflictFlag(stage)]);
+  const progress=reviewerProgress(stage);
+  const progRows=progress.map(p=>`<tr><td><b>${esc(p.name||'')}</b><br><span class="muted">${esc(p.email||'')}</span></td><td>${p.assigned}</td><td>${p.reviewed}</td><td>${p.pending}</td><td>${p.counts.include}/${p.counts.maybe}/${p.counts.exclude}</td><td><div class="prog-mini" style="max-width:130px"><i style="width:${p.assigned?Math.round(p.reviewed/p.assigned*100):0}%"></i></div></td></tr>`).join('');
+  const conflictRows=conflicts.map(r=>`<tr><td><b>${esc(r.title||'')}</b><br><span class="muted">${esc((r.authors||'').split(';')[0]||'')} ${esc(r.year||'')}</span></td><td>${stageReviews(r,stage).map(x=>`<div><b>${esc(x.reviewer||x.email||'reviewer')}</b>: ${esc(x.final)}${x.comment?`<br><span class="muted">${esc(x.comment)}</span>`:''}</div>`).join('')}</td><td><button class="btn gh sm" onclick="resolveConsensus('${stage}','${r.id}','include')">Include</button> <button class="btn gh sm" onclick="resolveConsensus('${stage}','${r.id}','maybe')">Maybe</button> <button class="btn gh sm" onclick="resolveConsensus('${stage}','${r.id}','exclude')">Exclude</button></td></tr>`).join('');
+  const pairRows=Object.keys(irr.byPair).map(k=>`<tr><td>${esc(k)}</td><td>${irr.byPair[k].n}</td><td>${Math.round(irr.byPair[k].agree/irr.byPair[k].n*100)}%</td></tr>`).join('');
+  modal(`<div class="modal-h">Consensus, reviewer progress & IRR<button class="x" onclick="closeModal()">x</button></div>
+  <div class="modal-b" style="max-width:980px">
+    <div class="tiles" style="grid-template-columns:repeat(4,minmax(0,1fr))">
+      <div class="tile"><div class="v">${conflicts.length}</div><div class="k">open conflicts</div></div>
+      <div class="tile flow"><div class="v">${irr.pairs}</div><div class="k">double-screen pairs</div></div>
+      <div class="tile inc"><div class="v">${irr.agreePct}%</div><div class="k">agreement</div></div>
+      <div class="tile syn"><div class="v">${irr.kappa==null?'-':irr.kappa}</div><div class="k">kappa / IRR</div></div>
+    </div>
+    <h3>Reviewer progress</h3>
+    <table class="tbl"><thead><tr><th>Reviewer</th><th>Assigned</th><th>Reviewed</th><th>Pending</th><th>I/M/E</th><th>Progress</th></tr></thead><tbody>${progRows||'<tr><td colspan="6">No reviewers found.</td></tr>'}</tbody></table>
+    <h3 style="margin-top:18px">Conflicts needing consensus</h3>
+    <table class="tbl"><thead><tr><th>Study</th><th>Reviewer decisions</th><th>Resolve</th></tr></thead><tbody>${conflictRows||'<tr><td colspan="3">No open conflicts.</td></tr>'}</tbody></table>
+    <h3 style="margin-top:18px">Pairwise agreement</h3>
+    <table class="tbl"><thead><tr><th>Reviewer pair</th><th>Overlaps</th><th>Agreement</th></tr></thead><tbody>${pairRows||'<tr><td colspan="3">No double-screened studies yet.</td></tr>'}</tbody></table>
+  </div><div class="modal-f"><button class="btn gh" onclick="closeModal()">Close</button></div>`);
+}
+function applyReviewerWorkflowSettings(){
+  const wf=ensureReviewWorkflow().ta;
+  wf.blind=!!(document.getElementById('rw-blind')||{}).checked;
+  wf.requireExcludeReason=!!(document.getElementById('rw-reason')||{}).checked;
+  wf.minReviewers=Math.max(1,Math.min(5,parseInt((document.getElementById('rw-min')||{}).value||2)));
+  saveNow();toast('Reviewer workflow settings saved','ok');serverTeamSplitModal();
+}
 window.teamBatchModal=teamBatchModal;window.tbAddReviewer=tbAddReviewer;window.tbSplit=tbSplit;
 window.tbExportBatch=tbExportBatch;window.tbImportBatch=tbImportBatch;window.renderBatchList=renderBatchList;window.tbConflicts=tbConflicts;
+window.showConsensusModal=showConsensusModal;window.resolveConsensus=resolveConsensus;window.applyReviewerWorkflowSettings=applyReviewerWorkflowSettings;
 
 async function fetchProjectMembers(){
   if(!BK.isServer()||!ST.id) return [];
@@ -3928,8 +4150,13 @@ async function serverTeamSplitModal(){
   const active=loadLiveSplitDefaults(members);
   const editable=BK.role==='owner'||BK.role==='editor';
   const uniq=ST.refs.filter(r=>!r.dup);
-  const pending=uniq.filter(r=>!r.ta||r.ta.by==='local');
+  const pending=uniq;
   const overlap=ensureLiveSplit().ta.overlap||0;
+  const wf=ensureReviewWorkflow().ta;
+  const irr=calcIRR('ta');
+  const progress=reviewerProgress('ta');
+  const progressRows=progress.map(p=>'<tr><td><b>'+esc(p.name||'')+'</b><div class="muted">'+esc(p.email||'')+'</div></td><td>'+p.assigned+'</td><td>'+p.reviewed+'</td><td>'+p.pending+'</td><td>'+p.counts.include+'/'+p.counts.maybe+'/'+p.counts.exclude+'</td></tr>').join('');
+  const conflictCount=uniq.filter(r=>r._conflict).length;
   modal('<div class="modal-h">👥 Team allocation<button class="x" onclick="closeModal()">×</button></div>'+
   '<div class="modal-b">'+
     '<div class="banner info" style="margin-bottom:14px"><span class="bi">🤝</span><div><b>Live shared allocation for this project.</b><br>Set what percentage of the screening queue each current project member should review. The assignment is saved inside the shared project, syncs to everyone, and each reviewer can switch to <b>My assigned only</b>.</div></div>'+
@@ -3944,6 +4171,17 @@ async function serverTeamSplitModal(){
       '<label class="fl" style="margin:0">Double-screen overlap</label>'+
       '<select class="inp" id="alloc-overlap" style="width:auto" '+(editable?'':'disabled')+'><option value="0" '+(overlap===0?'selected':'')+'>none</option><option value="0.2" '+(overlap===0.2?'selected':'')+'>20%</option><option value="0.5" '+(overlap===0.5?'selected':'')+'>50%</option><option value="1" '+(overlap===1?'selected':'')+'>100%</option></select>'+
       '<span class="muted">Overlap adds a second reviewer to a portion of studies.</span></div>'+
+    '<div class="divider"></div>'+
+    '<div class="card-h" style="margin-bottom:8px">Reviewer workflow</div>'+
+    '<div class="row" style="gap:12px;align-items:center;margin-bottom:10px">'+
+      '<label class="check"><input id="rw-blind" type="checkbox" '+(wf.blind?'checked':'')+' '+(editable?'':'disabled')+'> Blind screening</label>'+
+      '<label class="check"><input id="rw-reason" type="checkbox" '+(wf.requireExcludeReason?'checked':'')+' '+(editable?'':'disabled')+'> Exclusion reason required</label>'+
+      '<label class="fl" style="margin:0">Minimum reviewers</label><input class="inp" id="rw-min" type="number" min="1" max="5" value="'+(wf.minReviewers||2)+'" style="width:82px" '+(editable?'':'disabled')+'>'+
+      (editable?'<button class="btn gh sm" onclick="applyReviewerWorkflowSettings()">Save workflow settings</button>':'')+
+      '<button class="btn gh sm" onclick="showConsensusModal(&quot;ta&quot;)">Open consensus & IRR</button>'+
+    '</div>'+
+    '<div class="row" style="margin-bottom:10px"><span class="pill '+(conflictCount?'x':'')+'">Conflicts: '+conflictCount+'</span><span class="pill s">Agreement: '+irr.agreePct+'%</span><span class="pill">Kappa: '+(irr.kappa==null?'-':irr.kappa)+'</span><span class="pill">Pairs: '+irr.pairs+'</span></div>'+
+    '<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>Reviewer</th><th>Assigned</th><th>Reviewed</th><th>Pending</th><th>I/M/E</th></tr></thead><tbody>'+(progressRows||'<tr><td colspan="5">No reviewer progress yet.</td></tr>')+'</tbody></table></div>'+
     '<div id="alloc-msg" style="margin-top:12px">'+renderServerAllocationSummary(active)+'</div>'+
   '</div>'+
   '<div class="modal-f">'+
@@ -3965,7 +4203,7 @@ function serverAutoBalance(){
 function applyServerSplit(){
   const members=(BK.members||[]).slice();
   if(!members.length){toast('No team members to allocate across','err');return;}
-  const pending=ST.refs.filter(r=>!r.dup&&(!r.ta||r.ta.by==='local'));
+  const pending=ST.refs.filter(r=>!r.dup);
   if(!pending.length){toast('No pending studies to allocate','err');return;}
   const rows=members.map(m=>({id:m.id,name:m.name||m.email,email:m.email,role:m.role,pct:Math.max(0,parseFloat((document.getElementById('alloc-pct-'+m.id)||{}).value)||0)}))
     .filter(m=>m.pct>0);
