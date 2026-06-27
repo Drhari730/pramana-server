@@ -3004,7 +3004,7 @@ function heuristicExtractAll(){
           const hasKeyword = kws.some(kw => sl.includes(kw));
           const hasNumber = /\d/.test(s);
           if (hasKeyword && hasNumber && (sl.includes('p=') || sl.includes('p<') || sl.includes('%') || sl.includes('ci') || sl.includes('sd') || sl.includes('or='))) {
-            matchVal = '[\u26a1 Smart Match] Check quote'; matchQuote = s; break;
+            matchVal = ''; matchQuote = s; break;
           }
         }
       }
