@@ -3171,23 +3171,44 @@ function renderRobSummaryChart(list, doms) {
     });
   });
   const t = list.length;
-  const pct = (v) => (v/t*100).toFixed(1) + '%';
-  const bar = (d, label, isOverall) => {
-    const pLow = pct(counts[d].low), pSome = pct(counts[d].some), pHigh = pct(counts[d].high);
-    return '<div style="display:flex;align-items:center;margin-bottom:6px;font-size:11px">'+
-      '<div style="width:180px;text-align:right;padding-right:8px;font-weight:'+(isOverall?'700':'400')+'">'+esc(label)+'</div>'+
-      '<div style="flex:1;display:flex;height:16px;border-radius:2px;overflow:hidden;background:var(--wash2)">'+
-        (counts[d].low > 0 ? '<div style="width:'+pLow+';background:var(--inc)" title="Low risk: '+pLow+'"></div>' : '')+
-        (counts[d].some > 0 ? '<div style="width:'+pSome+';background:var(--maybe)" title="Some concerns: '+pSome+'"></div>' : '')+
-        (counts[d].high > 0 ? '<div style="width:'+pHigh+';background:var(--exc)" title="High risk: '+pHigh+'"></div>' : '')+
-      '</div><div style="width:40px;text-align:right;color:var(--t3)">100%</div></div>';
+  const barW = 450, labelW = 220, rowH = 26, H = (doms.length + 1) * rowH + 60, W = labelW + barW + 50;
+  
+  let svg = '<svg id="rob-summary-svg" width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'" xmlns="http://www.w3.org/2000/svg" style="font-family:sans-serif;font-size:11px;background:#ffffff">';
+  const pct = (v) => v/t;
+  const cLow = '#16a34a', cSome = '#d97706', cHigh = '#dc2626', cBg = '#eef2f9';
+  
+  const drawBar = (d, label, isOverall, y) => {
+    const pL = pct(counts[d].low), pS = pct(counts[d].some), pH = pct(counts[d].high);
+    const wL = pL*barW, wS = pS*barW, wH = pH*barW;
+    let out = '<text x="'+(labelW-10)+'" y="'+(y+16)+'" text-anchor="end" fill="#0f1729" font-weight="'+(isOverall?'bold':'normal')+'">'+esc(label)+'</text>';
+    out += '<rect x="'+labelW+'" y="'+(y+4)+'" width="'+barW+'" height="'+(rowH-8)+'" fill="'+cBg+'" rx="2" />';
+    let curX = labelW;
+    if(wL>0){ out+='<rect x="'+curX+'" y="'+(y+4)+'" width="'+wL+'" height="'+(rowH-8)+'" fill="'+cLow+'" />'; curX+=wL; }
+    if(wS>0){ out+='<rect x="'+curX+'" y="'+(y+4)+'" width="'+wS+'" height="'+(rowH-8)+'" fill="'+cSome+'" />'; curX+=wS; }
+    if(wH>0){ out+='<rect x="'+curX+'" y="'+(y+4)+'" width="'+wH+'" height="'+(rowH-8)+'" fill="'+cHigh+'" />'; curX+=wH; }
+    out += '<text x="'+(labelW+barW+10)+'" y="'+(y+16)+'" fill="#8a97ad">100%</text>';
+    return out;
   };
-  return '<div class="card" style="padding:16px;margin-bottom:16px;background:#f8fafc"><div style="margin-bottom:12px;font-weight:700;font-size:12px;color:var(--t2)">Traffic Light Summary (Intention-to-treat)</div>' + 
-    doms.map(d => bar(d, d)).join('') + '<div style="height:1px;background:var(--line2);margin:8px 0"></div>' + bar('overall', 'Overall Bias', true) +
-    '<div style="display:flex;justify-content:center;gap:16px;margin-top:12px;font-size:10px">'+
-    '<span><span style="display:inline-block;width:10px;height:10px;background:var(--inc);border-radius:2px;margin-right:4px"></span>Low risk</span>'+
-    '<span><span style="display:inline-block;width:10px;height:10px;background:var(--maybe);border-radius:2px;margin-right:4px"></span>Some concerns</span>'+
-    '<span><span style="display:inline-block;width:10px;height:10px;background:var(--exc);border-radius:2px;margin-right:4px"></span>High risk</span>'+
+  
+  let y = 10;
+  doms.forEach(d => { svg += drawBar(d, d, false, y); y += rowH; });
+  y += 5;
+  svg += '<line x1="20" y1="'+y+'" x2="'+(W-20)+'" y2="'+y+'" stroke="#cbd5e6" stroke-width="1"/>';
+  y += 5;
+  svg += drawBar('overall', 'Overall Bias', true, y);
+  y += rowH + 15;
+  
+  const legX = W/2 - 120;
+  svg += '<rect x="'+legX+'" y="'+(y-8)+'" width="10" height="10" fill="'+cLow+'" rx="2"/><text x="'+(legX+14)+'" y="'+(y+1)+'" fill="#54627a" font-size="10">Low risk</text>';
+  svg += '<rect x="'+(legX+70)+'" y="'+(y-8)+'" width="10" height="10" fill="'+cSome+'" rx="2"/><text x="'+(legX+84)+'" y="'+(y+1)+'" fill="#54627a" font-size="10">Some concerns</text>';
+  svg += '<rect x="'+(legX+170)+'" y="'+(y-8)+'" width="10" height="10" fill="'+cHigh+'" rx="2"/><text x="'+(legX+184)+'" y="'+(y+1)+'" fill="#54627a" font-size="10">High risk</text>';
+  
+  svg += '</svg>';
+  
+  return '<div class="card" style="padding:16px;margin-bottom:16px;background:#f8fafc"><div style="margin-bottom:12px;font-weight:700;font-size:12px;color:var(--t2)">Traffic Light Summary (Intention-to-treat)</div><div style="overflow-x:auto;display:flex;justify-content:center">' + svg + '</div>'+
+    '<div class="row" style="margin-top:10px;gap:8px;justify-content:center">'+
+      '<button class="btn gh sm" onclick="downloadSVG(\'rob-summary-svg\',\'rob_summary.svg\')">\u2b07 SVG</button>'+
+      '<button class="btn gh sm" onclick="downloadSVGasPNG(\'rob-summary-svg\',\'rob_summary.png\')">\u2b07 PNG Image</button>'+
     '</div></div>';
 }
 function renderQuality(){
