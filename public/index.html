@@ -3204,7 +3204,6 @@ function renderQuality(){
       Object.keys(ROB_TOOLS).map(t=>'<option '+(getTool()===t?'selected':'')+'>'+t+'</option>').join('')+'</select>'+
     '<button class="btn flow sm" onclick="robAll(\'ai\')">\u2728 Auto-Assess (Viveka AI - uses credits)</button>'+
     '<button class="btn gh sm" style="margin-left:8px" onclick="robAll(\'heuristic\')">\u2699 Auto-Assess (Local Heuristic - free)</button>'+
-    <button class="btn gh sm" style="margin-left:8px" onclick="robAll(\'heuristic\')">\u2699 Auto-Assess (Local Heuristic - free)</button>'+
     '<div class="pbar" style="width:160px"><i id="rob-bar"></i></div>'+
   '</div>'+
   (!list.length?'<div class="empty"><div class="ico">\u2696</div><h3>No included studies</h3><div>Confirm includes at full text first.</div></div>':
