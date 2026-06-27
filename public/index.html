@@ -2623,6 +2623,19 @@ function getFields(){return ST.project.extractFields||DEFAULT_FIELDS;}
 async function extractOne(id){
   const r=ST.refs.find(x=>x.id===id);if(!r)return;
   const fields=getFields();
+  if(window.BK&&BK.isServer&&BK.isServer()&&serverAIReady()&&ST.id){
+    if(typeof _srvTimer!=='undefined'&&_srvTimer)await serverSaveNow();
+    const started=Date.now();
+    const model=serverModelFor(ST.agent.advModel||ST.agent.model);
+    const res=await BK.api('POST','/api/projects/'+ST.id+'/ai/extract',{refId:id,fields,model},180000);
+    syncAICredits(res);
+    r.extract=res.extraction||{};
+    r.extractEvidence=res.evidence||{};
+    r.extractWarnings=res.warnings||[];
+    r.extractEffectCandidates=res.effectCandidates||[];
+    r.extractMeta={server:true,model:res.model||model,creditsUsed:res.creditsUsed||0,chunksUsed:res.chunksUsed||[],overallConfidence:res.overallConfidence||0,reviewedAt:new Date().toISOString(),ms:Date.now()-started};
+    save();return r;
+  }
   const ctx=r.ft&&r.ft.pdfText?r.ft.pdfText.slice(0,11000):r.abstract;
   const res=parseJSON(await LLM(`You are an expert data extractor for a systematic review. Extract these fields from the study. Use the study's own numbers; write "NR" (not reported) if absent. Be precise and concise.
 STUDY: ${r.title}
@@ -2634,25 +2647,28 @@ Each value a short string. For "effect", give the headline result with CI if pre
 async function extractAll(){
   const list=ST.refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include');
   if(!list.length){toast('No included studies','err');return;}
-  agentBusy(true);const bar=document.getElementById('ext-bar');let done=0;
-  for(const r of list){try{await extractOne(r.id);}catch(e){}
+  agentBusy(true);const bar=document.getElementById('ext-bar');let done=0,ok=0,fail=0,lastErr='';
+  for(const r of list){try{await extractOne(r.id);ok++;}catch(e){fail++;lastErr=e.message||'extraction failed';if(e.status===402||/credits|configured|provider/i.test(lastErr))break;}
     done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';
     if(done%2===0)renderExtTable();}
-  agentBusy(false);renderExtract();renderSpine();toast('Extracted '+done+' studies','ok');
+  agentBusy(false);renderExtract();renderSpine();
+  if(fail)toast('Extracted '+ok+' studies. Stopped: '+lastErr,'err');
+  else toast('Extracted '+ok+' studies','ok');
 }
 function renderExtract(){
   const fields=getFields();
   document.getElementById('pane-extract').innerHTML=`
   <div class="pane-h"><div class="eyebrow">Phase 08 — capture the data</div>
-    <h1>⊞ Data extraction</h1>
-    <p>Schema-driven extraction: the agent fills your fields from each full text, every cell editable. Add custom fields for your outcomes, then export the table for analysis.</p></div>
+    <h1>⊞ Viveka Extractor</h1>
+    <p>Server-side full-text extraction: Viveka reads the article in sections, extracts your fields, keeps evidence quotes, and flags missing or uncertain values. Every cell remains editable before analysis.</p></div>
   <div class="toolbar">
-    <button class="btn flow sm" onclick="extractAll()">⊹ Extract all</button>
+    <button class="btn flow sm" onclick="extractAll()">⊹ Extract all with Viveka</button>
     <div class="pbar" style="width:160px"><i id="ext-bar"></i></div>
     <button class="btn gh sm" onclick="addField()">+ Add field</button>
     <span class="spacer"></span>
     <button class="btn gh sm" onclick="exportExtractCSV()">⬇ Export CSV</button>
   </div>
+  <div class="banner info" style="margin-bottom:14px"><span class="bi">i</span><div>Manual editing is free. On the hosted app, Viveka Extractor uses server-side AI credits because it performs deeper full-text reasoning and validation.</div></div>
   <div class="card" style="overflow-x:auto"><div id="ext-table"></div></div>`;
   renderExtTable();
 }
@@ -2664,8 +2680,8 @@ function renderExtTable(){
   el.innerHTML=`<table class="tbl"><thead><tr><th style="min-width:180px">Study</th>
     ${fields.map(f=>`<th style="min-width:150px">${esc(f.label)} <button class="vbtn exc" style="width:18px;height:18px;font-size:11px;border:none" onclick="rmField('${f.k}')">×</button></th>`).join('')}</tr></thead><tbody>
     ${list.map(r=>{const e=r.extract||{};
-      return`<tr><td><b>${esc((r.authors||'').split(';')[0]||r.title.slice(0,30))} ${esc(r.year||'')}</b><div class="muted">${esc(r.title.slice(0,60))}</div></td>
-      ${fields.map(f=>`<td><textarea oninput="setCell('${r.id}','${f.k}',this.value)" style="min-height:36px;font-size:11.5px">${esc(e[f.k]||'')}</textarea></td>`).join('')}</tr>`;}).join('')}
+      return`<tr><td><b>${esc((r.authors||'').split(';')[0]||r.title.slice(0,30))} ${esc(r.year||'')}</b><div class="muted">${esc(r.title.slice(0,60))}</div><button class="btn gh sm" style="margin-top:8px" onclick="extractOne('${r.id}').then(()=>renderExtract()).catch(e=>toast(e.message,'err'))">Extract this</button>${r.extractMeta?`<div class="muted" style="font-size:11px;margin-top:6px">${esc(r.extractMeta.model||'Viveka')} · ${r.extractMeta.creditsUsed||0} credits · ${r.extractMeta.overallConfidence||0}% confidence</div>`:''}</td>
+      ${fields.map(f=>{const ev=(r.extractEvidence||{})[f.k]||{};return`<td><textarea oninput="setCell('${r.id}','${f.k}',this.value)" style="min-height:36px;font-size:11.5px">${esc(e[f.k]||'')}</textarea>${ev.quote?`<details style="margin-top:6px"><summary class="muted" style="cursor:pointer;font-size:11px">evidence ${ev.confidence?`· ${Number(ev.confidence).toFixed(0)}%`:''}</summary><div class="muted" style="font-size:11px;line-height:1.45;margin-top:4px">${esc(ev.quote)}</div></details>`:''}</td>`}).join('')}</tr>${((r.extractWarnings&&r.extractWarnings.length)||(r.extractEffectCandidates&&r.extractEffectCandidates.length))?`<tr><td></td><td colspan="${fields.length}"><div class="muted" style="font-size:11.5px">${r.extractWarnings&&r.extractWarnings.length?`<b>Warnings:</b> ${esc(r.extractWarnings.join('; '))}`:''}${r.extractEffectCandidates&&r.extractEffectCandidates.length?`<br><b>Effect candidates:</b> ${esc(r.extractEffectCandidates.map(x=>[x.outcome,x.value].filter(Boolean).join(': ')).join(' | '))}`:''}</div></td></tr>`:''}`;}).join('')}
     </tbody></table>`;
 }
 function setCell(id,k,v){const r=ST.refs.find(x=>x.id===id);if(r){r.extract=r.extract||{};r.extract[k]=v;save();}}

@@ -295,6 +295,20 @@ async function run() {
   r = await lead('POST','/api/projects/'+pid+'/ai/screen',{stage:'ta',refId:'r2'});
   ok('server-side screening uses configured project and requires provider key', r.status===503 && /not configured/i.test(r.body.error||''));
 
+  console.log('\n=== SERVER AI PHASE 3 EXTRACTION ===');
+  r = await lead('GET','/api/projects/'+pid);
+  version = r.body.project.version;
+  r = await lead('PUT','/api/projects/'+pid,{version, data:{project:{title:'mHealth HTN review',question:'Q',inc:'Adults',exc:'Animal studies'},agent:{advModel:'deepseek'},refs:[{id:'r1',title:'Trial A',abstract:'Randomized trial with 100 adults.',ft:{decision:'include',pdfText:'Methods: randomized controlled trial of 100 adults. Results: systolic blood pressure decreased by 5 mmHg compared with control.'}}]}});
+  ok('prepare included full-text study for extraction', r.status===200);
+  r = await outsider('POST','/api/projects/'+pid+'/ai/extract',{refId:'r1'});
+  ok('non-member blocked from server-side extraction', r.status===403);
+  r = await lead('POST','/api/projects/'+pid+'/ai/extract',{refId:'missing'});
+  ok('server-side extraction rejects missing study', r.status===404);
+  r = await lead('POST','/api/projects/'+pid+'/ai/extract',{refId:'r1'});
+  ok('server-side extraction requires configured provider key', r.status===503 && /not configured/i.test(r.body.error||''));
+  r = await lead('GET','/api/me');
+  ok('failed extraction does not deduct credits', r.status===200 && r.body.user.aiCredits===50);
+
   console.log('\n=== RATE LIMITING ===');
   const rlc = makeClient();
   let blocked=false;

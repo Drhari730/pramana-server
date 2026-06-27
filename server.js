@@ -17,6 +17,7 @@
      DELETE /api/projects/:id/members/:userId          remove a member (owner)
      POST /api/ai/generate     {prompt,maxTok,model}   server-side AI proxy
      POST /api/projects/:id/ai/screen {stage,refId}     server-side Viveka screening
+     POST /api/projects/:id/ai/extract {refId,fields}   server-side Viveka extraction
    Static: serves the front-end (index.html) from ./public
    ============================================================ */
 const path = require('path');
@@ -332,6 +333,142 @@ Abstract: ${safeText(ref.abstract || '(no abstract available)', 5000)}
 
 Return ONLY JSON:
 {"v":"include|exclude|maybe","conf":0-100,"reason":"<specific one-clause eligibility rationale>","pico":{"p":true/false,"i":true/false,"o":true/false}}`;
+}
+
+function extractionFields(data, requested) {
+  const defaults = [
+    { k: 'design', label: 'Study design' },
+    { k: 'country', label: 'Country / setting' },
+    { k: 'n', label: 'Sample size (N)' },
+    { k: 'population', label: 'Population' },
+    { k: 'intervention', label: 'Intervention' },
+    { k: 'comparator', label: 'Comparator' },
+    { k: 'followup', label: 'Follow-up' },
+    { k: 'outcome', label: 'Primary outcome' },
+    { k: 'effect', label: 'Effect estimate (with 95% CI)' }
+  ];
+  const projectFields = ((data || {}).project || {}).extractFields;
+  const fields = Array.isArray(requested) && requested.length
+    ? requested
+    : (Array.isArray(projectFields) && projectFields.length ? projectFields : defaults);
+  return fields
+    .map(f => ({ k: safeText(f.k || f.key || f.label || '', 60).replace(/[^a-zA-Z0-9_]/g, '_'), label: safeText(f.label || f.k || f.key || '', 140) }))
+    .filter(f => f.k && f.label)
+    .slice(0, 24);
+}
+
+function normalizePaperText(ref) {
+  const ft = (ref || {}).ft || {};
+  const text = ft.pdfText || ref.fullText || ref.abstract || '';
+  return String(text || '').replace(/\r/g, '\n').replace(/[ \t]+\n/g, '\n').replace(/\n{4,}/g, '\n\n').trim();
+}
+
+function sectionWindow(text, pattern, size, label) {
+  const m = pattern.exec(text);
+  if (!m) return null;
+  const start = Math.max(0, m.index - Math.floor(size * 0.18));
+  return { label, text: text.slice(start, start + size) };
+}
+
+function extractionChunks(text) {
+  const clean = String(text || '').trim();
+  if (!clean) return [];
+  const size = 8500;
+  const candidates = [
+    { label: 'front_matter', text: clean.slice(0, size) },
+    sectionWindow(clean, /\b(methods?|materials and methods|participants|eligibility|interventions?)\b/i, size, 'methods'),
+    sectionWindow(clean, /\b(results?|findings|outcomes?|primary outcome|secondary outcome)\b/i, size, 'results'),
+    sectionWindow(clean, /\b(table\s*1|baseline|characteristics|sample size|randomi[sz]ed|allocation)\b/i, size, 'tables_baseline'),
+    sectionWindow(clean, /\b(table\s*2|effect|mean difference|odds ratio|risk ratio|confidence interval|95%\s*ci|p\s*[<=>])\b/i, size, 'tables_effects')
+  ].filter(Boolean);
+  const seen = new Set();
+  const unique = [];
+  for (const c of candidates) {
+    const key = c.text.slice(0, 300).replace(/\s+/g, ' ');
+    if (seen.has(key) || c.text.length < 300) continue;
+    seen.add(key);
+    unique.push(c);
+  }
+  if (!unique.length) unique.push({ label: 'front_matter', text: clean.slice(0, size) });
+  return unique.slice(0, clean.length > size ? 5 : 1);
+}
+
+function buildExtractorChunkPrompt(data, ref, fields, chunk, index, total) {
+  const fieldList = fields.map(f => `${f.k}: ${f.label}`).join('\n');
+  return `You are Viveka Extractor, a strict systematic-review data extraction assistant.
+Extract only information explicitly supported by the study text chunk. Do not guess.
+For each requested field, return:
+- value: concise extracted value, or "NR" if not reported in this chunk
+- quote: the shortest exact supporting phrase/sentence from the chunk, or "" if NR
+- confidence: 0-100
+- status: found|not_reported|unclear
+
+Review protocol:
+${reviewContext((data || {}).project || {})}
+
+Study:
+Title: ${safeText(ref.title, 500)}
+Authors/year/journal: ${safeText(ref.authors || '', 220)} ${safeText(ref.year || '', 40)} ${safeText(ref.journal || '', 220)}
+
+Requested fields:
+${fieldList}
+
+Chunk ${index + 1} of ${total}: ${chunk.label}
+TEXT:
+${chunk.text}
+
+Return ONLY JSON:
+{"fields":{"field_key":{"value":"...","quote":"...","confidence":0-100,"status":"found|not_reported|unclear"}},"effect_candidates":[{"outcome":"...","group1":"...","group2":"...","value":"...","quote":"..."}],"warnings":["..."]}`;
+}
+
+function buildExtractorMergePrompt(data, ref, fields, chunkResults) {
+  const fieldList = fields.map(f => `${f.k}: ${f.label}`).join('\n');
+  return `You are Viveka Extractor's senior adjudicator. Merge the chunk-level extraction results into one final extraction table row.
+Rules:
+- Prefer values with direct quotes and higher confidence.
+- If chunks conflict, choose the best supported value and add a warning.
+- Keep values short enough for a spreadsheet cell.
+- Use "NR" only when not reported after reviewing all chunk results.
+- Keep a supporting quote for every non-NR value.
+- Flag values needed for meta-analysis if they are missing or ambiguous.
+
+Review protocol:
+${reviewContext((data || {}).project || {})}
+
+Study:
+Title: ${safeText(ref.title, 500)}
+
+Requested fields:
+${fieldList}
+
+Chunk-level JSON results:
+${JSON.stringify(chunkResults).slice(0, 26000)}
+
+Return ONLY JSON:
+{"fields":{"field_key":{"value":"...","quote":"...","confidence":0-100,"status":"found|not_reported|unclear"}},"effect_candidates":[{"outcome":"...","group1":"...","group2":"...","value":"...","quote":"..."}],"warnings":["..."],"overall_confidence":0-100}`;
+}
+
+function flatExtraction(fields, parsed) {
+  const out = {};
+  const evidence = {};
+  const src = parsed && parsed.fields && typeof parsed.fields === 'object' ? parsed.fields : {};
+  for (const f of fields) {
+    const cell = src[f.k] || {};
+    const value = typeof cell === 'string' ? cell : (cell.value || 'NR');
+    out[f.k] = safeText(value || 'NR', 900);
+    evidence[f.k] = {
+      quote: safeText(cell.quote || '', 1200),
+      confidence: Number(cell.confidence || 0),
+      status: safeText(cell.status || (value && value !== 'NR' ? 'found' : 'not_reported'), 40)
+    };
+  }
+  return {
+    values: out,
+    evidence,
+    effectCandidates: Array.isArray(parsed.effect_candidates) ? parsed.effect_candidates.slice(0, 10) : [],
+    warnings: Array.isArray(parsed.warnings) ? parsed.warnings.map(w => safeText(w, 260)).slice(0, 12) : [],
+    overallConfidence: Number(parsed.overall_confidence || 0)
+  };
 }
 async function projectDataForMember(projectId, userId) {
   const role = await memberRole(projectId, userId);
@@ -818,6 +955,75 @@ app.post('/api/projects/:id/ai/screen', requireAuth(async (req, res) => {
     });
   } catch (e) {
     const msg = e && e.message ? e.message : 'AI screening failed';
+    const status = e.status || (/not configured/i.test(msg) ? 503 : 502);
+    res.status(status).json({ error: msg, aiCredits: e.balance });
+  }
+}));
+
+app.post('/api/projects/:id/ai/extract', requireAuth(async (req, res) => {
+  const { refId, fields, model } = req.body || {};
+  if (!refId) return res.status(400).json({ error: 'refId required' });
+  const project = await projectDataForMember(req.params.id, req.user.id);
+  if (!project) return res.status(403).json({ error: 'Not a member' });
+  const data = project.data || {};
+  const refs = Array.isArray(data.refs) ? data.refs : [];
+  const ref = refs.find(r => r && r.id === refId);
+  if (!ref) return res.status(404).json({ error: 'Study not found in project' });
+
+  const extractFields = extractionFields(data, fields);
+  if (!extractFields.length) return res.status(400).json({ error: 'At least one extraction field is required' });
+  const paperText = normalizePaperText(ref);
+  if (!paperText) return res.status(400).json({ error: 'No full text or abstract available for extraction' });
+
+  const configured = configuredAIModels();
+  const agent = data.agent || {};
+  let selectedModel = model || agent.advModel || agent.model || configured[0] || 'gemini-flash';
+  if (!hasRealValue((aiModelMeta(selectedModel) || {}).key) && configured.length) selectedModel = configured[0];
+  const chunks = extractionChunks(paperText);
+  const creditCost = paperText.length > 12000 ? 12 : (paperText.length > 4000 ? 8 : 5);
+  const balance = await aiBalance(req.user.id);
+  if (balance < creditCost) {
+    return res.status(402).json({ error: `Not enough Viveka AI credits. You have ${balance}, need ${creditCost}. Manual extraction is still free.`, aiCredits: balance });
+  }
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0];
+  const rl = rateLimit('ai-extract:' + req.user.id + ':' + ip, 60, 60 * 60 * 1000);
+  if (!rl.ok) return res.status(429).json({ error: `AI extraction limit reached. Try again in ${Math.ceil(rl.retryAfter/60)} minute(s).` });
+
+  try {
+    const chunkResults = [];
+    for (let i = 0; i < chunks.length; i++) {
+      const prompt = buildExtractorChunkPrompt(data, ref, extractFields, chunks[i], i, chunks.length);
+      const raw = await serverLLM(prompt, 1400, selectedModel);
+      chunkResults.push(Object.assign({ _chunk: chunks[i].label }, parseAIJSON(raw)));
+    }
+    let finalParsed;
+    if (chunkResults.length > 1) {
+      const mergePrompt = buildExtractorMergePrompt(data, ref, extractFields, chunkResults);
+      finalParsed = parseAIJSON(await serverLLM(mergePrompt, 1800, selectedModel));
+    } else {
+      finalParsed = chunkResults[0] || { fields: {} };
+      if (finalParsed.overall_confidence == null) {
+        const vals = Object.values(finalParsed.fields || {}).map(x => Number((x || {}).confidence || 0)).filter(Boolean);
+        finalParsed.overall_confidence = vals.length ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
+      }
+    }
+    const result = flatExtraction(extractFields, finalParsed);
+    const aiCredits = await chargeAICredits(req.user.id, creditCost, 'extract:fulltext', selectedModel, req.params.id);
+    res.json({
+      ok: true,
+      server: true,
+      model: selectedModel,
+      aiCredits,
+      creditsUsed: creditCost,
+      chunksUsed: chunks.map(c => c.label),
+      extraction: result.values,
+      evidence: result.evidence,
+      effectCandidates: result.effectCandidates,
+      warnings: result.warnings,
+      overallConfidence: result.overallConfidence
+    });
+  } catch (e) {
+    const msg = e && e.message ? e.message : 'AI extraction failed';
     const status = e.status || (/not configured/i.test(msg) ? 503 : 502);
     res.status(status).json({ error: msg, aiCredits: e.balance });
   }
