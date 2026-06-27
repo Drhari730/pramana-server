@@ -2966,6 +2966,56 @@ Each value a short string. For "effect", give the headline result with CI if pre
 }
 function hasFullTextContent(r){const ft=r.ft||{};return !!(ft.pdfText||r.fullText||r.abstract);}
 function extractionRefs(){return ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe')&&r.ft&&r.ft.decision==='include'&&hasFullTextContent(r));}
+function heuristicExtractAll(){
+  const fields = getFields();
+  const list = extractionRefs().filter(r => hasFullTextContent(r));
+  if (!list.length) return toast('No included studies with full text to extract.', 'err');
+  toast('Running Smart Extraction (Heuristic) locally...', 'info');
+  list.forEach(r => {
+    r.extract = r.extract || {};
+    r.extractEvidence = r.extractEvidence || {};
+    r.extractMeta = { model: 'Smart Heuristic (Local)', creditsUsed: 0, overallConfidence: 100 };
+    const text = r.ft.pdfText || r.fullText || r.abstract || '';
+    if (!text) return;
+    const sentences = text.replace(/\n/g, ' ').split(/(?<=[.?!])\s+(?=[A-Z0-9])/);
+    fields.forEach(f => {
+      const fl = f.label.toLowerCase();
+      let matchVal = null, matchQuote = null;
+      if (fl.includes('sample') || fl.includes('size') || fl.match(/\bn\b/)) {
+        for (const s of sentences) {
+          const m = s.match(/\b(?:n|N|sample size)\s*(?:=|of|:)?\s*(\d{1,5})\b/) || s.match(/\b(?:total of)\s+(\d{1,5})\s+(?:patients|participants|subjects)\b/);
+          if (m && parseInt(m[1]) > 5) { matchVal = m[1]; matchQuote = s; break; }
+        }
+      } else if (fl.includes('age') || fl.includes('mean age')) {
+        for (const s of sentences) {
+          const m = s.match(/\b(?:mean)?\s*age\s*(?:of|was|is|=)?\s*(\d{1,2}(?:\.\d{1,2})?)\s*(?:years|yrs)?\b/i);
+          if (m) { matchVal = m[1]; matchQuote = s; break; }
+        }
+      } else if (fl.includes('female') || fl.includes('gender') || fl.includes('sex')) {
+         for (const s of sentences) {
+          const m = s.match(/\b(\d{1,3}(?:\.\d{1,2})?)\s*%\s*(?:female|male)\b/i) || s.match(/\b(\d{1,5})\s*(?:female|male)s?\b/i);
+          if (m) { matchVal = m[0]; matchQuote = s; break; }
+        }
+      } else {
+        const kws = fl.split(' ').filter(w => w.length > 3);
+        if(kws.length === 0) kws.push(fl);
+        for (const s of sentences) {
+          const sl = s.toLowerCase();
+          const hasKeyword = kws.some(kw => sl.includes(kw));
+          const hasNumber = /\d/.test(s);
+          if (hasKeyword && hasNumber && (sl.includes('p=') || sl.includes('p<') || sl.includes('%') || sl.includes('ci') || sl.includes('sd') || sl.includes('or='))) {
+            matchVal = '[\u26a1 Smart Match] Check quote'; matchQuote = s; break;
+          }
+        }
+      }
+      if (matchVal) { r.extract[f.k] = matchVal; r.extractEvidence[f.k] = { quote: matchQuote, confidence: 80 }; }
+    });
+  });
+  saveSoon();
+  renderExtract();
+  toast('Smart Extraction complete! Review highlighted quotes.', 'ok');
+}
+
 async function extractAll(){
   const list=extractionRefs();
   if(!list.length){toast('No included studies with full text available','err');return;}
@@ -3005,6 +3055,7 @@ function renderExtract(){
     <p>Server-side full-text extraction: Viveka reads the article in sections, extracts your fields, keeps evidence quotes, and flags missing or uncertain values. Every cell remains editable before analysis.</p></div>
   <div class="toolbar">
     <button class="btn flow sm" onclick="extractAll()">⊹ Extract all with Viveka</button>
+    <button class="btn sm" style="background:#15803d;color:#fff;border-color:#14532d;margin-left:8px" onclick="heuristicExtractAll()">⚡ Smart Extract (Free)</button>
     <div class="pbar" style="width:160px"><i id="ext-bar"></i></div>
     <button class="btn gh sm" id="ext-stop-btn" onclick="cancelExtractJob()" disabled>Stop server job</button>
     <span class="muted" id="ext-job-status" style="font-size:12px">Server jobs keep running outside the browser tab.</span>
@@ -3014,7 +3065,7 @@ function renderExtract(){
     <button class="btn gh sm" onclick="exportExtractCSV()">⬇ Export CSV</button>
   </div>
   ${noText?`<div class="banner" style="margin-bottom:14px;background:var(--maybe-w);border-color:var(--maybe)"><span class="bi" style="color:var(--maybe)">⚠</span><div><b>${noText} included ${noText===1?'study has':'studies have'} no full text attached.</b> Only ${withText.length} ${withText.length===1?'study':'studies'} with full text (PDF, pasted text, or fetched text) will be extracted. Go to Full Text phase to attach or fetch missing articles.</div></div>`:''}
-  <div class="banner info" style="margin-bottom:14px"><span class="bi">i</span><div>Manual editing is free. On the hosted app, Viveka Extractor uses server-side AI credits because it performs deeper full-text reasoning and validation.</div></div>
+  <div class="banner info" style="margin-bottom:14px"><span class="bi">i</span><div>Manual editing is free. <b>\u26a1 Smart Extract</b> uses local browser heuristics for fast baseline matching. For deep contextual extraction and numeric table parsing, use <b>\u229e Viveka AI</b> (uses credits).</div></div>
   <div class="card" style="overflow-x:auto"><div id="ext-table"></div></div>`;
   renderExtTable();
 }
