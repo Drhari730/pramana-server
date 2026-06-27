@@ -3279,8 +3279,8 @@ function renderSynth(){
       '<select class="inp" style="width:auto" id="ma-measure" onchange="ST.project.measure=this.value;save()">'+
         [['md','Mean difference (MD)'],['smd','Std. mean difference (SMD)'],['or','Odds ratio (OR)'],['rr','Risk ratio (RR)'],['hr','Hazard ratio (HR)']].map(a=>'<option value="'+a[0]+'" '+(ST.project.measure===a[0]?'selected':'')+'>'+a[1]+'</option>').join('')+'</select>'+
       '<select class="inp" style="width:auto" id="ma-model"><option value="random">Random effects</option><option value="fixed">Fixed effect</option></select>'+
-      '<label class="row" style="gap:6px"><input type="checkbox" id="ma-ci" '+(ST.project.showCI?'checked':'')+' onchange="ST.project.showCI=this.checked;save()"> Show 95% CI on plot</label>'+
-      '<label class="row" style="gap:6px"><input type="checkbox" id="ma-sub"> Subgroups</label>'+
+      '<label class="row" style="gap:6px"><input type="checkbox" id="ma-ci" '+(ST.project.showCI?'checked':'')+' onchange="ST.project.showCI=this.checked;save();ASRMA.runMeta()"> Show 95% CI on plot</label>'+
+      '<label class="row" style="gap:6px"><input type="checkbox" id="ma-sub" '+(ST.project.useSub?'checked':'')+' onchange="ST.project.useSub=this.checked;save();ASRMA.runMeta()"> Subgroups</label>'+
       '<button class="btn gh sm" onclick="autofillEffects()">Auto-fill from included ('+inc.length+')</button>'+
       '<span class="spacer"></span><button class="btn flow sm" onclick="ASRMA.runMeta()">\u27ff Pool &amp; plot</button>'+
     '</div>'+
@@ -3425,8 +3425,8 @@ function tQuant(p,df){ // crude two-step approx of Student-t quantile
 function runMeta(){
   const measure=document.getElementById('ma-measure').value;
   const model=document.getElementById('ma-model').value;
-  const useSub=document.getElementById('ma-sub')&&document.getElementById('ma-sub').checked;
-  const showCI=document.getElementById('ma-ci')?document.getElementById('ma-ci').checked:true;
+  const useSub=document.getElementById('ma-sub')?document.getElementById('ma-sub').checked:!!ST.project.useSub;
+  const showCI=document.getElementById('ma-ci')?document.getElementById('ma-ci').checked:!!ST.project.showCI;
   const log=['or','rr','hr'].includes(measure);
   const data=ST.effects.filter(e=>isFinite(e.es)&&isFinite(e.se)&&e.se>0)
     .map(e=>({label:e.label,y:e.es,se:e.se,w:1/(e.se*e.se),n:e.n,sub:(e.sub||'').trim()}));
@@ -3457,7 +3457,7 @@ function runMeta(){
     'Q='+overall.Q.toFixed(2)+', df='+overall.df+'. '+(overall.I2>75?'Substantial heterogeneity \u2014 interpret cautiously; explore subgroups / sensitivity.':overall.I2>50?'Moderate heterogeneity.':'Low heterogeneity \u2014 pooling is reasonable.')+
     (log?' Estimates shown on the ratio scale; analysis on the log scale.':'')+
     (subTest?' Subgroup difference: Q\u1d47='+subTest.Qb.toFixed(2)+', df='+subTest.dfb+', p='+(subTest.p<0.001?'<0.001':subTest.p.toFixed(3))+'.':'')+'</div></div>'+
-  '<div class="card"><div class="card-h">Forest plot</div><div style="overflow-x:auto">'+forestSVG(data,overall,log,measure,showCI,subResults)+'</div>'+
+  '<div class="card"><div class="card-h">Forest plot</div><div style="overflow-x:auto">'+forestSVG(data,overall,log,measure,showCI,subResults,subTest)+'</div>'+
     '<div class="row" style="margin-top:10px;gap:8px">'+
       '<button class="btn gh sm" onclick="downloadSVG(\'forest-svg\',\'forest_plot.svg\')">\u2b07 SVG</button>'+
       '<button class="btn gh sm" onclick="downloadSVGasPNG(\'forest-svg\',\'forest_plot.png\')">\u2b07 PNG Image</button>'+
@@ -3479,13 +3479,13 @@ function chiSqCdf(x,k){if(x<=0)return 0;// regularized lower incomplete gamma vi
 function lgamma(z){const c=[76.18009172947146,-86.50532032941677,24.01409824083091,-1.231739572450155,0.1208650973866179e-2,-0.5395239384953e-5];
   let x=z,y=z,tmp=x+5.5;tmp-=(x+0.5)*Math.log(tmp);let ser=1.000000000190015;for(let j=0;j<6;j++){y++;ser+=c[j]/y;}
   return -tmp+Math.log(2.5066282746310005*ser/x);}
-function forestSVG(data,ov,log,measure,showCI,subs){
+function forestSVG(data,ov,log,measure,showCI,subs,subTest){
   const rows=[];let groups;
   if(subs&&subs.length>1){groups=subs.map(s=>({name:s.name,res:s.res,items:s.rows}));}
   else groups=[{name:null,res:ov,items:data}];
   const nLines=data.length+groups.length*(subs&&subs.length>1?2:1)+1;
   const W=760,rowH=24,padL=200,padR=130,top=48;const plotW=W-padL-padR;
-  const H=top+nLines*rowH+58;
+  const H=top+nLines*rowH+(subTest?78:58);
   const all=data.flatMap(d=>[d.lo,d.hi]).concat([ov.lo,ov.hi,ov.piLo,ov.piHi]);
   let mn=Math.min.apply(null,all),mx=Math.max.apply(null,all);const pad=(mx-mn)*.12||1;mn-=pad;mx+=pad;
   const X=v=>padL+(Math.max(mn,Math.min(mx,v))-mn)/(mx-mn)*plotW;
@@ -3518,9 +3518,10 @@ function forestSVG(data,ov,log,measure,showCI,subs){
   return '<svg id="forest-svg" width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'" xmlns="http://www.w3.org/2000/svg" style="background:#fff;max-width:100%">'+
     '<line x1="'+X(nullV)+'" y1="'+(top-6)+'" x2="'+X(nullV)+'" y2="'+(y-rowH+18)+'" stroke="var(--line2)" stroke-dasharray="4 3"/>'+
     body+
-    '<text x="'+X(nullV)+'" y="'+(H-20)+'" font-size="10" fill="var(--t3)" text-anchor="middle">'+(log?'1':'0')+'</text>'+
-    '<text x="'+padL+'" y="'+(H-5)+'" font-size="9.5" fill="var(--t3)">\u2190 favours '+(log?'intervention':'treatment')+'</text>'+
-    '<text x="'+(W-padR)+'" y="'+(H-5)+'" font-size="9.5" fill="var(--t3)" text-anchor="end">favours '+(log?'control':'control')+' \u2192</text>'+
+    '<text x="'+X(nullV)+'" y="'+(H-(subTest?40:20))+'" font-size="10" fill="var(--t3)" text-anchor="middle">'+(log?'1':'0')+'</text>'+
+    '<text x="'+padL+'" y="'+(H-(subTest?25:5))+'" font-size="9.5" fill="var(--t3)">\u2190 favours '+(log?'intervention':'treatment')+'</text>'+
+    '<text x="'+(W-padR)+'" y="'+(H-(subTest?25:5))+'" font-size="9.5" fill="var(--t3)" text-anchor="end">favours '+(log?'control':'control')+' \u2192</text>'+
+    (subTest?'<text x="14" y="'+(H-8)+'" font-size="10.5" font-weight="700" fill="var(--ink)">Test for subgroup differences: Q = '+subTest.Qb.toFixed(2)+', df = '+subTest.dfb+', p = '+(subTest.p<0.001?'<0.001':subTest.p.toFixed(3))+'.</text>':'')+
   '</svg>';
 }
 function funnelSVG(data,pooled){
