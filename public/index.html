@@ -3221,7 +3221,7 @@ function renderQuality(){
     '<span class="pill" style="background:var(--exc-w);color:#b91c1c">\u2212 high risk</span>'+
     '<span class="spacer"></span>'+
     '<button class="btn gh sm" onclick="exportRobCSV()">\u2b07 Export Excel (.csv)</button>'+
-    '<button class="btn sm" style="margin-left:8px" onclick="ASRMA.go(\'synth\')">Meta-analysis \u2192</button></div></div>';
+    '<button class="btn sm" style="margin-left:8px" onclick="ASRMA.go(\'synth\')">Meta-analysis \u2192</button></div></div>');
 }
 function cycleRob(id,dom){const r=ST.refs.find(x=>x.id===id);if(!r)return;
   const tool=getTool();const realDom=ROB_TOOLS[tool].find(d=>d.replace(/'/g,'')===dom)||dom;
