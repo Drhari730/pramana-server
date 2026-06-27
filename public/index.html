@@ -587,9 +587,9 @@ const PHASES=[
   {id:'import',   name:'Import studies',  ico:'⇲', count:()=>ST.refs.length},
   {id:'dedup',    name:'De-duplicate',    ico:'⧉', count:()=>ST.refs.filter(r=>r.dup).length||'—'},
   {id:'screen',   name:'Title / Abstract',ico:'⊜', count:()=>ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.final).length},
-  {id:'fulltext', name:'Full text',       ico:'▤', count:()=>ST.refs.filter(r=>r.ta&&r.ta.final==='include'&&!r.dup).length},
-  {id:'extract',  name:'Extract data',    ico:'⊞', count:()=>ST.refs.filter(r=>r.ft&&r.ft.decision==='include').length},
-  {id:'quality',  name:'Risk of bias',    ico:'⚖', count:()=>ST.refs.filter(r=>r.quality&&r.quality.overall).length||'—'},
+  {id:'fulltext', name:'Full text',       ico:'▤', count:()=>ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe')).length},
+  {id:'extract',  name:'Extract data',    ico:'⊞', count:()=>ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe')&&r.ft&&r.ft.decision==='include').length},
+  {id:'quality',  name:'Risk of bias',    ico:'⚖', count:()=>ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe')&&r.ft&&r.ft.decision==='include'&&r.quality&&r.quality.overall).length||'—'},
   {id:'synth',    name:'Meta-analysis',   ico:'⟿', count:()=>ST.effects.length||'—'},
   {id:'grade',    name:'GRADE',           ico:'◆', count:()=>(ST.grade&&ST.grade.length)||'—'},
   {id:'report',   name:'PRISMA & export', ico:'⎙', count:()=>'—'}
@@ -2965,7 +2965,7 @@ Each value a short string. For "effect", give the headline result with CI if pre
   r.extract=res;save();return r;
 }
 function hasFullTextContent(r){const ft=r.ft||{};return !!(ft.pdfText||r.fullText||r.abstract);}
-function extractionRefs(){return ST.refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include'&&hasFullTextContent(r));}
+function extractionRefs(){return ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe')&&r.ft&&r.ft.decision==='include'&&hasFullTextContent(r));}
 async function extractAll(){
   const list=extractionRefs();
   if(!list.length){toast('No included studies with full text available','err');return;}
@@ -2996,7 +2996,7 @@ async function resetExtraction(){
 }
 function renderExtract(){
   const fields=getFields();
-  const allInc=ST.refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include');
+  const allInc=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe')&&r.ft&&r.ft.decision==='include');
   const withText=allInc.filter(r=>hasFullTextContent(r));
   const noText=allInc.length-withText.length;
   document.getElementById('pane-extract').innerHTML=`

@@ -1225,7 +1225,7 @@ async function runExtractAllJob(job) {
   const data = project.data || {};
   const refs = Array.isArray(data.refs) ? data.refs : [];
   const wanted = Array.isArray(payload.refIds) && payload.refIds.length ? new Set(payload.refIds) : null;
-  const list = refs.filter(r => r && !r.dup && (!wanted || wanted.has(r.id)) && r.ft && r.ft.decision === 'include' && (r.ft.pdfText || r.fullText || r.abstract));
+  const list = refs.filter(r => r && !r.dup && (!wanted || wanted.has(r.id)) && r.ta && (r.ta.final === 'include' || r.ta.final === 'maybe') && r.ft && r.ft.decision === 'include' && (r.ft.pdfText || r.fullText || r.abstract));
   const fields = payload.fields || extractionFields(data);
   const model = payload.model;
   let ok = 0, failed = 0;
