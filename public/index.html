@@ -4587,11 +4587,21 @@ function syncAICredits(payload){
 async function adminUsageModal(){
   try{
     const r=await BK.api('GET','/api/admin/usage');
+    const totalUsers=(r.users||[]).length;
+    const totalUsed=(r.users||[]).reduce((s,u)=>s+Number(u.credits_used||0),0);
+    const totalCalls=(r.users||[]).reduce((s,u)=>s+Number(u.ai_calls||0),0);
+    const totalBalance=(r.users||[]).reduce((s,u)=>s+Number(u.ai_credits||0),0);
     const rows=(r.users||[]).map(u=>`<tr><td><b>${esc(u.name||'')}</b><br><span class="muted">${esc(u.email||'')}</span></td><td>${Number(u.ai_credits||0)}</td><td>${Number(u.credits_used||0)}</td><td>${Number(u.ai_calls||0)}</td><td><button class="btn gh sm" onclick="adminAddCredits('${esc(u.id)}')">Add</button></td></tr>`).join('');
     const recent=(r.recent||[]).slice(0,30).map(x=>`<tr><td>${esc(x.email||'')}</td><td>${esc(x.feature||'')}</td><td>${esc(x.model||'')}</td><td>${Number(x.credits||0)}</td><td class="muted">${esc(new Date(x.created_at).toLocaleString())}</td></tr>`).join('');
-    modal(`<div class="modal-h">Admin - AI Credits<button class="x" onclick="closeModal()">x</button></div>
+    modal(`<div class="modal-h">Admin Portal - Users, AI Credits & Usage Logs<button class="x" onclick="closeModal()">x</button></div>
       <div class="modal-b" style="max-width:920px">
         <div class="banner info" style="margin-bottom:14px"><span class="bi">i</span><div>Manual screening, imports, PRISMA, and meta-analysis are free. Only Viveka Cloud AI uses credits. New accounts start with 50 credits.</div></div>
+        <div class="welcome-stats" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:16px">
+          <div class="welcome-stat"><b>${totalUsers}</b><div class="muted">registered users</div></div>
+          <div class="welcome-stat"><b>${totalBalance}</b><div class="muted">credits remaining</div></div>
+          <div class="welcome-stat"><b>${totalUsed}</b><div class="muted">AI credits used</div></div>
+          <div class="welcome-stat"><b>${totalCalls}</b><div class="muted">AI calls logged</div></div>
+        </div>
         <h3 style="margin:0 0 10px">Users and balances</h3>
         <table class="tbl"><thead><tr><th>User</th><th>Balance</th><th>AI credits used</th><th>AI calls</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="5">No users found.</td></tr>'}</tbody></table>
         <h3 style="margin:18px 0 10px">Recent AI usage</h3>
@@ -4618,7 +4628,7 @@ function updateUserChip(){
   const credits=BK.user.aiCredits!=null?Number(BK.user.aiCredits):0;
   chip.innerHTML=`<div style="display:flex;align-items:center;gap:8px">
     <div class="pill s" title="Manual screening, import, PRISMA, and meta-analysis are free. Only Viveka Cloud AI uses credits.">Viveka Credits: ${credits}</div>
-    ${BK.user.isAdmin?'<button class="hbtn" onclick="adminUsageModal()" title="Admin usage and AI credits">Admin</button>':''}
+    ${BK.user.isAdmin?'<button class="hbtn" onclick="adminUsageModal()" title="Admin portal: users, AI credits, and usage logs">Admin Portal</button>':''}
     <div style="width:28px;height:28px;border-radius:50%;background:var(--syn);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;cursor:pointer" title="${esc(BK.user.email)}\nClick to log out" onclick="doLogout()">${esc(initials)}</div>
   </div>`;
 }
@@ -4862,12 +4872,24 @@ renderHomeServer=function(){
         <div class="welcome-stat"><b id="dash-included">-</b><div class="muted">full-text included</div></div>
       </div>
     </div>
+    ${BK.user&&BK.user.isAdmin?`<div class="welcome-card" style="background:linear-gradient(135deg,#fff,#eefafa);border-color:#b8dedf">
+      <div class="row" style="align-items:flex-start">
+        <div>
+          <div class="muted" style="text-transform:uppercase;letter-spacing:.08em;font-size:11px;font-weight:800;color:var(--flow)">Admin Portal</div>
+          <h2 style="margin-top:4px">Users, AI credits, and usage logs</h2>
+          <p class="lead" style="margin:0;max-width:720px">Open this to see registered users, remaining Viveka credits, AI-credit usage patterns, recent AI logs, and to manually add testing credits.</p>
+        </div>
+        <span class="spacer"></span>
+        <button class="btn" onclick="adminUsageModal()">Open Admin Portal</button>
+      </div>
+    </div>`:''}
     <div class="home-hero">
       <div><h1>Your reviews</h1>
         <p class="lead">Reviews are saved to your account and shared live with everyone you invite. Create one, or open a shared review below.</p></div>
       <div class="spacer"></div>
       <div class="row" style="align-items:center">
         <span class="muted">${esc((BK.user&&(BK.user.name||BK.user.email))||'')}</span>
+        ${BK.user&&BK.user.isAdmin?'<button class="btn gh" onclick="adminUsageModal()">Admin Portal</button>':''}
         <button class="btn" onclick="newProject()">+ New review</button>
         <button class="btn gh" onclick="doLogout()">Log out</button>
       </div>
