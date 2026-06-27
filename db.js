@@ -95,6 +95,20 @@ CREATE TABLE IF NOT EXISTS ai_usage (
 CREATE INDEX IF NOT EXISTS idx_ai_usage_user ON ai_usage(user_id);
 CREATE INDEX IF NOT EXISTS idx_ai_usage_project ON ai_usage(project_id);
 
+CREATE TABLE IF NOT EXISTS files (
+  id          TEXT PRIMARY KEY,
+  project_id  TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  ref_id      TEXT,
+  user_id     TEXT REFERENCES users(id) ON DELETE SET NULL,
+  filename    TEXT NOT NULL,
+  mimetype    TEXT NOT NULL,
+  size        INTEGER NOT NULL,
+  data        BYTEA NOT NULL,
+  created_at  TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_files_project ON files(project_id);
+CREATE INDEX IF NOT EXISTS idx_files_ref ON files(project_id, ref_id);
+
 CREATE TABLE IF NOT EXISTS jobs (
   id               TEXT PRIMARY KEY,
   project_id       TEXT REFERENCES projects(id) ON DELETE CASCADE,

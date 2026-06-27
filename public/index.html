@@ -1600,7 +1600,7 @@ function setStageFinalObj(r,stage,val){
   if(stage==='ft'){
     if(!val){
       const old=r.ft||{},keep={};
-      ['oa','pdfText','pdfName','fulltextUrl','source','doi','fetchedAt'].forEach(k=>{if(old[k]!=null)keep[k]=old[k];});
+      ['oa','pdfText','pdfName','fileId','fileMime','fileSize','fulltextUrl','source','doi','fetchedAt','serverExtractedAt','serverExtractedBy','pages'].forEach(k=>{if(old[k]!=null)keep[k]=old[k];});
       r.ft=Object.keys(keep).length?keep:null;
     }else r.ft=Object.assign({},r.ft||{},val);
   }else r.ta=val;
@@ -2658,6 +2658,7 @@ function renderFulltextList(){
       <div class="st-meta"><span>${esc(r.year||'')}</span><span>${esc(r.journal||'')}</span>
         ${ft.oa?'<span style="color:var(--inc);font-weight:700">OA</span>':''}
         ${ft.fulltextUrl?`<a href="${esc(ft.fulltextUrl)}" target="_blank">full text</a>`:r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi</a>`:''}
+        ${ft.fileId?`<span style="color:var(--flow);font-weight:700">PDF attached</span>`:''}
         ${ft.pdfText?`<span style="color:var(--flow)">text attached (${(ft.pdfText.length/1000).toFixed(0)}k chars)</span>`:'<span style="color:var(--maybe)">no full text yet</span>'}
         <span style="color:var(--t3)">estimated human time: ~${fmtMinutes(ftEstimateMinutes(r))}</span>
         ${ft.ms?`<span style="color:var(--t3)">Viveka time: ${fmtDuration(ft.ms)}</span>`:''}</div>
@@ -2667,6 +2668,7 @@ function renderFulltextList(){
           <span class="muted" style="flex:1">${esc(ft.reason||'')}</span>`:'<span class="dchip pend">not assessed</span><span class="spacer"></span>'}
         <button class="btn gh sm" onclick="ASRMA.fetchFullText('${r.id}').then(()=>{renderFulltextList()})" title="Fetch open-access text online">Fetch</button>
         <button class="btn gh sm" onclick="attachFullText('${r.id}')" title="Upload a PDF or .txt">Attach</button>
+        ${ft.fileId?`<button class="btn flow sm" onclick="openPdfViewer('${r.id}')" title="Read the attached PDF beside this screening record">Open PDF</button>`:''}
         <button class="btn gh sm" onclick="pasteFullText('${r.id}')" title="Paste text">Paste</button>
         <button class="btn flow sm" onclick="ftScreen('${r.id}','cloud')">Viveka Cloud</button>
         <button class="btn gh sm" onclick="ftScreen('${r.id}','local').then(()=>{renderFulltextList();renderFTStats();})">Viveka Local</button>
@@ -2693,6 +2695,7 @@ function renderFulltextList(){
       <div class="st-meta"><span>${esc(r.year||'')}</span><span>${esc(r.journal||'')}</span>
         ${ft.oa?'<span style="color:var(--inc);font-weight:700">OA</span>':''}
         ${ft.fulltextUrl?`<a href="${esc(ft.fulltextUrl)}" target="_blank">full text</a>`:r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi</a>`:''}
+        ${ft.fileId?`<span style="color:var(--flow);font-weight:700">PDF attached</span>`:''}
         ${ft.pdfText?`<span style="color:var(--flow)">text attached (${(ft.pdfText.length/1000).toFixed(0)}k chars)</span>`:'<span style="color:var(--maybe)">no full text yet</span>'}
         <span style="color:var(--t3)">estimated human time: ~${fmtMinutes(ftEstimateMinutes(r))}</span>
         ${ft.ms?`<span style="color:var(--t3)">Viveka time: ${fmtDuration(ft.ms)}</span>`:''}</div>
@@ -2702,6 +2705,7 @@ function renderFulltextList(){
           <span class="muted" style="flex:1">${esc(ft.reason||'')}</span>`:'<span class="dchip pend">not assessed</span><span class="spacer"></span>'}
         <button class="btn gh sm" onclick="ASRMA.fetchFullText('${r.id}').then(()=>{renderFulltextList()})" title="Fetch open-access text online">Fetch</button>
         <button class="btn gh sm" onclick="attachFullText('${r.id}')" title="Upload a PDF or .txt">Attach</button>
+        ${ft.fileId?`<button class="btn flow sm" onclick="openPdfViewer('${r.id}')" title="Read the attached PDF beside this screening record">Open PDF</button>`:''}
         <button class="btn gh sm" onclick="pasteFullText('${r.id}')" title="Paste text">Paste</button>
         <button class="btn flow sm" onclick="ftScreen('${r.id}','cloud')">Viveka Cloud</button>
         <button class="btn gh sm" onclick="ftScreen('${r.id}','local').then(()=>{renderFulltextList();renderFTStats();})">Viveka Local</button>
@@ -2751,7 +2755,7 @@ function resetFullTextScreening(){
   list.forEach(r=>{
     if(!r.ft)return;
     const keep={};
-    ['oa','pdfText','pdfName','fulltextUrl','source','doi','fetchedAt'].forEach(k=>{if(r.ft[k]!=null)keep[k]=r.ft[k];});
+    ['oa','pdfText','pdfName','fileId','fileMime','fileSize','fulltextUrl','source','doi','fetchedAt','serverExtractedAt','serverExtractedBy','pages'].forEach(k=>{if(r.ft[k]!=null)keep[k]=r.ft[k];});
     r.ft=keep;
     delete r._ftConflict;
     if(r.reviews)delete r.reviews.ft;
@@ -4089,6 +4093,7 @@ function attachFullText(id){
         if(out.version)BK.version=out.version;
         renderFulltext();renderSpine();setSyncState('saved');
         toast('Server extracted '+(out.chars||0).toLocaleString()+' chars from '+f.name,'ok');
+        if(r.ft.fileId)openPdfViewer(id);
       }else{
         let text='';
         if(/\.pdf$/i.test(f.name)){text=await extractPDFText(f);}
@@ -4113,7 +4118,46 @@ function pasteFullText(id){
 function savePastedText(id){const r=refById(id);if(!r)return;r.ft=r.ft||{};
   r.ft.pdfText=document.getElementById('ft-paste').value.trim();r.ft.pdfName='pasted text';r.ft.retrieved=true;
   save();closeModal();renderFulltext();toast('Text saved ('+r.ft.pdfText.length.toLocaleString()+' chars)','ok');}
+function pdfFileUrl(r){
+  if(!(window.BK&&BK.isServer&&BK.isServer()&&ST.id&&r&&r.ft&&r.ft.fileId))return '';
+  return '/api/projects/'+encodeURIComponent(ST.id)+'/files/'+encodeURIComponent(r.ft.fileId);
+}
+function closePdfViewer(){
+  const p=document.getElementById('pdf-viewer-panel');
+  if(p)p.remove();
+}
+function pdfViewerDecision(id,dec){
+  ftDecide(id,dec);
+  const badge=document.getElementById('pdf-viewer-decision');
+  if(badge)badge.textContent=dec;
+}
+function openPdfViewer(id){
+  const r=refById(id);
+  const url=pdfFileUrl(r);
+  if(!url){toast('No attached PDF is available for this study yet','err');return;}
+  closePdfViewer();
+  const panel=document.createElement('div');
+  panel.id='pdf-viewer-panel';
+  panel.style.cssText='position:fixed;inset:0;z-index:9999;background:rgba(15,23,42,.38);display:flex;justify-content:flex-end;';
+  panel.innerHTML=`<div style="width:min(980px,88vw);height:100%;background:#0f172a;box-shadow:-24px 0 60px rgba(15,23,42,.35);display:flex;flex-direction:column">
+    <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;background:#111827;color:white;border-bottom:1px solid rgba(255,255,255,.12)">
+      <div style="font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:52vw">${esc((r.ft&&r.ft.pdfName)||r.title||'Attached PDF')}</div>
+      <span id="pdf-viewer-decision" style="border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:4px 9px;color:#c7d2fe;font-size:12px">${esc((r.ft&&r.ft.decision)||'not assessed')}</span>
+      <span style="flex:1"></span>
+      <button class="btn gh sm" onclick="ftScreen('${id}','cloud').then(()=>{renderFulltextList();renderFTStats();})">Viveka Cloud</button>
+      <button class="btn gh sm" onclick="ftScreen('${id}','local').then(()=>{renderFulltextList();renderFTStats();})">Viveka Local</button>
+      <button class="btn flow sm" onclick="pdfViewerDecision('${id}','include')">Include</button>
+      <button class="btn danger gh sm" onclick="pdfViewerDecision('${id}','exclude')">Exclude</button>
+      <a class="btn gh sm" href="${url}" target="_blank" rel="noopener">New tab</a>
+      <button class="btn gh sm" onclick="closePdfViewer()">Close</button>
+    </div>
+    <iframe src="${url}#toolbar=1&navpanes=0" title="Attached PDF" style="border:0;flex:1;width:100%;background:#1f2937"></iframe>
+  </div>`;
+  panel.addEventListener('click',e=>{if(e.target===panel)closePdfViewer();});
+  document.body.appendChild(panel);
+}
 window.attachFullText=attachFullText;window.pasteFullText=pasteFullText;window.savePastedText=savePastedText;window.extractPDFText=extractPDFText;
+window.openPdfViewer=openPdfViewer;window.closePdfViewer=closePdfViewer;window.pdfViewerDecision=pdfViewerDecision;
 
 /* ===================== TEAM BATCHES (file-based collaboration, no server) =====================
    Split studies into reviewer batches -> export a small file per reviewer ->

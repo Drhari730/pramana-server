@@ -1118,6 +1118,19 @@ async function extractUploadedText(file) {
   err.status = 415;
   throw err;
 }
+function isPDFUpload(file) {
+  const name = String((file && file.originalname) || '').toLowerCase();
+  const mime = String((file && file.mimetype) || '').toLowerCase();
+  return mime.includes('pdf') || /\.pdf$/i.test(name);
+}
+async function storeProjectFile({ projectId, refId, userId, file }) {
+  const id = uid('file_');
+  await db.q(
+    'INSERT INTO files (id,project_id,ref_id,user_id,filename,mimetype,size,data) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+    [id, projectId, refId, userId, file.originalname || 'uploaded file', file.mimetype || 'application/octet-stream', file.size || file.buffer.length, file.buffer]
+  );
+  return id;
+}
 app.post('/api/projects/:id/refs/:refId/fulltext/upload',
   requireAuthMiddleware,
   upload.single('file'),
@@ -1132,9 +1145,13 @@ app.post('/api/projects/:id/refs/:refId/fulltext/upload',
       const ref = refs.find(r => r && r.id === req.params.refId);
       if (!ref) return res.status(404).json({ error: 'Study not found in project' });
       const extracted = await extractUploadedText(req.file);
+      const fileId = isPDFUpload(req.file) ? await storeProjectFile({ projectId: req.params.id, refId: req.params.refId, userId: req.user.id, file: req.file }) : null;
       ref.ft = Object.assign({}, ref.ft || {}, {
         pdfText: extracted.text.slice(0, 350000),
         pdfName: req.file.originalname || 'uploaded file',
+        fileId: fileId || (ref.ft && ref.ft.fileId) || null,
+        fileMime: req.file.mimetype || '',
+        fileSize: req.file.size || req.file.buffer.length,
         retrieved: true,
         source: extracted.method,
         serverExtractedAt: new Date().toISOString(),
@@ -1148,6 +1165,20 @@ app.post('/api/projects/:id/refs/:refId/fulltext/upload',
     }
   }
 );
+app.get('/api/projects/:id/files/:fileId', requireAuth(async (req, res) => {
+  const role = await memberRole(req.params.id, req.user.id);
+  if (!role) return res.status(403).send('Not a member');
+  const rows = await db.q('SELECT filename,mimetype,size,data FROM files WHERE id=$1 AND project_id=$2', [req.params.fileId, req.params.id]);
+  const file = rows[0];
+  if (!file) return res.status(404).send('File not found');
+  const name = String(file.filename || 'paper.pdf').replace(/[\r\n"]/g, '');
+  const mime = file.mimetype || 'application/pdf';
+  res.setHeader('Content-Type', mime);
+  res.setHeader('Content-Length', file.size || (file.data ? file.data.length : 0));
+  res.setHeader('Content-Disposition', `inline; filename="${name}"`);
+  res.setHeader('Cache-Control', 'private, max-age=300');
+  res.end(file.data);
+}));
 
 /* ---------------- SERVER JOBS ---------------- */
 const activeJobs = new Set();
