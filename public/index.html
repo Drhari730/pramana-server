@@ -1618,12 +1618,8 @@ function visibleStageDecision(r,stage){
   return own||final||null;
 }
 function requireDecisionReason(stage,r,dec){
-  const wf=ensureReviewWorkflow()[stage];
   const existing=(myStageReview(r,stage)||stageFinalObj(r,stage)||{}).comment||'';
-  if(dec!=='exclude'||!wf.requireExcludeReason)return existing;
-  const txt=prompt('Reason/comment is required for exclusion:',existing||'');
-  if(!txt||!txt.trim()){toast('Exclusion reason is required','err');return null;}
-  return txt.trim();
+  return existing;
 }
 function setReviewerStageDecision(r,stage,dec,comment,prev){
   const info=reviewerInfo();
@@ -2068,14 +2064,17 @@ function engSig(eng){return (eng.trainedAt||'')+':'+eng.vocab.length;}
 function vecFor(r,eng){const sig=engSig(eng);const c=_vecCache.get(r.id);
   if(c&&c.sig===sig)return c.v;
   const v=tfidf(ltok(docText(r)),eng);_vecCache.set(r.id,{sig,v});return v;}
-function scoreAllLocal(vmap){
+function scoreAllLocal(vmap,opts){
   const eng=ST.engine;if(!eng)return;
+  opts=opts||{};
   const started=Date.now();let scored=0;
   const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
   const maybeBand=ST.settings.localMaybeBand!=null?ST.settings.localMaybeBand:0.08;
+  const scope=titleAbstractScopeRefs();
   titleAbstractScopeRefs().forEach(r=>{
     const final=stageFinalObj(r,'ta');
     if(myStageReview(r,'ta')||(final&&['human','consensus','arbitrator','conflict'].includes(final.by)))return; // never overwrite reviewer labels
+    if(opts.pendingOnly&&final&&final.by==='local')return;
     const v=(vmap&&vmap[r.id])||vecFor(r,eng);
     const p=localProbability(v,eng);
     const dec=p>=thr?'include':(p>=thr-maybeBand?'maybe':'exclude');
@@ -2085,8 +2084,38 @@ function scoreAllLocal(vmap){
   });
   eng.lastScoreMs=Date.now()-started;
   eng.lastScoreN=scored;
+  eng.lastScoreTotal=scope.length;
   eng.lastScorePerMs=scored?eng.lastScoreMs/scored:0;
+  eng.lastScoreAt=new Date().toISOString();
+  eng.lastScoreMode=opts.pendingOnly?'pending':'rescore';
   progressTick('screen-time',scored,scored||1,started,'Viveka Local');
+  return scored;
+}
+function localEngineCounts(){
+  const scope=titleAbstractScopeRefs();
+  const local=scope.filter(r=>r.ta&&r.ta.by==='local').length;
+  const protectedN=scope.filter(r=>myStageReview(r,'ta')||(stageFinalObj(r,'ta')&&['human','consensus','arbitrator','conflict'].includes(stageFinalObj(r,'ta').by))).length;
+  return {total:scope.length,local,pending:Math.max(0,scope.length-local-protectedN),protectedN};
+}
+function formatMs(ms){
+  ms=Number(ms||0);
+  if(ms<1000)return Math.round(ms)+' ms';
+  if(ms<60000)return (ms/1000).toFixed(1)+' sec';
+  return Math.round(ms/60000)+' min '+Math.round((ms%60000)/1000)+' sec';
+}
+function runLocalPending(){
+  if(!ST.engine){toast('Train Viveka Local first','err');return;}
+  const started=Date.now();
+  const n=scoreAllLocal(null,{pendingOnly:true})||0;
+  saveSoon();renderScreen();renderSpine();
+  toast('Viveka Local screened '+n+' pending papers in '+formatMs(Date.now()-started),'ok');
+}
+function rescoreLocalQueue(){
+  if(!ST.engine){toast('Train Viveka Local first','err');return;}
+  const started=Date.now();
+  const n=scoreAllLocal(null,{pendingOnly:false})||0;
+  saveSoon();renderScreen();renderSpine();
+  toast('Viveka Local re-scored '+n+' unconfirmed papers in '+formatMs(Date.now()-started),'ok');
 }
 let _thrDeb=null;
 function reThreshold(v){
@@ -2122,7 +2151,10 @@ async function vivekaSeed(){ // optional: one small LLM batch to seed labels
 }
 function renderLocalControls(){
   const t=localTrainable();const eng=ST.engine;const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
-  const scored=titleAbstractScopeRefs().filter(r=>r.ta&&r.ta.by==='local').length;
+  const lc=localEngineCounts();
+  const scored=lc.local;
+  const last=eng&&eng.lastScoreAt?new Date(eng.lastScoreAt):null;
+  const lastTxt=eng&&eng.lastScoreAt?`Last local run: ${scored} scored - ${formatMs(eng.lastScoreMs)} total - ${eng.lastScorePerMs?eng.lastScorePerMs.toFixed(2):'0'} ms/article - ${last.toLocaleString()}`:'Not run yet after this training.';
   return `<div class="card tight" style="margin-bottom:14px">
     <div class="card-h">⚙ Viveka Local <span class="muted" style="font-weight:500">— in-browser screening engine</span> <span class="tag">${eng?'trained':'not trained'}</span></div>
     <div class="banner info" style="margin-bottom:12px"><span class="bi">ⓘ</span><div>
@@ -2161,8 +2193,56 @@ function loadActiveLearning(){
   window._alSet=new Set(ids);SCREEN_FILTER='al';renderScreen();
   toast('Showing the 15 most uncertain papers — label them and re-train','ok');
 }
+function renderLocalControls(){
+  const t=localTrainable();
+  const eng=ST.engine;
+  const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
+  const lc=localEngineCounts();
+  const scored=lc.local;
+  const last=eng&&eng.lastScoreAt?new Date(eng.lastScoreAt):null;
+  const lastTxt=eng&&eng.lastScoreAt
+    ? `Last local run: ${scored} scored - ${formatMs(eng.lastScoreMs)} total - ${eng.lastScorePerMs?eng.lastScorePerMs.toFixed(2):'0'} ms/article - ${last.toLocaleString()}`
+    : 'Not run yet after this training.';
+  return `<div class="card tight" style="margin-bottom:14px">
+    <div class="card-h">Viveka Local <span class="muted" style="font-weight:500">- in-browser screening engine</span> <span class="tag">${eng?'trained':'not trained'}</span></div>
+    <div class="banner info" style="margin-bottom:12px"><span class="bi">i</span><div>
+      <b>How this works:</b> label a balanced seed (at least 5 includes and 5 excludes; ideally 20-40 total), then <b>Train</b>. Training also screens the pending queue once. After that, use <b>Screen pending</b> or <b>Re-score</b> whenever you change thresholds or add corrections. It is <b>free, in your browser</b> - no tokens.</div></div>
+    <div class="row" style="margin-bottom:10px">
+      <span class="pill ${t.inc>=5?'f':''}">${t.inc} includes labelled</span>
+      <span class="pill ${t.exc>=5?'f':''}">${t.exc} excludes labelled</span>
+      ${eng?`<span class="pill s">seed ${eng.seedN} - ${eng.val?('cross-val recall '+eng.val.recall+'% - prec '+eng.val.prec+'%'):('resub '+eng.trainAcc+'%')} - local scored ${scored}</span>
+      <span class="pill">pending for local ${lc.pending}</span>
+      <span class="pill f">${formatMs(eng.lastScorePerMs||0)} / article</span>`:''}
+    </div>
+    <div class="row">
+      <button class="btn gh sm" onclick="startSeeding()">1. Label seed by hand</button>
+      <button class="btn gh sm" onclick="vivekaSeed()" title="Optional: use one small LLM batch to label about 40 seed papers">1. Let Viveka label seed batch</button>
+      <div class="pbar" style="width:90px"><i id="seed-bar"></i></div>
+      <button class="btn flow sm" onclick="trainLocalEngine()" ${t.ok?'':'disabled'}>2. ${eng?'Re-train + screen':'Train + screen pending'}</button>
+      ${eng?`<button class="btn flow sm" onclick="runLocalPending()">Screen pending with Viveka Local</button>
+      <button class="btn gh sm" onclick="rescoreLocalQueue()">Re-score local queue</button>
+      <button class="btn gh sm" onclick="loadActiveLearning()">3. Label uncertain</button>`:''}
+    </div>
+    ${eng?`<div class="divider"></div>
+    <div class="banner info" style="margin-bottom:12px"><span class="bi">✓</span><div><b>Viveka Local status:</b> ${lastTxt}. Human-confirmed and consensus records are protected and will not be overwritten.</div></div>
+    <div class="row"><label class="fl" style="margin:0">Include threshold <b id="thr-val">${Math.round(thr*100)}%</b></label>
+      <input type="range" min="0.1" max="0.8" step="0.01" value="${thr}" style="flex:1;max-width:280px" oninput="reThreshold(this.value)">
+      <span class="muted">lower = more sensitive; auto threshold targets high recall</span></div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn gh sm" onclick="setLocalPreset('high')">High recall 25%</button>
+      <button class="btn gh sm" onclick="setLocalPreset('balanced')">Balanced 35%</button>
+      <button class="btn gh sm" onclick="setLocalPreset('strict')">Strict 50%</button>
+      <span class="muted">Use high recall when missing an includable paper is worse than reviewing extra maybes.</span>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <span class="pill f">favours include: ${(eng.topInc||[]).slice(0,8).join(', ')}</span></div>
+    <div class="row" style="margin-top:4px">
+      <span class="pill" style="background:var(--exc-w);color:#b91c1c">favours exclude: ${(eng.topExc||[]).slice(0,8).join(', ')}</span></div>`:''}
+  </div>`;
+}
 window.setMode=setMode;window.trainLocalEngine=trainLocalEngine;window.startSeeding=startSeeding;
 window.vivekaSeed=vivekaSeed;window.reThreshold=reThreshold;window.setLocalPreset=setLocalPreset;window.loadActiveLearning=loadActiveLearning;
+window.runLocalPending=runLocalPending;window.rescoreLocalQueue=rescoreLocalQueue;
 window.recommendedMode=recommendedMode;window.currentMode=currentMode;window.uniqueCount=uniqueCount;
 
 function renderScreenStats(){
@@ -2453,7 +2533,7 @@ function renderFulltext(){
   document.getElementById('pane-fulltext').innerHTML=`
   <div class="pane-h"><div class="eyebrow">Phase 07 — confirm eligibility</div>
     <h1>▤ Full-text screening</h1>
-    <p>Pull open-access full text from Europe PMC & Unpaywall, or attach a PDF / paste the text yourself, then assess eligibility against the full paper and record an exclusion reason for the PRISMA flow.</p></div>
+    <p>Pull open-access full text from Europe PMC & Unpaywall, or attach a PDF / paste the text yourself, then assess eligibility against the full paper. Comments or exclusion reasons can be added when useful.</p></div>
   <div id="ft-stats"></div>
   <div class="toolbar">
     <button class="btn flow sm" id="ft-fetch-btn" onclick="ASRMA.fetchAllFullText()">🌐 Fetch full text</button>
@@ -2684,7 +2764,7 @@ renderFulltext=function(){
   document.getElementById('pane-fulltext').innerHTML=`
   <div class="pane-h"><div class="eyebrow">Phase 07 - confirm eligibility</div>
     <h1>Full-text screening</h1>
-    <p>Pull open-access full text from Europe PMC and Unpaywall, or attach a PDF / paste the text yourself, then assess eligibility against the full paper and record an exclusion reason for the PRISMA flow.</p></div>
+    <p>Pull open-access full text from Europe PMC and Unpaywall, or attach a PDF / paste the text yourself, then assess eligibility against the full paper. Comments or exclusion reasons can be added when useful.</p></div>
   <div id="ft-stats"></div>
   <div class="toolbar">
     <button class="btn flow sm" id="ft-fetch-btn" onclick="ASRMA.fetchAllFullText()">Fetch full text</button>
