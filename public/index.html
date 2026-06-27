@@ -3114,7 +3114,7 @@ window.robAll=robAll;window.cycleRob=cycleRob;
 
 /* ===================== META-ANALYSIS ===================== */
 function renderSynth(){
-  const inc=ST.refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include');
+  const inc=extractionRefs();
   if(ST.project.showCI==null)ST.project.showCI=true;
   document.getElementById('pane-synth').innerHTML=
   '<div class="pane-h"><div class="eyebrow">Phase 10 \u2014 synthesise</div>'+
@@ -3213,10 +3213,47 @@ function renderEffectRows(){
 function addEffect(){ST.effects.push({label:'Study '+(ST.effects.length+1),es:null,se:null,n:null,sub:''});save();renderEffectRows();}
 function removeEffect(i){ST.effects.splice(i,1);save();renderEffectRows();}
 function autofillEffects(){
-  const inc=ST.refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include');
-  if(!inc.length){toast('No included studies yet','err');return;}
-  ST.effects=inc.map(r=>({label:((r.authors||'').split(';')[0]||r.title.slice(0,20))+' '+(r.year||''),es:null,se:null,n:parseInt((r.extract||{}).n)||null,hint:(r.extract||{}).effect||'',sub:''}));
-  save();renderEffectRows();toast('Loaded '+inc.length+' rows \u2014 use the calculator or enter effect & SE','ok');
+  const inc=extractionRefs();
+  if(!inc.length){toast('No included studies from extraction yet','err');return;}
+  const measure = ST.project.measure || 'or';
+  function tryParse(txt) {
+    if (!txt) return null;
+    const m = txt.replace(/−/g, '-').match(/(-?\d+\.?\d*)\s*(?:\(|\[)(?:95%\s*CI\s*)?:?\s*(-?\d+\.?\d*)\s*(?:-|to|,)\s*(-?\d+\.?\d*)(?:\)|\])/i);
+    if (!m) return null;
+    const es_raw = parseFloat(m[1]), lo = parseFloat(m[2]), hi = parseFloat(m[3]);
+    if (isNaN(es_raw) || isNaN(lo) || isNaN(hi)) return null;
+    if (measure === 'or' || measure === 'rr' || measure === 'hr') {
+      if (es_raw <= 0 || lo <= 0 || hi <= 0) return null;
+      return { es: Math.log(es_raw), se: Math.abs(Math.log(hi) - Math.log(lo)) / 3.92 };
+    } else {
+      return { es: es_raw, se: Math.abs(hi - lo) / 3.92 };
+    }
+  }
+  let filled = 0;
+  ST.effects=inc.map(r=>{
+    const e = r.extract || {};
+    let es = null, se = null, hint = e.effect || '';
+    if (r.extractEffectCandidates && r.extractEffectCandidates.length) {
+      for (const cand of r.extractEffectCandidates) {
+        const candStr = [cand.outcome, cand.value, cand.quote].filter(Boolean).join(' ');
+        const p = tryParse(candStr);
+        if (p) { es = p.es; se = p.se; hint = candStr; break; }
+      }
+    }
+    if (es === null) {
+      const p = tryParse(hint);
+      if (p) { es = p.es; se = p.se; }
+    }
+    if (es !== null) filled++;
+    return {
+      label: ((r.authors||'').split(';')[0]||r.title.slice(0,20))+' '+(r.year||''),
+      es, se,
+      n: parseInt(e.n) || null,
+      hint,
+      sub: ''
+    };
+  });
+  save();renderEffectRows();toast('Loaded '+inc.length+' rows — auto-filled '+filled+' effects where 95% CIs were found','ok');
 }
 /* ---- pooling (one subgroup or overall) ---- */
 function poolGroup(rows,model){
@@ -3431,7 +3468,7 @@ function prismaSVG(c){
 function exportProject(){const b=new Blob([JSON.stringify(Object.assign({},ST,{_app:'asrma',_v:1}),null,2)],{type:'application/json'});
   const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=(ST.project.title||'asrma-project').replace(/\W+/g,'_')+'.json';a.click();toast('Project exported','ok');}
 function exportIncludedRIS(){
-  const inc=ST.refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include');
+  const inc=extractionRefs();
   if(!inc.length){toast('No included studies','err');return;}
   const ris=inc.map(r=>{
     const au=(r.authors||'').split(';').map(a=>'AU  - '+a.trim()).join('\n');
@@ -3441,7 +3478,7 @@ function exportIncludedRIS(){
   const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='included_studies.ris';a.click();toast('RIS exported','ok');
 }
 function exportIncludedCSV(){
-  const inc=ST.refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include');
+  const inc=extractionRefs();
   const head=['Authors','Year','Title','Journal','DOI','RoB overall'];
   const rows=inc.map(r=>[r.authors,r.year,r.title,r.journal,r.doi,(r.quality||{}).overall||'']);
   downloadCSV([head].concat(rows),'included_studies.csv');
