@@ -26,6 +26,9 @@ const express = require('express');
 const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
+const multer = require('multer');
+const { PDFParse } = require('pdf-parse');
+const { createWorker } = require('tesseract.js');
 const db = require('./db');
 
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-only-change-me';
@@ -45,6 +48,10 @@ function aiServerEnabled() {
 const app = express();
 app.use(express.json({ limit: '12mb' }));   // project data can be large
 app.use(cookieParser());
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 18 * 1024 * 1024 }
+});
 
 function uid(p) { return (p||'') + crypto.randomBytes(9).toString('base64url'); }
 
@@ -72,6 +79,12 @@ function requireAuth(handler) {
     req.user = u;
     return handler(req, res);
   };
+}
+async function requireAuthMiddleware(req, res, next) {
+  const u = await currentUser(req);
+  if (!u) return res.status(401).json({ error: 'Not logged in' });
+  req.user = u;
+  next();
 }
 async function memberRole(projectId, userId) {
   const rows = await db.q('SELECT role FROM members WHERE project_id=$1 AND user_id=$2', [projectId, userId]);
@@ -470,6 +483,67 @@ function flatExtraction(fields, parsed) {
     overallConfidence: Number(parsed.overall_confidence || 0)
   };
 }
+async function runServerExtraction({ projectId, userId, data, ref, fields, model }) {
+  const extractFields = extractionFields(data, fields);
+  if (!extractFields.length) {
+    const err = new Error('At least one extraction field is required');
+    err.status = 400;
+    throw err;
+  }
+  const paperText = normalizePaperText(ref);
+  if (!paperText) {
+    const err = new Error('No full text or abstract available for extraction');
+    err.status = 400;
+    throw err;
+  }
+
+  const configured = configuredAIModels();
+  const agent = data.agent || {};
+  let selectedModel = model || agent.advModel || agent.model || configured[0] || 'gemini-flash';
+  if (!hasRealValue((aiModelMeta(selectedModel) || {}).key) && configured.length) selectedModel = configured[0];
+  const chunks = extractionChunks(paperText);
+  const creditCost = paperText.length > 12000 ? 12 : (paperText.length > 4000 ? 8 : 5);
+  const balance = await aiBalance(userId);
+  if (balance < creditCost) {
+    const err = new Error(`Not enough Viveka AI credits. You have ${balance}, need ${creditCost}. Manual extraction is still free.`);
+    err.status = 402;
+    err.balance = balance;
+    throw err;
+  }
+
+  const chunkResults = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const prompt = buildExtractorChunkPrompt(data, ref, extractFields, chunks[i], i, chunks.length);
+    const raw = await serverLLM(prompt, 1400, selectedModel);
+    chunkResults.push(Object.assign({ _chunk: chunks[i].label }, parseAIJSON(raw)));
+  }
+  let finalParsed;
+  if (chunkResults.length > 1) {
+    const mergePrompt = buildExtractorMergePrompt(data, ref, extractFields, chunkResults);
+    finalParsed = parseAIJSON(await serverLLM(mergePrompt, 1800, selectedModel));
+  } else {
+    finalParsed = chunkResults[0] || { fields: {} };
+    if (finalParsed.overall_confidence == null) {
+      const vals = Object.values(finalParsed.fields || {}).map(x => Number((x || {}).confidence || 0)).filter(Boolean);
+      finalParsed.overall_confidence = vals.length ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
+    }
+  }
+  const result = flatExtraction(extractFields, finalParsed);
+  const aiCredits = await chargeAICredits(userId, creditCost, 'extract:fulltext', selectedModel, projectId);
+  return {
+    ok: true,
+    server: true,
+    model: selectedModel,
+    aiCredits,
+    creditsUsed: creditCost,
+    chunksUsed: chunks.map(c => c.label),
+    extraction: result.values,
+    evidence: result.evidence,
+    effectCandidates: result.effectCandidates,
+    warnings: result.warnings,
+    overallConfidence: result.overallConfidence
+  };
+}
 async function projectDataForMember(projectId, userId) {
   const role = await memberRole(projectId, userId);
   if (!role) return null;
@@ -478,6 +552,18 @@ async function projectDataForMember(projectId, userId) {
   let data = rows[0].data || {};
   if (typeof data === 'string') data = JSON.parse(data || '{}');
   return { data, role, version: rows[0].version };
+}
+async function saveProjectDataDirect(projectId, data, userId) {
+  const cur = await db.q('SELECT version FROM projects WHERE id=$1', [projectId]);
+  if (!cur[0]) {
+    const err = new Error('Project not found');
+    err.status = 404;
+    throw err;
+  }
+  const newV = Number(cur[0].version) + 1;
+  await db.q('UPDATE projects SET data=$1, version=$2, updated_at=now(), updated_by=$3, title=$4 WHERE id=$5',
+    [JSON.stringify(data || {}), newV, userId, (data && data.project && data.project.title) || 'Untitled review', projectId]);
+  return newV;
 }
 
 function getMailer() {
@@ -969,64 +1055,225 @@ app.post('/api/projects/:id/ai/extract', requireAuth(async (req, res) => {
   const refs = Array.isArray(data.refs) ? data.refs : [];
   const ref = refs.find(r => r && r.id === refId);
   if (!ref) return res.status(404).json({ error: 'Study not found in project' });
-
-  const extractFields = extractionFields(data, fields);
-  if (!extractFields.length) return res.status(400).json({ error: 'At least one extraction field is required' });
-  const paperText = normalizePaperText(ref);
-  if (!paperText) return res.status(400).json({ error: 'No full text or abstract available for extraction' });
-
-  const configured = configuredAIModels();
-  const agent = data.agent || {};
-  let selectedModel = model || agent.advModel || agent.model || configured[0] || 'gemini-flash';
-  if (!hasRealValue((aiModelMeta(selectedModel) || {}).key) && configured.length) selectedModel = configured[0];
-  const chunks = extractionChunks(paperText);
-  const creditCost = paperText.length > 12000 ? 12 : (paperText.length > 4000 ? 8 : 5);
-  const balance = await aiBalance(req.user.id);
-  if (balance < creditCost) {
-    return res.status(402).json({ error: `Not enough Viveka AI credits. You have ${balance}, need ${creditCost}. Manual extraction is still free.`, aiCredits: balance });
-  }
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0];
   const rl = rateLimit('ai-extract:' + req.user.id + ':' + ip, 60, 60 * 60 * 1000);
   if (!rl.ok) return res.status(429).json({ error: `AI extraction limit reached. Try again in ${Math.ceil(rl.retryAfter/60)} minute(s).` });
 
   try {
-    const chunkResults = [];
-    for (let i = 0; i < chunks.length; i++) {
-      const prompt = buildExtractorChunkPrompt(data, ref, extractFields, chunks[i], i, chunks.length);
-      const raw = await serverLLM(prompt, 1400, selectedModel);
-      chunkResults.push(Object.assign({ _chunk: chunks[i].label }, parseAIJSON(raw)));
-    }
-    let finalParsed;
-    if (chunkResults.length > 1) {
-      const mergePrompt = buildExtractorMergePrompt(data, ref, extractFields, chunkResults);
-      finalParsed = parseAIJSON(await serverLLM(mergePrompt, 1800, selectedModel));
-    } else {
-      finalParsed = chunkResults[0] || { fields: {} };
-      if (finalParsed.overall_confidence == null) {
-        const vals = Object.values(finalParsed.fields || {}).map(x => Number((x || {}).confidence || 0)).filter(Boolean);
-        finalParsed.overall_confidence = vals.length ? Math.round(vals.reduce((a, b) => a + b, 0) / vals.length) : 0;
-      }
-    }
-    const result = flatExtraction(extractFields, finalParsed);
-    const aiCredits = await chargeAICredits(req.user.id, creditCost, 'extract:fulltext', selectedModel, req.params.id);
-    res.json({
-      ok: true,
-      server: true,
-      model: selectedModel,
-      aiCredits,
-      creditsUsed: creditCost,
-      chunksUsed: chunks.map(c => c.label),
-      extraction: result.values,
-      evidence: result.evidence,
-      effectCandidates: result.effectCandidates,
-      warnings: result.warnings,
-      overallConfidence: result.overallConfidence
-    });
+    res.json(await runServerExtraction({ projectId: req.params.id, userId: req.user.id, data, ref, fields, model }));
   } catch (e) {
     const msg = e && e.message ? e.message : 'AI extraction failed';
     const status = e.status || (/not configured/i.test(msg) ? 503 : 502);
     res.status(status).json({ error: msg, aiCredits: e.balance });
   }
+}));
+
+async function ocrImageBuffer(buffer) {
+  const worker = await createWorker('eng');
+  try {
+    const result = await worker.recognize(buffer);
+    return (result && result.data && result.data.text) ? result.data.text : '';
+  } finally {
+    await worker.terminate();
+  }
+}
+async function extractUploadedText(file) {
+  if (!file || !file.buffer) {
+    const err = new Error('File is required');
+    err.status = 400;
+    throw err;
+  }
+  const name = file.originalname || 'uploaded file';
+  const mime = String(file.mimetype || '').toLowerCase();
+  const lower = name.toLowerCase();
+  if (mime.includes('text') || /\.(txt|text|md)$/i.test(lower)) {
+    return { text: file.buffer.toString('utf8'), method: 'server-text', pages: null };
+  }
+  if (mime.includes('pdf') || /\.pdf$/i.test(lower)) {
+    const parser = new PDFParse({ data: file.buffer });
+    try {
+      const parsed = await parser.getText({ first: 80 });
+      const text = String(parsed.text || '').trim();
+      if (text.length < 80) {
+        const err = new Error('This PDF appears scanned or image-only. Upload a text PDF, paste text, or upload page images for OCR.');
+        err.status = 422;
+        err.needsOcr = true;
+        throw err;
+      }
+      return { text, method: 'server-pdf-text', pages: parsed.total || null };
+    } finally {
+      await parser.destroy();
+    }
+  }
+  if (mime.startsWith('image/') || /\.(png|jpe?g|webp|tiff?)$/i.test(lower)) {
+    const text = (await ocrImageBuffer(file.buffer)).trim();
+    if (text.length < 20) {
+      const err = new Error('OCR could not extract usable text from this image.');
+      err.status = 422;
+      throw err;
+    }
+    return { text, method: 'server-ocr-image', pages: 1 };
+  }
+  const err = new Error('Unsupported file type. Upload PDF, TXT, PNG, JPG, WEBP, or TIFF.');
+  err.status = 415;
+  throw err;
+}
+app.post('/api/projects/:id/refs/:refId/fulltext/upload',
+  requireAuthMiddleware,
+  upload.single('file'),
+  async (req, res) => {
+    try {
+      const role = await memberRole(req.params.id, req.user.id);
+      if (!role) return res.status(403).json({ error: 'Not a member' });
+      const project = await projectDataForMember(req.params.id, req.user.id);
+      if (!project) return res.status(404).json({ error: 'Project not found' });
+      const data = project.data || {};
+      const refs = Array.isArray(data.refs) ? data.refs : [];
+      const ref = refs.find(r => r && r.id === req.params.refId);
+      if (!ref) return res.status(404).json({ error: 'Study not found in project' });
+      const extracted = await extractUploadedText(req.file);
+      ref.ft = Object.assign({}, ref.ft || {}, {
+        pdfText: extracted.text.slice(0, 350000),
+        pdfName: req.file.originalname || 'uploaded file',
+        retrieved: true,
+        source: extracted.method,
+        serverExtractedAt: new Date().toISOString(),
+        serverExtractedBy: req.user.id,
+        pages: extracted.pages
+      });
+      const version = await saveProjectDataDirect(req.params.id, data, req.user.id);
+      res.json({ ok: true, version, ft: ref.ft, chars: ref.ft.pdfText.length, method: extracted.method, pages: extracted.pages });
+    } catch (e) {
+      res.status(e.status || 500).json({ error: e.message || 'Full-text upload failed', needsOcr: !!e.needsOcr });
+    }
+  }
+);
+
+/* ---------------- SERVER JOBS ---------------- */
+const activeJobs = new Set();
+async function jobRow(jobId) {
+  const rows = await db.q('SELECT id,project_id,user_id,type,status,payload,progress,result,error,cancel_requested FROM jobs WHERE id=$1', [jobId]);
+  return rows[0] || null;
+}
+function publicJob(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    projectId: row.project_id,
+    type: row.type,
+    status: row.status,
+    progress: typeof row.progress === 'string' ? JSON.parse(row.progress || '{}') : (row.progress || {}),
+    result: typeof row.result === 'string' ? JSON.parse(row.result || '{}') : (row.result || {}),
+    error: row.error || null,
+    cancelRequested: !!row.cancel_requested
+  };
+}
+async function updateJob(jobId, fields) {
+  const row = await jobRow(jobId);
+  if (!row) return null;
+  const next = Object.assign({}, row, fields);
+  await db.q(
+    'UPDATE jobs SET status=$1, progress=$2, result=$3, error=$4, cancel_requested=$5, updated_at=now(), started_at=COALESCE(started_at,$6), finished_at=$7 WHERE id=$8',
+    [
+      next.status,
+      JSON.stringify(next.progress || {}),
+      JSON.stringify(next.result || {}),
+      next.error || null,
+      !!next.cancel_requested,
+      next.status === 'running' ? new Date().toISOString() : null,
+      ['succeeded', 'failed', 'cancelled'].includes(next.status) ? new Date().toISOString() : null,
+      jobId
+    ]
+  );
+  return jobRow(jobId);
+}
+async function runExtractAllJob(job) {
+  let payload = typeof job.payload === 'string' ? JSON.parse(job.payload || '{}') : (job.payload || {});
+  const project = await projectDataForMember(job.project_id, job.user_id);
+  if (!project) throw Object.assign(new Error('Job user is no longer a project member'), { status: 403 });
+  const data = project.data || {};
+  const refs = Array.isArray(data.refs) ? data.refs : [];
+  const wanted = Array.isArray(payload.refIds) && payload.refIds.length ? new Set(payload.refIds) : null;
+  const list = refs.filter(r => r && !r.dup && (!wanted || wanted.has(r.id)) && r.ft && r.ft.decision === 'include');
+  const fields = payload.fields || extractionFields(data);
+  const model = payload.model;
+  let ok = 0, failed = 0;
+  await updateJob(job.id, { progress: { total: list.length, done: 0, ok, failed, current: '' } });
+  for (let i = 0; i < list.length; i++) {
+    const latest = await jobRow(job.id);
+    if (latest && latest.cancel_requested) {
+      await updateJob(job.id, { status: 'cancelled', result: { ok, failed, cancelledAt: i } });
+      return;
+    }
+    const ref = list[i];
+    await updateJob(job.id, { progress: { total: list.length, done: i, ok, failed, current: ref.title || ref.id } });
+    try {
+      const result = await runServerExtraction({ projectId: job.project_id, userId: job.user_id, data, ref, fields, model });
+      ref.extract = result.extraction || {};
+      ref.extractEvidence = result.evidence || {};
+      ref.extractWarnings = result.warnings || [];
+      ref.extractEffectCandidates = result.effectCandidates || [];
+      ref.extractMeta = {
+        server: true,
+        jobId: job.id,
+        model: result.model,
+        creditsUsed: result.creditsUsed || 0,
+        chunksUsed: result.chunksUsed || [],
+        overallConfidence: result.overallConfidence || 0,
+        reviewedAt: new Date().toISOString()
+      };
+      ok++;
+    } catch (e) {
+      ref.extractWarnings = (ref.extractWarnings || []).concat('Extraction job failed: ' + (e.message || 'unknown error')).slice(-12);
+      failed++;
+      if (e.status === 402 || /credits|configured|provider/i.test(e.message || '')) {
+        await saveProjectDataDirect(job.project_id, data, job.user_id);
+        throw e;
+      }
+    }
+    await saveProjectDataDirect(job.project_id, data, job.user_id);
+    await updateJob(job.id, { progress: { total: list.length, done: i + 1, ok, failed, current: ref.title || ref.id } });
+  }
+  await updateJob(job.id, { status: 'succeeded', result: { ok, failed, total: list.length } });
+}
+async function runJob(jobId) {
+  if (activeJobs.has(jobId)) return;
+  activeJobs.add(jobId);
+  try {
+    let job = await updateJob(jobId, { status: 'running', error: null });
+    if (!job) return;
+    if (job.type === 'extract-all') await runExtractAllJob(job);
+    else throw new Error('Unknown job type: ' + job.type);
+  } catch (e) {
+    await updateJob(jobId, { status: 'failed', error: e.message || 'Job failed' });
+  } finally {
+    activeJobs.delete(jobId);
+  }
+}
+app.post('/api/projects/:id/jobs', requireAuth(async (req, res) => {
+  const { type, refIds, fields, model } = req.body || {};
+  if (type !== 'extract-all') return res.status(400).json({ error: 'Unsupported job type' });
+  const role = await memberRole(req.params.id, req.user.id);
+  if (!role) return res.status(403).json({ error: 'Not a member' });
+  const id = uid('job_');
+  const payload = { refIds: Array.isArray(refIds) ? refIds.slice(0, 10000) : null, fields, model };
+  await db.q('INSERT INTO jobs (id,project_id,user_id,type,status,payload,progress,result) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
+    [id, req.params.id, req.user.id, type, 'queued', JSON.stringify(payload), JSON.stringify({ total: 0, done: 0 }), JSON.stringify({})]);
+  setTimeout(() => runJob(id), 0);
+  res.json({ ok: true, job: publicJob(await jobRow(id)) });
+}));
+app.get('/api/jobs/:id', requireAuth(async (req, res) => {
+  const row = await jobRow(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Job not found' });
+  if (row.user_id !== req.user.id && !(await memberRole(row.project_id, req.user.id))) return res.status(403).json({ error: 'Not allowed' });
+  res.json({ job: publicJob(row) });
+}));
+app.post('/api/jobs/:id/cancel', requireAuth(async (req, res) => {
+  const row = await jobRow(req.params.id);
+  if (!row) return res.status(404).json({ error: 'Job not found' });
+  if (row.user_id !== req.user.id && !(await memberRole(row.project_id, req.user.id))) return res.status(403).json({ error: 'Not allowed' });
+  const updated = await updateJob(req.params.id, { cancel_requested: true, status: row.status === 'queued' ? 'cancelled' : row.status });
+  res.json({ ok: true, job: publicJob(updated) });
 }));
 
 /* ---------------- ADMIN: credits and usage ---------------- */

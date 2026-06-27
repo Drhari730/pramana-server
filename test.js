@@ -10,7 +10,7 @@ process.env.DEEPSEEK_API_KEY = '';
 process.env.ZAI_API_KEY = '';
 
 /* ---- tiny in-memory tables ---- */
-const T = { users: [], projects: [], members: [], invites: [], resets: [], usage: [] };
+const T = { users: [], projects: [], members: [], invites: [], resets: [], usage: [], jobs: [] };
 function clone(o){ return JSON.parse(JSON.stringify(o)); }
 
 /* A hand-written matcher for the exact queries server.js issues.
@@ -59,6 +59,36 @@ async function mockQuery(text, params=[]) {
 
   // ai_usage
   if (s.startsWith('INSERT INTO ai_usage')){ T.usage.push({id:params[0],user_id:params[1],project_id:params[2],feature:params[3],model:params[4],credits:params[5]}); return []; }
+
+  // jobs
+  if (s.startsWith('INSERT INTO jobs')) {
+    T.jobs.push({
+      id: params[0],
+      project_id: params[1],
+      user_id: params[2],
+      type: params[3],
+      status: params[4],
+      payload: JSON.parse(params[5] || '{}'),
+      progress: JSON.parse(params[6] || '{}'),
+      result: JSON.parse(params[7] || '{}'),
+      error: null,
+      cancel_requested: false
+    });
+    return [];
+  }
+  if (s==='SELECT id,project_id,user_id,type,status,payload,progress,result,error,cancel_requested FROM jobs WHERE id=$1')
+    return T.jobs.filter(j=>j.id===params[0]).map(clone);
+  if (s.startsWith('UPDATE jobs SET status=$1')) {
+    const j=T.jobs.find(j=>j.id===params[7]);
+    if(j){
+      j.status=params[0];
+      j.progress=JSON.parse(params[1] || '{}');
+      j.result=JSON.parse(params[2] || '{}');
+      j.error=params[3] || null;
+      j.cancel_requested=!!params[4];
+    }
+    return [];
+  }
 
   // password_resets
   if (s.startsWith('INSERT INTO password_resets')){ T.resets.push({token:params[0],user_id:params[1],expires_at:params[2],used:false}); return []; }
@@ -191,6 +221,14 @@ async function run() {
   // stale save (old version) should conflict
   r = await lead('PUT','/api/projects/'+pid,{version, data:{refs:[]}});
   ok('stale save => 409 conflict', r.status===409 && r.body.currentVersion===version+1);
+
+  console.log('\n=== SERVER JOBS ===');
+  r = await lead('POST','/api/projects/'+pid+'/jobs',{type:'extract-all',refIds:[],fields:[]});
+  ok('create server extraction job', r.status===200 && r.body.job && r.body.job.id);
+  const jid = r.body.job.id;
+  await new Promise(resolve=>setTimeout(resolve,25));
+  r = await lead('GET','/api/jobs/'+jid);
+  ok('server extraction job is readable', r.status===200 && ['queued','running','succeeded'].includes(r.body.job.status));
 
   console.log('\n=== INVITE + SHARED ACCESS ===');
   // invite a reviewer who hasn't registered yet

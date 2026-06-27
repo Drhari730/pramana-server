@@ -2781,6 +2781,81 @@ const DEFAULT_FIELDS=[
   {k:'effect',label:'Effect estimate (with 95% CI)'}
 ];
 function getFields(){return ST.project.extractFields||DEFAULT_FIELDS;}
+let EXTRACT_JOB_ID=null;
+async function refreshServerProjectPhase(phase){
+  if(!(window.BK&&BK.isServer&&BK.isServer()&&ST.id))return;
+  const res=await BK.api('GET','/api/projects/'+ST.id,null,30000);
+  const id=ST.id;
+  const data=res.project&&res.project.data?res.project.data:{};
+  Object.keys(ST).forEach(k=>delete ST[k]);
+  Object.assign(ST,blankState(),data,{id});
+  window.ST=ST;
+  BK.version=res.project.version;
+  BK.role=res.role;
+  updatePill();updateKeyBtn();updateAgentChip();renderTeam();
+  renderCurrentPhaseNoSave(phase||'extract');
+}
+function setExtractJobUi(running,text,pct){
+  const bar=document.getElementById('ext-bar');
+  const label=document.getElementById('ext-job-status');
+  const stop=document.getElementById('ext-stop-btn');
+  if(bar)bar.style.width=Math.max(0,Math.min(100,pct||0))+'%';
+  if(label)label.textContent=text||'';
+  if(stop)stop.disabled=!running;
+}
+async function pollServerJob(jobId,onTick){
+  let last=null;
+  while(true){
+    await new Promise(resolve=>setTimeout(resolve,1500));
+    const res=await BK.api('GET','/api/jobs/'+jobId,null,30000);
+    const job=res.job||{};
+    last=job;
+    if(onTick)onTick(job);
+    if(['succeeded','failed','cancelled'].includes(job.status))return job;
+  }
+}
+async function serverExtractAllJob(list){
+  if(EXTRACT_JOB_ID){toast('Extraction is already running','err');return;}
+  if(typeof _srvTimer!=='undefined'&&_srvTimer)await serverSaveNow();
+  agentBusy(true);
+  const started=Date.now();
+  try{
+    const fields=getFields();
+    const model=serverModelFor(ST.agent.advModel||ST.agent.model);
+    const res=await BK.api('POST','/api/projects/'+ST.id+'/jobs',{type:'extract-all',refIds:list.map(r=>r.id),fields,model},30000);
+    EXTRACT_JOB_ID=res.job&&res.job.id;
+    setExtractJobUi(true,'Server extraction queued...',3);
+    const job=await pollServerJob(EXTRACT_JOB_ID,j=>{
+      const p=j.progress||{};
+      const total=Number(p.total||list.length||0);
+      const done=Number(p.done||0);
+      const pct=total?Math.round(done/total*100):5;
+      const elapsed=Math.max(1,Math.round((Date.now()-started)/1000));
+      const per=done?Math.round(elapsed/done):0;
+      const eta=done&&total>done?' - ETA ~'+Math.round((total-done)*per/60)+' min':'';
+      setExtractJobUi(true,'Server extraction: '+done+'/'+total+' - '+(p.ok||0)+' ok - '+(p.failed||0)+' failed - '+elapsed+'s elapsed'+eta,pct);
+    });
+    EXTRACT_JOB_ID=null;
+    setExtractJobUi(false,'Refreshing extracted data...',100);
+    await refreshServerProjectPhase('extract');
+    if(job.status==='succeeded')toast('Extracted '+((job.result&&job.result.ok)||0)+' studies on server','ok');
+    else if(job.status==='cancelled')toast('Server extraction stopped','ok');
+    else toast(job.error||'Server extraction failed','err');
+  }catch(e){
+    EXTRACT_JOB_ID=null;
+    setExtractJobUi(false,e.message||'Server extraction failed',0);
+    toast(e.message||'Server extraction failed','err');
+  }finally{
+    agentBusy(false);
+  }
+}
+async function cancelExtractJob(){
+  if(!EXTRACT_JOB_ID){toast('No extraction job is running','err');return;}
+  try{
+    await BK.api('POST','/api/jobs/'+EXTRACT_JOB_ID+'/cancel',{},15000);
+    setExtractJobUi(true,'Stop requested. Waiting for the current article to finish...',50);
+  }catch(e){toast(e.message||'Could not stop extraction','err');}
+}
 async function extractOne(id){
   const r=ST.refs.find(x=>x.id===id);if(!r)return;
   const fields=getFields();
@@ -2808,6 +2883,7 @@ Each value a short string. For "effect", give the headline result with CI if pre
 async function extractAll(){
   const list=ST.refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include');
   if(!list.length){toast('No included studies','err');return;}
+  if(window.BK&&BK.isServer&&BK.isServer()&&serverAIReady()&&ST.id){await serverExtractAllJob(list);return;}
   agentBusy(true);const bar=document.getElementById('ext-bar');let done=0,ok=0,fail=0,lastErr='';
   for(const r of list){try{await extractOne(r.id);ok++;}catch(e){fail++;lastErr=e.message||'extraction failed';if(e.status===402||/credits|configured|provider/i.test(lastErr))break;}
     done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';
@@ -2825,6 +2901,8 @@ function renderExtract(){
   <div class="toolbar">
     <button class="btn flow sm" onclick="extractAll()">⊹ Extract all with Viveka</button>
     <div class="pbar" style="width:160px"><i id="ext-bar"></i></div>
+    <button class="btn gh sm" id="ext-stop-btn" onclick="cancelExtractJob()" disabled>Stop server job</button>
+    <span class="muted" id="ext-job-status" style="font-size:12px">Server jobs keep running outside the browser tab.</span>
     <button class="btn gh sm" onclick="addField()">+ Add field</button>
     <span class="spacer"></span>
     <button class="btn gh sm" onclick="exportExtractCSV()">⬇ Export CSV</button>
@@ -2856,7 +2934,7 @@ function exportExtractCSV(){
     return[(r.authors||'').split(';')[0],r.year,r.doi].concat(fields.map(f=>e[f.k]||''));});
   downloadCSV([head].concat(rows),'extraction.csv');
 }
-window.extractAll=extractAll;window.setCell=setCell;window.addField=addField;window.rmField=rmField;window.exportExtractCSV=exportExtractCSV;
+window.extractAll=extractAll;window.cancelExtractJob=cancelExtractJob;window.setCell=setCell;window.addField=addField;window.rmField=rmField;window.exportExtractCSV=exportExtractCSV;
 function downloadCSV(rows,name){
   const csv=rows.map(r=>r.map(c=>'"'+String(c==null?'':c).replace(/"/g,'""')+'"').join(',')).join('\n');
   const b=new Blob([csv],{type:'text/csv'});const a=document.createElement('a');
@@ -3918,18 +3996,28 @@ async function extractPDFText(file){
   return text.replace(/\s+/g,' ').trim();
 }
 function attachFullText(id){
-  const inp=document.createElement('input');inp.type='file';inp.accept='.pdf,.txt,.text';
+  const inp=document.createElement('input');inp.type='file';inp.accept='.pdf,.txt,.text,.png,.jpg,.jpeg,.webp,.tif,.tiff';
   inp.onchange=async e=>{const f=e.target.files[0];if(!f)return;
     const r=refById(id);if(!r)return;r.ft=r.ft||{};
-    toast('Reading '+f.name+'\u2026','ok');
+    toast((BK.isServer()?'Uploading to server: ':'Reading ')+f.name+'\u2026','ok');
     try{
-      let text='';
-      if(/\.pdf$/i.test(f.name)){text=await extractPDFText(f);}
-      else{text=await f.text();}
-      if(!text||text.length<40){toast('Could not extract usable text (scanned PDF?). Try pasting text instead.','err');}
-      r.ft.pdfText=text;r.ft.pdfName=f.name;r.ft.retrieved=true;
-      save();renderFulltext();
-      toast('Attached '+f.name+' \u2014 '+text.length.toLocaleString()+' chars of text','ok');
+      if(BK.isServer()&&ST.id){
+        if(typeof _srvTimer!=='undefined'&&_srvTimer)await serverSaveNow();
+        const fd=new FormData();fd.append('file',f);
+        const out=await BK.upload('/api/projects/'+ST.id+'/refs/'+id+'/fulltext/upload',fd,180000);
+        r.ft=Object.assign({},r.ft||{},out.ft||{});
+        if(out.version)BK.version=out.version;
+        renderFulltext();renderSpine();setSyncState('saved');
+        toast('Server extracted '+(out.chars||0).toLocaleString()+' chars from '+f.name,'ok');
+      }else{
+        let text='';
+        if(/\.pdf$/i.test(f.name)){text=await extractPDFText(f);}
+        else{text=await f.text();}
+        if(!text||text.length<40){toast('Could not extract usable text (scanned PDF?). Try pasting text instead.','err');}
+        r.ft.pdfText=text;r.ft.pdfName=f.name;r.ft.retrieved=true;
+        save();renderFulltext();
+        toast('Attached '+f.name+' \u2014 '+text.length.toLocaleString()+' chars of text','ok');
+      }
     }catch(err){toast('Attach failed: '+err.message,'err');}
   };
   inp.click();
@@ -4397,6 +4485,22 @@ const BK = {
     clearTimeout(timer);
     let j={}; try{ j = await r.json(); }catch(e){}
     if(j&&j.aiCredits!=null)syncAICredits(j);
+    if(!r.ok){ const err=new Error(j.error||('HTTP '+r.status)); err.status=r.status; err.body=j; throw err; }
+    return j;
+  },
+  async upload(path, formData, timeoutMs){
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 120000);
+    let r;
+    try{
+      r = await fetch(path, {method:'POST', credentials:'same-origin', body:formData, signal:ctrl.signal});
+    }catch(e){
+      clearTimeout(timer);
+      if(e && e.name==='AbortError') throw new Error('The server took too long to process the file. Try a smaller file.');
+      throw e;
+    }
+    clearTimeout(timer);
+    let j={}; try{ j=await r.json(); }catch(e){}
     if(!r.ok){ const err=new Error(j.error||('HTTP '+r.status)); err.status=r.status; err.body=j; throw err; }
     return j;
   },

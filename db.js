@@ -94,6 +94,25 @@ CREATE TABLE IF NOT EXISTS ai_usage (
 );
 CREATE INDEX IF NOT EXISTS idx_ai_usage_user ON ai_usage(user_id);
 CREATE INDEX IF NOT EXISTS idx_ai_usage_project ON ai_usage(project_id);
+
+CREATE TABLE IF NOT EXISTS jobs (
+  id               TEXT PRIMARY KEY,
+  project_id       TEXT REFERENCES projects(id) ON DELETE CASCADE,
+  user_id          TEXT REFERENCES users(id) ON DELETE CASCADE,
+  type             TEXT NOT NULL,
+  status           TEXT NOT NULL DEFAULT 'queued',
+  payload          JSONB NOT NULL DEFAULT '{}',
+  progress         JSONB NOT NULL DEFAULT '{}',
+  result           JSONB NOT NULL DEFAULT '{}',
+  error            TEXT,
+  cancel_requested BOOLEAN DEFAULT false,
+  created_at       TIMESTAMPTZ DEFAULT now(),
+  updated_at       TIMESTAMPTZ DEFAULT now(),
+  started_at       TIMESTAMPTZ,
+  finished_at      TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_project ON jobs(project_id);
+CREATE INDEX IF NOT EXISTS idx_jobs_user ON jobs(user_id);
 `;
 
 async function initSchema() {
