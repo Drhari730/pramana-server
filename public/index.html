@@ -5370,6 +5370,25 @@ async function afterLogin(){
   }
   goHome();
 }
+function showProfileModal(){
+  if(!BK.user)return;
+  const initials=(BK.user.name||BK.user.email||'?').split(/\s+/).map(w=>w[0]).slice(0,2).join('').toUpperCase();
+  const credits=BK.user.aiCredits!=null?Number(BK.user.aiCredits):0;
+  
+  modal(`<div class="modal-h">User Profile<button class="x" onclick="closeModal()">x</button></div>
+    <div class="modal-b" style="max-width:340px;text-align:center">
+      <div style="width:64px;height:64px;border-radius:50%;background:var(--syn);color:#fff;font-size:24px;font-weight:700;display:flex;align-items:center;justify-content:center;margin:10px auto 16px auto">${esc(initials)}</div>
+      <div style="font-weight:700;font-size:18px;color:var(--t1)">${esc(BK.user.name||'')}</div>
+      <div class="muted" style="margin-bottom:24px">${esc(BK.user.email)}</div>
+      <div style="background:var(--wash2);border-radius:8px;padding:16px;text-align:left;margin-bottom:24px">
+         <div style="font-size:12px;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:8px">Account Status</div>
+         <div style="font-size:14px;color:var(--t1);font-weight:600;margin-bottom:16px"><span style="display:inline-block;width:8px;height:8px;background:var(--inc);border-radius:50%;margin-right:8px"></span>Trial version</div>
+         <div style="font-size:12px;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:4px">Viveka Credits</div>
+         <div style="font-size:28px;font-weight:700;color:var(--syn)">${credits}</div>
+      </div>
+      <button class="btn exc" style="width:100%" onclick="doLogout()">Log out</button>
+    </div>`);
+}
 async function doLogout(){ try{ await BK.api('POST','/api/auth/logout'); }catch(e){} BK.user=null; location.reload(); }
 function syncAICredits(payload){
   if(payload&&payload.aiCredits!=null&&BK.user){
@@ -5422,10 +5441,10 @@ function updateUserChip(){
   chip.innerHTML=`<div style="display:flex;align-items:center;gap:8px">
     <div class="pill s" title="Manual screening, import, PRISMA, and meta-analysis are free. Only Viveka Cloud AI uses credits.">Viveka Credits: ${credits}</div>
     ${BK.user.isAdmin?'<button class="hbtn" onclick="adminUsageModal()" title="Admin portal: users, AI credits, and usage logs">Admin Portal</button>':''}
-    <div style="width:28px;height:28px;border-radius:50%;background:var(--syn);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;cursor:pointer" title="${esc(BK.user.email)}\nClick to log out" onclick="doLogout()">${esc(initials)}</div>
+    <div style="width:28px;height:28px;border-radius:50%;background:var(--syn);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;cursor:pointer" title="${esc(BK.user.email)}\nClick to view profile" onclick="showProfileModal()">${esc(initials)}</div>
   </div>`;
 }
-window.showAuthScreen=showAuthScreen;window.authTab=authTab;window.authSubmit=authSubmit;window.doLogout=doLogout;window.adminUsageModal=adminUsageModal;window.adminAddCredits=adminAddCredits;
+window.showAuthScreen=showAuthScreen;window.authTab=authTab;window.authSubmit=authSubmit;window.doLogout=doLogout;window.adminUsageModal=adminUsageModal;window.adminAddCredits=adminAddCredits;window.showProfileModal=showProfileModal;
 
 /* ---------- SERVER-BACKED PROJECT OPS ---------- */
 async function serverListProjects(){
