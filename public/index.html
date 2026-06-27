@@ -3218,7 +3218,10 @@ function renderQuality(){
   '</tbody></table>'+
   '<div class="row" style="margin-top:12px;align-items:center"><span class="pill" style="background:var(--inc-w);color:#15803d">+ low</span>'+
     '<span class="pill" style="background:var(--maybe-w);color:#b45309">? some concerns</span>'+
-    '<span class="spacer"></span><button class="btn sm" onclick="ASRMA.go(\'synth\')">Meta-analysis \u2192</button></div></div>');
+    '<span class="pill" style="background:var(--exc-w);color:#b91c1c">\u2212 high risk</span>'+
+    '<span class="spacer"></span>'+
+    '<button class="btn gh sm" onclick="exportRobCSV()">\u2b07 Export Excel (.csv)</button>'+
+    '<button class="btn sm" style="margin-left:8px" onclick="ASRMA.go(\'synth\')">Meta-analysis \u2192</button></div></div>';
 }
 function cycleRob(id,dom){const r=ST.refs.find(x=>x.id===id);if(!r)return;
   const tool=getTool();const realDom=ROB_TOOLS[tool].find(d=>d.replace(/'/g,'')===dom)||dom;
