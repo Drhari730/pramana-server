@@ -3041,7 +3041,23 @@ function exportExtractCSV(){
     return[(r.authors||'').split(';')[0],r.year,r.doi].concat(fields.map(f=>e[f.k]||''));});
   downloadCSV([head].concat(rows),'extraction.csv');
 }
+function exportRobCSV(){
+  const tool=getTool();const doms=ROB_TOOLS[tool];
+  const list=extractionRefs();
+  const head=['Study'].concat(doms).concat(['Overall Bias']);
+  const rows=list.map(r=>{
+    const q=r.quality||{domains:{}};
+    return [(r.authors||'').split(';')[0]+' '+(r.year||'')].concat(doms.map(d=>(q.domains[d]||{}).j||'')).concat([q.overall||'']);
+  });
+  downloadCSV([head].concat(rows),'risk_of_bias.csv');
+}
+function exportGradeCSV(){
+  const head=['Outcome','Start','Risk of bias','Inconsistency','Indirectness','Imprecision','Publication bias','Large effect','Dose response','Confounding','Certainty'];
+  const rows=ST.grade.map(g=>[g.outcome||'',g.start||'',g.rob||'0',g.incons||'0',g.indirect||'0',g.imprec||'0',g.pubbias||'0',g.large||'0',g.doseresp||'0',g.confound||'0',gradeLevel(g)]);
+  downloadCSV([head].concat(rows),'grade_certainty.csv');
+}
 window.extractAll=extractAll;window.cancelExtractJob=cancelExtractJob;window.setCell=setCell;window.addField=addField;window.rmField=rmField;window.exportExtractCSV=exportExtractCSV;window.resetExtraction=resetExtraction;
+window.exportRobCSV=exportRobCSV;window.exportGradeCSV=exportGradeCSV;
 function downloadCSV(rows,name){
   const csv=rows.map(r=>r.map(c=>'"'+String(c==null?'':c).replace(/"/g,'""')+'"').join(',')).join('\n');
   const b=new Blob([csv],{type:'text/csv'});const a=document.createElement('a');
@@ -3188,6 +3204,7 @@ function renderQuality(){
       Object.keys(ROB_TOOLS).map(t=>'<option '+(getTool()===t?'selected':'')+'>'+t+'</option>').join('')+'</select>'+
     '<button class="btn flow sm" onclick="robAll(\'ai\')">\u2728 Auto-Assess (Viveka AI - uses credits)</button>'+
     '<button class="btn gh sm" style="margin-left:8px" onclick="robAll(\'heuristic\')">\u2699 Auto-Assess (Local Heuristic - free)</button>'+
+    <button class="btn gh sm" style="margin-left:8px" onclick="robAll(\'heuristic\')">\u2699 Auto-Assess (Local Heuristic - free)</button>'+
     '<div class="pbar" style="width:160px"><i id="rob-bar"></i></div>'+
   '</div>'+
   (!list.length?'<div class="empty"><div class="ico">\u2696</div><h3>No included studies</h3><div>Confirm includes at full text first.</div></div>':
@@ -3200,9 +3217,8 @@ function renderQuality(){
       return '<td style="text-align:center;cursor:pointer" title="'+esc((q.domains[d]||{}).why||'click to cycle')+'" onclick="cycleRob(\''+r.id+'\',\''+esc(d).replace(/'/g,'')+'\')">'+dot(j)+'</td>';}).join('')+
     '<td style="text-align:center">'+dot(q.overall)+'</td></tr>';}).join('')+
   '</tbody></table>'+
-  '<div class="row" style="margin-top:12px"><span class="pill" style="background:var(--inc-w);color:#15803d">+ low</span>'+
+  '<div class="row" style="margin-top:12px;align-items:center"><span class="pill" style="background:var(--inc-w);color:#15803d">+ low</span>'+
     '<span class="pill" style="background:var(--maybe-w);color:#b45309">? some concerns</span>'+
-    '<span class="pill" style="background:var(--exc-w);color:#b91c1c">\u2212 high</span>'+
     '<span class="spacer"></span><button class="btn sm" onclick="ASRMA.go(\'synth\')">Meta-analysis \u2192</button></div></div>');
 }
 function cycleRob(id,dom){const r=ST.refs.find(x=>x.id===id);if(!r)return;
@@ -3419,9 +3435,16 @@ function runMeta(){
     (log?' Estimates shown on the ratio scale; analysis on the log scale.':'')+
     (subTest?' Subgroup difference: Q\u1d47='+subTest.Qb.toFixed(2)+', df='+subTest.dfb+', p='+(subTest.p<0.001?'<0.001':subTest.p.toFixed(3))+'.':'')+'</div></div>'+
   '<div class="card"><div class="card-h">Forest plot</div><div style="overflow-x:auto">'+forestSVG(data,overall,log,measure,showCI,subResults)+'</div>'+
-    '<div class="row" style="margin-top:10px"><button class="btn gh sm" onclick="downloadSVG(\'forest-svg\',\'forest_plot.svg\')">\u2b07 Forest SVG</button></div></div>'+
+    '<div class="row" style="margin-top:10px;gap:8px">'+
+      '<button class="btn gh sm" onclick="downloadSVG(\'forest-svg\',\'forest_plot.svg\')">\u2b07 SVG</button>'+
+      '<button class="btn gh sm" onclick="downloadSVGasPNG(\'forest-svg\',\'forest_plot.png\')">\u2b07 PNG Image</button>'+
+    '</div></div>'+
   '<div class="card"><div class="card-h">Funnel plot <span class="tag">small-study / publication-bias check</span></div>'+funnelSVG(data,overall.pooled)+
-    '<div class="muted" style="margin-top:8px">Visual asymmetry can suggest small-study effects; with \u226510 studies consider Egger\u2019s test (not automated here).</div></div>';
+    '<div class="muted" style="margin-top:8px">Visual asymmetry can suggest small-study effects; with \u226510 studies consider Egger\u2019s test (not automated here).</div>'+
+    '<div class="row" style="margin-top:10px;gap:8px">'+
+      '<button class="btn gh sm" onclick="downloadSVG(\'funnel-svg\',\'funnel_plot.svg\')">\u2b07 SVG</button>'+
+      '<button class="btn gh sm" onclick="downloadSVGasPNG(\'funnel-svg\',\'funnel_plot.png\')">\u2b07 PNG Image</button>'+
+    '</div></div>';
 }
 function normCdf(x){return .5*(1+erf(x/Math.SQRT2));}
 function erf(x){const t=1/(1+.3275911*Math.abs(x));
@@ -3498,7 +3521,26 @@ function funnelSVG(data,pooled){
 function downloadSVG(id,name){const svg=document.getElementById(id);if(!svg)return;
   const s=new XMLSerializer().serializeToString(svg);const b=new Blob([s],{type:'image/svg+xml'});
   const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=name;a.click();}
-window.runMeta=runMeta;window.autofillEffects=autofillEffects;window.downloadSVG=downloadSVG;
+function downloadSVGasPNG(id, name) {
+  const svg = document.getElementById(id); if(!svg)return;
+  const svgData = new XMLSerializer().serializeToString(svg);
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  const img = new Image();
+  img.onload = function() {
+    canvas.width = img.width;
+    canvas.height = img.height;
+    ctx.fillStyle = "white";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0);
+    const a = document.createElement("a");
+    a.download = name;
+    a.href = canvas.toDataURL("image/png");
+    a.click();
+  };
+  img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svgData)));
+}
+window.runMeta=runMeta;window.autofillEffects=autofillEffects;window.downloadSVG=downloadSVG;window.downloadSVGasPNG=downloadSVGasPNG;
 ASRMA.runMeta=runMeta;ASRMA.addEffect=addEffect;ASRMA.removeEffect=removeEffect;
 
 /* ===================== REPORT / PRISMA / EXPORT ===================== */
@@ -4261,8 +4303,11 @@ function renderGrade(){
     '<span class="muted" style="font-size:12px;margin-left:8px">Calculates certainty from Meta-analysis results and RoB matrix.</span>'+
   '</div>'+
   ST.grade.map((g,i)=>gradeCard(g,i,lvlCol)).join('')+
-  '<div class="row"><button class="btn gh sm" onclick="addGradeRow()">+ Add outcome</button>'+
-    '<span class="spacer"></span><button class="btn" onclick="ASRMA.go(\'report\')">Continue to report \u2192</button></div>';
+  '<div class="row" style="margin-top:16px">'+
+    '<button class="btn gh sm" onclick="addGradeRow()">+ Add outcome</button>'+
+    '<button class="btn gh sm" style="margin-left:8px" onclick="exportGradeCSV()">\u2b07 Export Excel (.csv)</button>'+
+    '<span class="spacer"></span><button class="btn" onclick="ASRMA.go(\'report\')">Continue to report \u2192</button>'+
+  '</div>';
 }
 function gradeCard(g,i,lvlCol){
   const lvl=gradeLevel(g);
