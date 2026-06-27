@@ -3119,20 +3119,60 @@ function heuristicRob(text, tool, domains) {
   return res;
 }
 
-async function robOne(id){
+async function robOne(id, mode){
   const r=ST.refs.find(x=>x.id===id);if(!r)return;
   const tool=getTool();const doms=ROB_TOOLS[tool];
-  const ctx=r.ft&&r.ft.pdfText?r.ft.pdfText.slice(0,30000):r.abstract;
-  const res = heuristicRob(ctx, tool, doms);
-  r.quality={tool,domains:res.domains||{},overall:res.overall||'some',by:'algorithm'};
+  if(mode === 'ai'){
+    const ctx=r.ft&&r.ft.pdfText?r.ft.pdfText.slice(0,9000):r.abstract;
+    const res=parseJSON(await LLM('Assess risk of bias using '+tool+' for this study. For each domain give a judgement (low/some/high) and a one-clause justification.\nSTUDY: '+r.title+'\nTEXT: '+ctx+'\nDomains: '+JSON.stringify(doms)+'\nReturn ONLY JSON: {"domains":{'+doms.map(d=>'"'+d+'":{"j":"low|some|high","why":"..."}').join(',')+'},"overall":"low|some|high"}',900,ST.agent.advModel));
+    r.quality={tool,domains:res.domains||{},overall:res.overall||'some',by:'agent'};
+  } else {
+    const ctx=r.ft&&r.ft.pdfText?r.ft.pdfText.slice(0,30000):r.abstract;
+    const res = heuristicRob(ctx, tool, doms);
+    r.quality={tool,domains:res.domains||{},overall:res.overall||'some',by:'algorithm'};
+  }
   save();return r;
 }
-async function robAll(){
+async function robAll(mode){
   const list=extractionRefs();
   if(!list.length){toast('No included studies from extraction yet','err');return;}
   agentBusy(true);let done=0;const bar=document.getElementById('rob-bar');
-  for(const r of list){try{await robOne(r.id);}catch(e){}done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';if(done%2===0)renderQuality();}
+  for(const r of list){try{await robOne(r.id, mode);}catch(e){}done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';if(done%2===0)renderQuality();}
   agentBusy(false);renderQuality();renderSpine();toast('Assessed '+done+' studies','ok');
+}
+
+function renderRobSummaryChart(list, doms) {
+  if (!list.length) return '';
+  const counts = {overall: {low:0, some:0, high:0}};
+  doms.forEach(d => counts[d] = {low:0, some:0, high:0});
+  list.forEach(r => {
+    const q = r.quality || {domains:{}};
+    const ov = q.overall || 'some';
+    counts.overall[ov] = (counts.overall[ov]||0) + 1;
+    doms.forEach(d => {
+      const j = (q.domains[d]||{}).j || 'some';
+      counts[d][j] = (counts[d][j]||0) + 1;
+    });
+  });
+  const t = list.length;
+  const pct = (v) => (v/t*100).toFixed(1) + '%';
+  const bar = (d, label, isOverall) => {
+    const pLow = pct(counts[d].low), pSome = pct(counts[d].some), pHigh = pct(counts[d].high);
+    return '<div style="display:flex;align-items:center;margin-bottom:6px;font-size:11px">'+
+      '<div style="width:180px;text-align:right;padding-right:8px;font-weight:'+(isOverall?'700':'400')+'">'+esc(label)+'</div>'+
+      '<div style="flex:1;display:flex;height:16px;border-radius:2px;overflow:hidden;background:var(--wash2)">'+
+        (counts[d].low > 0 ? '<div style="width:'+pLow+';background:var(--inc)" title="Low risk: '+pLow+'"></div>' : '')+
+        (counts[d].some > 0 ? '<div style="width:'+pSome+';background:var(--maybe)" title="Some concerns: '+pSome+'"></div>' : '')+
+        (counts[d].high > 0 ? '<div style="width:'+pHigh+';background:var(--exc)" title="High risk: '+pHigh+'"></div>' : '')+
+      '</div><div style="width:40px;text-align:right;color:var(--t3)">100%</div></div>';
+  };
+  return '<div class="card" style="padding:16px;margin-bottom:16px;background:#f8fafc"><div style="margin-bottom:12px;font-weight:700;font-size:12px;color:var(--t2)">Traffic Light Summary (Intention-to-treat)</div>' + 
+    doms.map(d => bar(d, d)).join('') + '<div style="height:1px;background:var(--line2);margin:8px 0"></div>' + bar('overall', 'Overall Bias', true) +
+    '<div style="display:flex;justify-content:center;gap:16px;margin-top:12px;font-size:10px">'+
+    '<span><span style="display:inline-block;width:10px;height:10px;background:var(--inc);border-radius:2px;margin-right:4px"></span>Low risk</span>'+
+    '<span><span style="display:inline-block;width:10px;height:10px;background:var(--maybe);border-radius:2px;margin-right:4px"></span>Some concerns</span>'+
+    '<span><span style="display:inline-block;width:10px;height:10px;background:var(--exc);border-radius:2px;margin-right:4px"></span>High risk</span>'+
+    '</div></div>';
 }
 function renderQuality(){
   const tool=getTool();const doms=ROB_TOOLS[tool];
@@ -3142,14 +3182,16 @@ function renderQuality(){
   document.getElementById('pane-quality').innerHTML=
   '<div class="pane-h"><div class="eyebrow">Phase 09 \u2014 appraise</div>'+
     '<h1>\u2696 Risk of bias</h1>'+
-    '<p>The automated algorithm scans each full text and uses guideline heuristics to judge every domain, producing a baseline traffic-light matrix. Hover for the evidence keyword, and click any cell to manually override.</p></div>'+
+    '<p>Assess the risk of bias for each study using automated heuristics or Viveka AI. You can always override any cell manually.</p></div>'+
   '<div class="toolbar">'+
     '<select class="inp" style="width:auto" onchange="ST.project.robTool=this.value;save();renderQuality()">'+
       Object.keys(ROB_TOOLS).map(t=>'<option '+(getTool()===t?'selected':'')+'>'+t+'</option>').join('')+'</select>'+
-    '<button class="btn flow sm" onclick="robAll()">\u2039 Assess all</button>'+
+    '<button class="btn flow sm" onclick="robAll(\'ai\')">\u2728 Auto-Assess (Viveka AI - uses credits)</button>'+
+    '<button class="btn gh sm" style="margin-left:8px" onclick="robAll(\'heuristic\')">\u2699 Auto-Assess (Local Heuristic - free)</button>'+
     '<div class="pbar" style="width:160px"><i id="rob-bar"></i></div>'+
   '</div>'+
   (!list.length?'<div class="empty"><div class="ico">\u2696</div><h3>No included studies</h3><div>Confirm includes at full text first.</div></div>':
+  renderRobSummaryChart(list, doms)+
   '<div class="card" style="overflow-x:auto"><div class="card-h">'+tool+' traffic-light matrix</div>'+
   '<table class="tbl"><thead><tr><th style="min-width:170px">Study</th>'+doms.map(d=>'<th title="'+esc(d)+'">'+esc(d.split(' ')[0])+'</th>').join('')+'<th>Overall</th></tr></thead><tbody>'+
   list.map(r=>{const q=r.quality||{domains:{}};
@@ -4131,49 +4173,78 @@ function ensureGradeRows(){
     (outs.length?outs:['Primary outcome']).forEach(o=>ST.grade.push(Object.assign({outcome:o,nStudies:'',nPart:''},startGrade())));
   }
 }
-function autoGradeAll() {
+async function autoGradeAll(mode) {
   const inc = extractionRefs();
   if(!inc.length || !ST.effects.length) { toast('Need both included extraction studies and meta-analysis effects to Auto-GRADE','err'); return; }
   
-  let highRob = 0, totalRob = 0;
-  inc.forEach(r => {
-    if(r.quality && r.quality.overall) {
-      totalRob++;
-      if(r.quality.overall === 'high') highRob++;
-    }
-  });
-  const robDowngrade = (totalRob > 0 && (highRob / totalRob) > 0.6) ? 2 : (totalRob > 0 && (highRob / totalRob) > 0.3) ? 1 : 0;
-
-  ST.grade.forEach(g => {
-    let poolStats = null;
-    if (g.outcome) {
+  if (mode === 'ai') {
+    agentBusy(true);
+    let robSummary = '';
+    let highRob = 0, totalRob = 0;
+    inc.forEach(r => {
+      if(r.quality && r.quality.overall) {
+        totalRob++;
+        if(r.quality.overall === 'high') highRob++;
+      }
+    });
+    robSummary = `RoB Summary: ${totalRob} studies assessed, ${highRob} are high risk overall.`;
+    
+    for(const g of ST.grade) {
+      if(!g.outcome) continue;
       const matchData = ST.effects.filter(e => isFinite(e.es) && isFinite(e.se) && e.se > 0 && (!e.sub || e.sub.toLowerCase() === g.outcome.toLowerCase() || g.outcome === 'Primary outcome'));
+      let poolStats = null;
       if (matchData.length >= 2) {
          const d = matchData.map(e=>({y:e.es,se:e.se,w:1/(e.se*e.se)}));
          poolStats = poolGroup(d, document.getElementById('ma-model')?document.getElementById('ma-model').value:'random');
       }
+      const prompt = `Assess GRADE certainty of evidence for outcome "${g.outcome}".\nMeta-analysis: ${poolStats?`I2=${poolStats.I2.toFixed(1)}%, Pooled=${poolStats.pooled.toFixed(2)} [95% CI ${poolStats.lo.toFixed(2)}, ${poolStats.hi.toFixed(2)}], Studies=${poolStats.n}`:'No pooled data'}\nIncluded studies: ${inc.length}\n${robSummary}\nProvide judgments for downgrade/upgrade domains. Return ONLY JSON: {"start":"high|low","rob":0|1|2,"incons":0|1|2,"indirect":0|1|2,"imprec":0|1|2,"pubbias":0|1|2,"large":0|1,"doseresp":0|1,"confound":0|1}`;
+      try {
+        const res = parseJSON(await LLM(prompt, 500, ST.agent.advModel));
+        Object.assign(g, res);
+      } catch(e) {}
     }
-    
-    let hasRCTs = false;
-    inc.forEach(r => { if(r.quality && r.quality.tool && (r.quality.tool.includes('RoB 2') || r.quality.tool.includes('JBI'))) hasRCTs = true; });
-    g.start = hasRCTs ? 'high' : 'low';
-    g.rob = robDowngrade;
-    
-    if (poolStats) {
-      if (poolStats.I2 > 75) g.incons = 2; else if (poolStats.I2 > 50) g.incons = 1; else g.incons = 0;
-      const measure = ST.project.measure || 'or';
-      const crossesNull = (poolStats.lo < 0 && poolStats.hi > 0);
-      const wideCI = Math.abs(poolStats.hi - poolStats.lo) > (measure === 'md' ? 5 : 1.0);
-      if (crossesNull && wideCI) g.imprec = 2; else if (crossesNull || wideCI) g.imprec = 1; else g.imprec = 0;
-      g.pubbias = poolStats.n > 10 ? 1 : 0;
-      if (g.start === 'low' && Math.abs(poolStats.pooled) > (measure === 'md' ? 2 : 0.693)) g.large = 1; else g.large = 0;
-    } else {
-      g.incons = 0; g.imprec = 0; g.pubbias = 0; g.large = 0;
-    }
-    g.indirect = 0; g.doseresp = 0; g.confound = 0;
-  });
+    agentBusy(false);
+  } else {
+    let highRob = 0, totalRob = 0;
+    inc.forEach(r => {
+      if(r.quality && r.quality.overall) {
+        totalRob++;
+        if(r.quality.overall === 'high') highRob++;
+      }
+    });
+    const robDowngrade = (totalRob > 0 && (highRob / totalRob) > 0.6) ? 2 : (totalRob > 0 && (highRob / totalRob) > 0.3) ? 1 : 0;
+
+    ST.grade.forEach(g => {
+      let poolStats = null;
+      if (g.outcome) {
+        const matchData = ST.effects.filter(e => isFinite(e.es) && isFinite(e.se) && e.se > 0 && (!e.sub || e.sub.toLowerCase() === g.outcome.toLowerCase() || g.outcome === 'Primary outcome'));
+        if (matchData.length >= 2) {
+           const d = matchData.map(e=>({y:e.es,se:e.se,w:1/(e.se*e.se)}));
+           poolStats = poolGroup(d, document.getElementById('ma-model')?document.getElementById('ma-model').value:'random');
+        }
+      }
+      
+      let hasRCTs = false;
+      inc.forEach(r => { if(r.quality && r.quality.tool && (r.quality.tool.includes('RoB 2') || r.quality.tool.includes('JBI'))) hasRCTs = true; });
+      g.start = hasRCTs ? 'high' : 'low';
+      g.rob = robDowngrade;
+      
+      if (poolStats) {
+        if (poolStats.I2 > 75) g.incons = 2; else if (poolStats.I2 > 50) g.incons = 1; else g.incons = 0;
+        const measure = ST.project.measure || 'or';
+        const crossesNull = (poolStats.lo < 0 && poolStats.hi > 0);
+        const wideCI = Math.abs(poolStats.hi - poolStats.lo) > (measure === 'md' ? 5 : 1.0);
+        if (crossesNull && wideCI) g.imprec = 2; else if (crossesNull || wideCI) g.imprec = 1; else g.imprec = 0;
+        g.pubbias = poolStats.n > 10 ? 1 : 0;
+        if (g.start === 'low' && Math.abs(poolStats.pooled) > (measure === 'md' ? 2 : 0.693)) g.large = 1; else g.large = 0;
+      } else {
+        g.incons = 0; g.imprec = 0; g.pubbias = 0; g.large = 0;
+      }
+      g.indirect = 0; g.doseresp = 0; g.confound = 0;
+    });
+  }
   
-  save(); renderGrade(); toast('Auto-GRADE calculated based on RoB and Meta-analysis! Review manually.','ok');
+  save(); renderGrade(); toast(`Auto-GRADE calculated using ${mode==='ai'?'Viveka AI':'local heuristics'}! Review manually.`,'ok');
 }
 
 function renderGrade(){
@@ -4184,7 +4255,11 @@ function renderGrade(){
     '<h1>\u25c6 GRADE</h1>'+
     '<p>Rate the certainty of evidence for each outcome. Start High (RCTs) or Low (observational), then rate down for the five concerns or up for the three strengthening factors. The level updates automatically.</p></div>'+
   '<div class="banner info"><span class="bi">\u24d8</span><div>For each downgrade domain choose 0 (no concern), \u22121 (serious) or \u22122 (very serious). Upgrade factors apply mainly to observational evidence. This produces a transparent, editable Summary-of-Findings grade \u2014 you remain the judge.</div></div>'+
-  '<div style="margin-bottom:14px"><button class="btn flow sm" onclick="autoGradeAll()">\u27ff Auto-GRADE (Heuristic)</button> <span class="muted" style="font-size:12px;margin-left:8px">Calculates certainty automatically from Risk of Bias matrices and Meta-analysis I\u00b2 / CI spread.</span></div>'+
+  '<div style="margin-bottom:14px">'+
+    '<button class="btn flow sm" onclick="autoGradeAll(\'ai\')">\u2728 Auto-GRADE (Viveka AI - uses credits)</button> '+
+    '<button class="btn gh sm" onclick="autoGradeAll(\'heuristic\')">\u2699 Auto-GRADE (Local Heuristic - free)</button> '+
+    '<span class="muted" style="font-size:12px;margin-left:8px">Calculates certainty from Meta-analysis results and RoB matrix.</span>'+
+  '</div>'+
   ST.grade.map((g,i)=>gradeCard(g,i,lvlCol)).join('')+
   '<div class="row"><button class="btn gh sm" onclick="addGradeRow()">+ Add outcome</button>'+
     '<span class="spacer"></span><button class="btn" onclick="ASRMA.go(\'report\')">Continue to report \u2192</button></div>';
