@@ -2964,9 +2964,11 @@ Return ONLY JSON with exactly these keys: ${JSON.stringify(fields.map(f=>f.k))}
 Each value a short string. For "effect", give the headline result with CI if present.`,900,ST.agent.advModel));
   r.extract=res;save();return r;
 }
+function hasFullTextContent(r){const ft=r.ft||{};return !!(ft.pdfText||r.fullText||r.abstract);}
+function extractionRefs(){return ST.refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include'&&hasFullTextContent(r));}
 async function extractAll(){
-  const list=ST.refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include');
-  if(!list.length){toast('No included studies','err');return;}
+  const list=extractionRefs();
+  if(!list.length){toast('No included studies with full text available','err');return;}
   if(window.BK&&BK.isServer&&BK.isServer()&&serverAIReady()&&ST.id){await serverExtractAllJob(list);return;}
   agentBusy(true);const bar=document.getElementById('ext-bar');let done=0,ok=0,fail=0,lastErr='';
   for(const r of list){try{await extractOne(r.id);ok++;}catch(e){fail++;lastErr=e.message||'extraction failed';if(e.status===402||/credits|configured|provider/i.test(lastErr))break;}
@@ -2976,8 +2978,27 @@ async function extractAll(){
   if(fail)toast('Extracted '+ok+' studies. Stopped: '+lastErr,'err');
   else toast('Extracted '+ok+' studies','ok');
 }
+async function resetExtraction(){
+  if(EXTRACT_JOB_ID){toast('Stop the running extraction job first','err');return;}
+  const list=extractionRefs().filter(r=>r.extract);
+  if(!list.length){toast('No extraction data to reset','err');return;}
+  if(!confirm('Reset extraction data for '+list.length+' studies? This will clear all extracted fields so you can re-run extraction from scratch.'))return;
+  if(window.BK&&BK.isServer&&BK.isServer()&&ST.id){
+    try{
+      const res=await BK.api('POST','/api/projects/'+ST.id+'/reset-extraction',{},30000);
+      toast('Reset extraction for '+(res.reset||0)+' studies','ok');
+      await refreshServerProjectPhase('extract');
+    }catch(e){toast(e.message||'Reset failed','err');}
+    return;
+  }
+  list.forEach(r=>{delete r.extract;delete r.extractEvidence;delete r.extractWarnings;delete r.extractEffectCandidates;delete r.extractMeta;});
+  saveNow();renderExtract();renderSpine();toast('Reset extraction for '+list.length+' studies','ok');
+}
 function renderExtract(){
   const fields=getFields();
+  const allInc=ST.refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include');
+  const withText=allInc.filter(r=>hasFullTextContent(r));
+  const noText=allInc.length-withText.length;
   document.getElementById('pane-extract').innerHTML=`
   <div class="pane-h"><div class="eyebrow">Phase 08 — capture the data</div>
     <h1>⊞ Viveka Extractor</h1>
@@ -2988,22 +3009,24 @@ function renderExtract(){
     <button class="btn gh sm" id="ext-stop-btn" onclick="cancelExtractJob()" disabled>Stop server job</button>
     <span class="muted" id="ext-job-status" style="font-size:12px">Server jobs keep running outside the browser tab.</span>
     <button class="btn gh sm" onclick="addField()">+ Add field</button>
+    <button class="btn gh sm" style="color:var(--exc)" onclick="resetExtraction()" title="Clear all extracted data and start fresh">↺ Reset extraction</button>
     <span class="spacer"></span>
     <button class="btn gh sm" onclick="exportExtractCSV()">⬇ Export CSV</button>
   </div>
+  ${noText?`<div class="banner" style="margin-bottom:14px;background:var(--maybe-w);border-color:var(--maybe)"><span class="bi" style="color:var(--maybe)">⚠</span><div><b>${noText} included ${noText===1?'study has':'studies have'} no full text attached.</b> Only ${withText.length} ${withText.length===1?'study':'studies'} with full text (PDF, pasted text, or fetched text) will be extracted. Go to Full Text phase to attach or fetch missing articles.</div></div>`:''}
   <div class="banner info" style="margin-bottom:14px"><span class="bi">i</span><div>Manual editing is free. On the hosted app, Viveka Extractor uses server-side AI credits because it performs deeper full-text reasoning and validation.</div></div>
   <div class="card" style="overflow-x:auto"><div id="ext-table"></div></div>`;
   renderExtTable();
 }
 function renderExtTable(){
   const fields=getFields();
-  const list=ST.refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include');
+  const list=extractionRefs();
   const el=document.getElementById('ext-table');if(!el)return;
-  if(!list.length){el.innerHTML='<div class="empty"><div class="ico">⊞</div><h3>No included studies yet</h3><div>Include studies at full text first.</div></div>';return;}
+  if(!list.length){el.innerHTML='<div class="empty"><div class="ico">⊞</div><h3>No included studies with full text</h3><div>Include studies at full-text screening and attach or fetch their full text first.</div></div>';return;}
   el.innerHTML=`<table class="tbl"><thead><tr><th style="min-width:180px">Study</th>
     ${fields.map(f=>`<th style="min-width:150px">${esc(f.label)} <button class="vbtn exc" style="width:18px;height:18px;font-size:11px;border:none" onclick="rmField('${f.k}')">×</button></th>`).join('')}</tr></thead><tbody>
-    ${list.map(r=>{const e=r.extract||{};
-      return`<tr><td><b>${esc((r.authors||'').split(';')[0]||r.title.slice(0,30))} ${esc(r.year||'')}</b><div class="muted">${esc(r.title.slice(0,60))}</div><button class="btn gh sm" style="margin-top:8px" onclick="extractOne('${r.id}').then(()=>renderExtract()).catch(e=>toast(e.message,'err'))">Extract this</button>${r.extractMeta?`<div class="muted" style="font-size:11px;margin-top:6px">${esc(r.extractMeta.model||'Viveka')} · ${r.extractMeta.creditsUsed||0} credits · ${r.extractMeta.overallConfidence||0}% confidence</div>`:''}</td>
+    ${list.map(r=>{const e=r.extract||{};const ft=r.ft||{};const textSrc=ft.pdfText?'PDF/text ('+Math.round(ft.pdfText.length/1000)+'k chars)':r.fullText?'full text':'abstract only';
+      return`<tr><td><b>${esc((r.authors||'').split(';')[0]||r.title.slice(0,30))} ${esc(r.year||'')}</b><div class="muted">${esc(r.title.slice(0,60))}</div><div style="font-size:11px;margin-top:4px;color:${ft.pdfText?'var(--flow)':'var(--maybe)'}">${esc(textSrc)}</div><button class="btn gh sm" style="margin-top:8px" onclick="extractOne('${r.id}').then(()=>renderExtract()).catch(e=>toast(e.message,'err'))">Extract this</button>${r.extractMeta?`<div class="muted" style="font-size:11px;margin-top:6px">${esc(r.extractMeta.model||'Viveka')} · ${r.extractMeta.creditsUsed||0} credits · ${r.extractMeta.overallConfidence||0}% confidence</div>`:''}</td>
       ${fields.map(f=>{const ev=(r.extractEvidence||{})[f.k]||{};return`<td><textarea oninput="setCell('${r.id}','${f.k}',this.value)" style="min-height:36px;font-size:11.5px">${esc(e[f.k]||'')}</textarea>${ev.quote?`<details style="margin-top:6px"><summary class="muted" style="cursor:pointer;font-size:11px">evidence ${ev.confidence?`· ${Number(ev.confidence).toFixed(0)}%`:''}</summary><div class="muted" style="font-size:11px;line-height:1.45;margin-top:4px">${esc(ev.quote)}</div></details>`:''}</td>`}).join('')}</tr>${((r.extractWarnings&&r.extractWarnings.length)||(r.extractEffectCandidates&&r.extractEffectCandidates.length))?`<tr><td></td><td colspan="${fields.length}"><div class="muted" style="font-size:11.5px">${r.extractWarnings&&r.extractWarnings.length?`<b>Warnings:</b> ${esc(r.extractWarnings.join('; '))}`:''}${r.extractEffectCandidates&&r.extractEffectCandidates.length?`<br><b>Effect candidates:</b> ${esc(r.extractEffectCandidates.map(x=>[x.outcome,x.value].filter(Boolean).join(': ')).join(' | '))}`:''}</div></td></tr>`:''}`;}).join('')}
     </tbody></table>`;
 }
@@ -3012,13 +3035,13 @@ function addField(){const label=prompt('New field name (e.g. "Effect size — SM
   const k='f_'+uid().slice(0,5);ST.project.extractFields=getFields().concat([{k,label}]);save();renderExtract();}
 function rmField(k){ST.project.extractFields=getFields().filter(f=>f.k!==k);save();renderExtract();}
 function exportExtractCSV(){
-  const fields=getFields();const list=ST.refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include');
+  const fields=getFields();const list=extractionRefs();
   const head=['Study','Year','DOI'].concat(fields.map(f=>f.label));
   const rows=list.map(r=>{const e=r.extract||{};
     return[(r.authors||'').split(';')[0],r.year,r.doi].concat(fields.map(f=>e[f.k]||''));});
   downloadCSV([head].concat(rows),'extraction.csv');
 }
-window.extractAll=extractAll;window.cancelExtractJob=cancelExtractJob;window.setCell=setCell;window.addField=addField;window.rmField=rmField;window.exportExtractCSV=exportExtractCSV;
+window.extractAll=extractAll;window.cancelExtractJob=cancelExtractJob;window.setCell=setCell;window.addField=addField;window.rmField=rmField;window.exportExtractCSV=exportExtractCSV;window.resetExtraction=resetExtraction;
 function downloadCSV(rows,name){
   const csv=rows.map(r=>r.map(c=>'"'+String(c==null?'':c).replace(/"/g,'""')+'"').join(',')).join('\n');
   const b=new Blob([csv],{type:'text/csv'});const a=document.createElement('a');

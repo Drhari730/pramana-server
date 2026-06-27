@@ -1225,7 +1225,7 @@ async function runExtractAllJob(job) {
   const data = project.data || {};
   const refs = Array.isArray(data.refs) ? data.refs : [];
   const wanted = Array.isArray(payload.refIds) && payload.refIds.length ? new Set(payload.refIds) : null;
-  const list = refs.filter(r => r && !r.dup && (!wanted || wanted.has(r.id)) && r.ft && r.ft.decision === 'include');
+  const list = refs.filter(r => r && !r.dup && (!wanted || wanted.has(r.id)) && r.ft && r.ft.decision === 'include' && (r.ft.pdfText || r.fullText || r.abstract));
   const fields = payload.fields || extractionFields(data);
   const model = payload.model;
   let ok = 0, failed = 0;
@@ -1305,6 +1305,33 @@ app.post('/api/jobs/:id/cancel', requireAuth(async (req, res) => {
   if (row.user_id !== req.user.id && !(await memberRole(row.project_id, req.user.id))) return res.status(403).json({ error: 'Not allowed' });
   const updated = await updateJob(req.params.id, { cancel_requested: true, status: row.status === 'queued' ? 'cancelled' : row.status });
   res.json({ ok: true, job: publicJob(updated) });
+}));
+
+/* --- Reset extraction data --- */
+app.post('/api/projects/:id/reset-extraction', requireAuth(async (req, res) => {
+  const role = await memberRole(req.params.id, req.user.id);
+  if (!role) return res.status(403).json({ error: 'Not a member' });
+  const project = await projectDataForMember(req.params.id, req.user.id);
+  if (!project) return res.status(404).json({ error: 'Project not found' });
+  const data = project.data || {};
+  const refs = Array.isArray(data.refs) ? data.refs : [];
+  let count = 0;
+  refs.forEach(r => {
+    if (r && !r.dup && r.ft && r.ft.decision === 'include' && r.extract) {
+      delete r.extract;
+      delete r.extractEvidence;
+      delete r.extractWarnings;
+      delete r.extractEffectCandidates;
+      delete r.extractMeta;
+      count++;
+    }
+  });
+  if (count > 0) {
+    const version = await saveProjectDataDirect(req.params.id, data, req.user.id);
+    res.json({ ok: true, reset: count, version });
+  } else {
+    res.json({ ok: true, reset: 0 });
+  }
 }));
 
 /* ---------------- ADMIN: credits and usage ---------------- */
