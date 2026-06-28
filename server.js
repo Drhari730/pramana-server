@@ -591,9 +591,6 @@ function escapeHtml(value) {
 function transactionalFrom() {
   return process.env.SMTP_FROM || 'Pramana AI <pramana.ai.srma@gmail.com>';
 }
-function publicAssetUrl(pathname) {
-  return String(APP_URL || '').replace(/\/+$/, '') + pathname;
-}
 async function withTimeout(label, promise, ms) {
   let timer;
   try {
@@ -657,7 +654,6 @@ async function sendTransactionalEmail({ to, subject, html }) {
   return { sent: true };
 }
 function emailFrame({ pretitle, title, body, ctaLabel, ctaLink, note }) {
-  const logo = publicAssetUrl('/pramana-mark.svg');
   return `<!doctype html>
   <html><body style="margin:0;padding:0;background:#f4f7fb;font-family:Segoe UI,Arial,sans-serif;color:#10213a">
     <div style="display:none;max-height:0;overflow:hidden;color:#f4f7fb">${escapeHtml(title)} - Pramana Evidence Synthesis</div>
@@ -665,9 +661,7 @@ function emailFrame({ pretitle, title, body, ctaLabel, ctaLink, note }) {
       <div style="background:#ffffff;border:1px solid #d9e3f1;border-radius:18px;overflow:hidden;box-shadow:0 14px 40px rgba(16,33,58,.08)">
         <div style="padding:22px 24px;background:linear-gradient(135deg,#0f8b8d,#3657d6);color:#fff">
           <div style="display:flex;align-items:center;gap:12px">
-            <div style="width:48px;height:48px;border-radius:14px;background:rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;overflow:hidden">
-              <img src="${logo}" width="48" height="48" alt="Pramana" style="display:block;width:48px;height:48px;border:0">
-            </div>
+            <div style="width:48px;height:48px;border-radius:14px;background:#ffffff;color:#3657d6;display:flex;align-items:center;justify-content:center;font-size:26px;font-weight:900;line-height:48px;text-align:center;box-shadow:0 8px 20px rgba(16,33,58,.16)">P</div>
             <div>
               <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;opacity:.88">${escapeHtml(pretitle || 'Pramana Evidence Synthesis')}</div>
               <div style="font-size:24px;font-weight:800;line-height:1.15;margin-top:2px">${escapeHtml(title)}</div>
@@ -681,7 +675,6 @@ function emailFrame({ pretitle, title, body, ctaLabel, ctaLink, note }) {
           ${note ? `<div style="margin-top:18px;font-size:12px;line-height:1.6;color:#60748a">${note}</div>` : ''}
           <div style="border-top:1px solid #e2eaf5;margin-top:22px;padding-top:14px;font-size:12px;line-height:1.6;color:#60748a">
             <b style="color:#10213a">Pramāṇa - Evidence Synthesis</b><br>
-            Developed by Dr G. Hari Prakash<br>
             Contact: <a href="mailto:pramana.ai.srma@gmail.com" style="color:#3657d6;text-decoration:none">pramana.ai.srma@gmail.com</a><br>
             Proudly Made in India
           </div>
