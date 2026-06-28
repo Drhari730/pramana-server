@@ -585,6 +585,15 @@ function parseFromHeader(raw) {
   if (m) return { name: m[1].trim().replace(/^"|"$/g, ''), email: m[2].trim() };
   return { name: 'Pramana', email: s };
 }
+function escapeHtml(value) {
+  return String(value == null ? '' : value).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+function transactionalFrom() {
+  return process.env.SMTP_FROM || 'Pramana AI <pramana.ai.srma@gmail.com>';
+}
+function publicAssetUrl(pathname) {
+  return String(APP_URL || '').replace(/\/+$/, '') + pathname;
+}
 async function withTimeout(label, promise, ms) {
   let timer;
   try {
@@ -617,7 +626,7 @@ function queueEmail(label, recipient, fn) {
   }, 0);
 }
 async function sendViaBrevoApi({ to, subject, html }) {
-  const sender = parseFromHeader(process.env.SMTP_FROM);
+  const sender = parseFromHeader(transactionalFrom());
   const res = await fetch('https://api.brevo.com/v3/smtp/email', {
     method: 'POST',
     headers: {
@@ -638,25 +647,44 @@ async function sendViaBrevoApi({ to, subject, html }) {
   }
   return data;
 }
+async function sendTransactionalEmail({ to, subject, html }) {
+  if (apiEmailConfigured()) await sendViaBrevoApi({ to, subject, html });
+  else {
+    const m = getMailer();
+    if (!m) return { sent: false, reason: 'email-not-configured' };
+    await m.sendMail({ from: transactionalFrom(), to, subject, html });
+  }
+  return { sent: true };
+}
 function emailFrame({ pretitle, title, body, ctaLabel, ctaLink, note }) {
+  const logo = publicAssetUrl('/pramana-mark.svg');
   return `<!doctype html>
   <html><body style="margin:0;padding:0;background:#f4f7fb;font-family:Segoe UI,Arial,sans-serif;color:#10213a">
+    <div style="display:none;max-height:0;overflow:hidden;color:#f4f7fb">${escapeHtml(title)} - Pramana Evidence Synthesis</div>
     <div style="max-width:640px;margin:0 auto;padding:28px 16px">
       <div style="background:#ffffff;border:1px solid #d9e3f1;border-radius:18px;overflow:hidden;box-shadow:0 14px 40px rgba(16,33,58,.08)">
         <div style="padding:22px 24px;background:linear-gradient(135deg,#0f8b8d,#3657d6);color:#fff">
           <div style="display:flex;align-items:center;gap:12px">
-            <div style="width:42px;height:42px;border-radius:12px;background:rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:700">P</div>
+            <div style="width:48px;height:48px;border-radius:14px;background:rgba(255,255,255,.18);display:flex;align-items:center;justify-content:center;overflow:hidden">
+              <img src="${logo}" width="48" height="48" alt="Pramana" style="display:block;width:48px;height:48px;border:0">
+            </div>
             <div>
-              <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;opacity:.82">${pretitle}</div>
-              <div style="font-size:24px;font-weight:800;line-height:1.15;margin-top:2px">${title}</div>
+              <div style="font-size:11px;letter-spacing:.12em;text-transform:uppercase;opacity:.88">${escapeHtml(pretitle || 'Pramana Evidence Synthesis')}</div>
+              <div style="font-size:24px;font-weight:800;line-height:1.15;margin-top:2px">${escapeHtml(title)}</div>
             </div>
           </div>
         </div>
         <div style="padding:24px">
           <div style="font-size:15px;line-height:1.65;color:#24384f">${body}</div>
-          ${ctaLink ? `<div style="margin:22px 0 10px"><a href="${ctaLink}" style="display:inline-block;background:#3657d6;color:#fff;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:700">${ctaLabel}</a></div>
-          <div style="font-size:12px;line-height:1.5;color:#60748a;word-break:break-all">${ctaLink}</div>` : ''}
+          ${ctaLink ? `<div style="margin:22px 0 10px"><a href="${escapeHtml(ctaLink)}" style="display:inline-block;background:#3657d6;color:#fff;text-decoration:none;padding:12px 18px;border-radius:10px;font-weight:700">${escapeHtml(ctaLabel || 'Open Pramana')}</a></div>
+          <div style="font-size:12px;line-height:1.5;color:#60748a;word-break:break-all">${escapeHtml(ctaLink)}</div>` : ''}
           ${note ? `<div style="margin-top:18px;font-size:12px;line-height:1.6;color:#60748a">${note}</div>` : ''}
+          <div style="border-top:1px solid #e2eaf5;margin-top:22px;padding-top:14px;font-size:12px;line-height:1.6;color:#60748a">
+            <b style="color:#10213a">Pramāṇa - Evidence Synthesis</b><br>
+            Developed by Dr G. Hari Prakash<br>
+            Contact: <a href="mailto:pramana.ai.srma@gmail.com" style="color:#3657d6;text-decoration:none">pramana.ai.srma@gmail.com</a><br>
+            Proudly Made in India
+          </div>
         </div>
       </div>
     </div>
@@ -666,59 +694,57 @@ async function sendInviteEmail(to, project, link, inviter) {
   const subject = `${inviter} invited you to a Pramana review: ${project}`;
   const html = emailFrame({
     pretitle: 'Pramana Evidence Synthesis',
-    title: 'You have been invited',
-    body: `<p>${inviter} has invited you to collaborate on the systematic review <b>${project}</b>.</p>
+    title: 'Review invitation',
+    body: `<p>Hello,</p>
+           <p><b>${escapeHtml(inviter)}</b> has invited you to collaborate on the review <b>${escapeHtml(project)}</b>.</p>
            <p>Open the shared workspace below to join the review, screen studies, and work with the same live data.</p>`,
     ctaLabel: 'Open the review',
     ctaLink: link,
-    note: 'If the button does not open, paste the link above into your browser.'
+    note: 'This is a transactional invitation email from Pramana. If the button does not open, paste the link above into your browser.'
   });
-  if (apiEmailConfigured()) await sendViaBrevoApi({ to, subject, html });
-  else {
-    const m = getMailer();
-    if (!m) return { sent: false, reason: 'email-not-configured' };
-    await m.sendMail({ from: process.env.SMTP_FROM || 'Pramana <no-reply@pramana.app>', to, subject, html });
-  }
-  return { sent: true };
+  return sendTransactionalEmail({ to, subject, html });
 }
 async function sendResetEmail(to, link) {
   const subject = 'Reset your Pramana password';
   const html = emailFrame({
     pretitle: 'Pramana Evidence Synthesis',
     title: 'Reset your password',
-    body: `<p>You asked to reset your Pramana password.</p>
+    body: `<p>Hello,</p>
+           <p>You asked to reset your Pramana password.</p>
            <p>This link will let you choose a new password and expires in 1 hour.</p>`,
     ctaLabel: 'Choose a new password',
     ctaLink: link,
-    note: 'If you did not request this, you can ignore this email.'
+    note: 'If you did not request this, you can ignore this email. Your current password will remain unchanged unless this link is used.'
   });
-  if (apiEmailConfigured()) await sendViaBrevoApi({ to, subject, html });
-  else {
-    const m = getMailer();
-    if (!m) return { sent: false, reason: 'email-not-configured' };
-    await m.sendMail({ from: process.env.SMTP_FROM || 'Pramana <no-reply@pramana.app>', to, subject, html });
-  }
-  return { sent: true };
+  return sendTransactionalEmail({ to, subject, html });
 }
 async function sendWelcomeEmail(to, name) {
   const subject = 'Welcome to Pramana';
   const html = emailFrame({
     pretitle: 'Pramana Evidence Synthesis',
     title: 'Your account is ready',
-    body: `<p>Hello ${name || 'there'},</p>
+    body: `<p>Hello ${escapeHtml(name || 'there')},</p>
            <p>Your Pramana account has been created successfully.</p>
            <p>You can now create reviews, invite collaborators, screen studies, extract data, and run meta-analysis from the same workspace.</p>`,
     ctaLabel: 'Open Pramana',
     ctaLink: APP_URL,
     note: 'This email confirms that account creation was successful.'
   });
-  if (apiEmailConfigured()) await sendViaBrevoApi({ to, subject, html });
-  else {
-    const m = getMailer();
-    if (!m) return { sent: false, reason: 'email-not-configured' };
-    await m.sendMail({ from: process.env.SMTP_FROM || 'Pramana <no-reply@pramana.app>', to, subject, html });
-  }
-  return { sent: true };
+  return sendTransactionalEmail({ to, subject, html });
+}
+async function sendPasswordChangedEmail(to, name) {
+  const subject = 'Your Pramana password was changed';
+  const html = emailFrame({
+    pretitle: 'Pramana Account Security',
+    title: 'Password changed',
+    body: `<p>Hello ${escapeHtml(name || 'there')},</p>
+           <p>Your Pramana password was changed successfully.</p>
+           <p>If this was you, no action is needed. If you did not make this change, reset your password immediately and contact support.</p>`,
+    ctaLabel: 'Open Pramana',
+    ctaLink: APP_URL,
+    note: 'This is a security notification for your Pramana account.'
+  });
+  return sendTransactionalEmail({ to, subject, html });
 }
 
 /* ---------------- simple in-memory rate limiter ---------------- */
@@ -833,6 +859,9 @@ app.post('/api/auth/reset', async (req, res) => {
   // log them in immediately
   const urows = await db.q('SELECT id,email,name,ai_credits FROM users WHERE id=$1', [r.user_id]);
   setAuthCookie(res, urows[0]);
+  if (urows[0] && emailConfigured()) {
+    queueEmail('Password changed email', urows[0].email, () => sendPasswordChangedEmail(urows[0].email, urows[0].name));
+  }
   res.json({ ok: true, user: publicUser(urows[0]) });
 });
 
