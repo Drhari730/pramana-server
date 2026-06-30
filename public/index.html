@@ -1333,6 +1333,25 @@ window.buildBoolean=buildBoolean;window.copyBool=copyBool;
 /* ===================== IMPORT PANE ===================== */
 function renderImport(){
   const n=ST.refs.length;
+  const files = {};
+  ST.refs.forEach(r => {
+    if(!files[r.source]) files[r.source] = { count: 0, db: r.db || 'Unknown' };
+    files[r.source].count++;
+  });
+  const fileRows = Object.entries(files).map(([src, info]) => {
+    const dbOptions = ['Unknown', 'PubMed', 'Scopus', 'Web of Science', 'Embase', 'Cochrane', 'Ovid', 'Other'].map(db => 
+      `<option value="${db}" ${info.db === db ? 'selected' : ''}>${db}</option>`
+    ).join('');
+    return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--line);background:#fff">
+      <div style="flex:1;font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(src)}">${esc(src)} <span class="muted" style="font-weight:400;margin-left:6px">(${info.count} records)</span></div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <select class="inp" style="padding:4px 8px;font-size:12px;height:auto;min-width:120px" onchange="window.updateSourceDb('${esc(src)}', this.value)">${dbOptions}</select>
+        <button class="btn danger gh sm" onclick="window.deleteSource('${esc(src)}')">Delete</button>
+      </div>
+    </div>`;
+  }).join('');
+  const fileListHTML = fileRows ? `<div class="card" style="padding:0;overflow:hidden;border-radius:12px;margin-bottom:16px">${fileRows}</div>` : '';
+
   document.getElementById('pane-import').innerHTML=`
   <div class="pane-h"><div class="eyebrow">Phase 04 — bring it in</div>
     <h1>⇲ Import studies</h1>
@@ -1356,25 +1375,6 @@ function renderImport(){
     <div class="row" style="margin-top:10px"><button class="btn" onclick="ASRMA.importText()">Parse & add</button>
       <button class="btn gh sm" onclick="document.getElementById('paste-in').value=SAMPLE_RIS">Insert sample RIS</button></div>
   </div>
-
-  const files = {};
-  ST.refs.forEach(r => {
-    if(!files[r.source]) files[r.source] = { count: 0, db: r.db || 'Unknown' };
-    files[r.source].count++;
-  });
-  const fileRows = Object.entries(files).map(([src, info]) => {
-    const dbOptions = ['Unknown', 'PubMed', 'Scopus', 'Web of Science', 'Embase', 'Cochrane', 'Ovid', 'Other'].map(db => 
-      `<option value="${db}" ${info.db === db ? 'selected' : ''}>${db}</option>`
-    ).join('');
-    return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--line);background:#fff">
-      <div style="flex:1;font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(src)}">${esc(src)} <span class="muted" style="font-weight:400;margin-left:6px">(${info.count} records)</span></div>
-      <div style="display:flex;align-items:center;gap:12px">
-        <select class="inp" style="padding:4px 8px;font-size:12px;height:auto;min-width:120px" onchange="window.updateSourceDb('${esc(src)}', this.value)">${dbOptions}</select>
-        <button class="btn danger gh sm" onclick="window.deleteSource('${esc(src)}')">Delete</button>
-      </div>
-    </div>`;
-  }).join('');
-  const fileListHTML = fileRows ? `<div class="card" style="padding:0;overflow:hidden;border-radius:12px;margin-bottom:16px">${fileRows}</div>` : '';
 
   ${n?`<div class="tiles">
     <div class="tile flow"><div class="v">${n}</div><div class="k">records imported</div></div>

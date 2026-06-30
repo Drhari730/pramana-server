@@ -1,360 +1,5502 @@
-/* Integration test: runs the real Express app against an in-memory store that
-   emulates just enough Postgres for our queries. No external DB needed. */
-const http = require('http');
-const db = require('./db');
-process.env.GEMINI_API_KEY = '';
-process.env.GOOGLE_AI_API_KEY = '';
-process.env.OPENAI_API_KEY = '';
-process.env.ANTHROPIC_API_KEY = '';
-process.env.DEEPSEEK_API_KEY = '';
-process.env.ZAI_API_KEY = '';
 
-/* ---- tiny in-memory tables ---- */
-const T = { users: [], projects: [], members: [], invites: [], resets: [], usage: [], jobs: [] };
-function clone(o){ return JSON.parse(JSON.stringify(o)); }
 
-/* A hand-written matcher for the exact queries server.js issues.
-   Returns rows (array). Keeps the test honest: if a query isn't handled it throws. */
-async function mockQuery(text, params=[]) {
-  const s = text.replace(/\s+/g,' ').trim();
+/* ============================================================
+   AUTOMATED SRMA — application core
+   Single-file, offline-capable, multi-provider LLM agents.
+   ============================================================ */
 
-  if (s.startsWith('CREATE TABLE') || s.startsWith('CREATE INDEX')) return [];
 
-  // users
-  if (s==='SELECT id,email,name FROM users WHERE id=$1')
-    return T.users.filter(u=>u.id===params[0]).map(u=>({id:u.id,email:u.email,name:u.name}));
-  if (s==='SELECT id,email,name,ai_credits FROM users WHERE id=$1')
-    return T.users.filter(u=>u.id===params[0]).map(u=>({id:u.id,email:u.email,name:u.name,ai_credits:u.ai_credits||0}));
-  if (s==='SELECT id FROM users WHERE email=$1')
-    return T.users.filter(u=>u.email===params[0]).map(u=>({id:u.id}));
-  if (s==='SELECT id,email,name FROM users WHERE email=$1')
-    return T.users.filter(u=>u.email===params[0]).map(u=>({id:u.id,email:u.email,name:u.name}));
-  if (s==='SELECT id,email,name,ai_credits FROM users WHERE email=$1')
-    return T.users.filter(u=>u.email===params[0]).map(u=>({id:u.id,email:u.email,name:u.name,ai_credits:u.ai_credits||0}));
-  if (s==='SELECT id,email,name,password_hash FROM users WHERE email=$1')
-    return T.users.filter(u=>u.email===params[0]).map(u=>clone(u));
-  if (s==='SELECT id,email,name,password_hash,ai_credits FROM users WHERE email=$1')
-    return T.users.filter(u=>u.email===params[0]).map(u=>clone(u));
-  if (s.startsWith('INSERT INTO users')) {
-    const cols = s.match(/\(([^)]+)\) VALUES/)[1].split(',').map(c=>c.trim());
-    const row={ai_credits:50}; cols.forEach((c,i)=>row[c==='password_hash'?'password_hash':c]=params[i]); T.users.push(row); return [];
+/* ===================== STATE ===================== */
+const ST = {
+  project:{title:'',question:'',type:'Systematic Review (PICO)',reviewTypeId:'sr-pico',framework:'PICO',focus:'',registration:'',p:'',i:'',c:'',o:'',inc:'',exc:''},
+  agent:{trained:false,persona:'',glossary:[],rubric:[],synonyms:[],calibration:null,
+         model:'gemini-flash',advModel:'gemini-flash',trainedAt:null},
+  refs:[], team:[], effects:[],
+  prisma:{}, settings:{strictness:'balanced'}
+};
+/* ---- multi-project storage layer ---- */
+const IDX='asrma_index';            // [{id,title,question,updatedAt,counts}]
+const PKEY=id=>'asrma_p_'+id;       // full project blob
+const ACTIVE='asrma_active';        // active project id
+const REVIEW_TYPE_GROUPS=[
+  {label:'Intervention reviews',items:[
+    {id:'sr-pico',label:'Systematic Review (PICO)',framework:'PICO',legacy:'Intervention review',
+      fields:{p:'Population',i:'Intervention',c:'Comparator',o:'Outcome'},
+      placeholders:{p:'Adults with hypertension in LMICs',i:'mHealth or app-based self-management',c:'Usual care or no digital support',o:'Systolic BP, diastolic BP, adherence'},
+      focusLabel:'Primary outcome / focus',focusPlaceholder:'e.g. HbA1c reduction, blood-pressure control, quality of life',
+      note:'Use PRISMA 2020 with intervention-style PICO eligibility.'},
+    {id:'srma-pico',label:'Systematic Review + Meta-analysis (PICO)',framework:'PICO',
+      fields:{p:'Population',i:'Intervention',c:'Comparator',o:'Outcome'},
+      placeholders:{p:'Adults with hypertension in LMICs',i:'mHealth or app-based self-management',c:'Usual care or no digital support',o:'Continuous or dichotomous outcomes suitable for pooling'},
+      focusLabel:'Primary pooled outcome',focusPlaceholder:'e.g. mean change in systolic BP, risk ratio for control',
+      note:'Use PRISMA 2020 and plan effect sizes, heterogeneity, and subgroup analyses.'},
+    {id:'rapid-pico',label:'Rapid Review (PICO)',framework:'PICO',
+      fields:{p:'Population',i:'Intervention',c:'Comparator',o:'Outcome'},
+      placeholders:{p:'Target population',i:'Index intervention',c:'Comparator',o:'Most decision-critical outcomes'},
+      focusLabel:'Decision focus',focusPlaceholder:'e.g. interventions needed for service planning within 3 months',
+      note:'Use a narrowed PICO and explicitly justify streamlining choices.'}
+  ]},
+  {label:'Prevalence / epidemiology',items:[
+    {id:'prev-cocopop',label:'Prevalence / Incidence Review (CoCoPop)',framework:'CoCoPop',
+      fields:{p:'Condition',i:'Context',c:'Population',o:'Prevalence / incidence outcome'},
+      placeholders:{p:'Hypertension or uncontrolled hypertension',i:'Primary care, community, or hospital settings',c:'Adults in LMICs',o:'Prevalence, incidence, awareness, control'},
+      focusLabel:'Primary epidemiologic estimate',focusPlaceholder:'e.g. prevalence of uncontrolled hypertension',
+      note:'Use JBI prevalence review logic with CoCoPop framing.'},
+    {id:'burden-cocopop',label:'Disease Burden Review (CoCoPop)',framework:'CoCoPop',
+      fields:{p:'Condition',i:'Context',c:'Population',o:'Burden outcome'},
+      placeholders:{p:'Stroke, diabetes, hypertension',i:'National or regional health systems',c:'Adults or children in target region',o:'Incidence, mortality, DALYs, utilisation'},
+      focusLabel:'Primary burden metric',focusPlaceholder:'e.g. DALYs, hospitalisation rate, annual mortality',
+      note:'Use CoCoPop and keep outcomes centered on burden estimates.'}
+  ]},
+  {label:'Qualitative / mixed methods',items:[
+    {id:'qual-pico',label:'Qualitative Synthesis (PICo)',framework:'PICo',
+      fields:{p:'Population',i:'Phenomenon of interest',c:'Context',o:'Themes / synthesis output'},
+      placeholders:{p:'Patients, carers, clinicians',i:'Experience of using mHealth for hypertension care',c:'Primary care, community, rural LMIC settings',o:'Barriers, facilitators, perceived value'},
+      focusLabel:'Synthesis focus',focusPlaceholder:'e.g. lived experience, implementation barriers, user acceptability',
+      note:'Use qualitative review logic and train the reviewer for relevance rather than treatment effect.'},
+    {id:'mixed-pico',label:'Mixed-Methods Review (PICO + PICo)',framework:'PICO + PICo',
+      fields:{p:'Population',i:'Intervention / phenomenon',c:'Comparator / context',o:'Outcomes + themes'},
+      placeholders:{p:'Target population',i:'Intervention plus experiential component',c:'Comparator or implementation context',o:'Quantitative outcomes and qualitative themes'},
+      focusLabel:'Integration focus',focusPlaceholder:'e.g. effectiveness plus implementation experience',
+      note:'Keep quantitative and qualitative eligibility aligned from the start.'}
+  ]},
+  {label:'Diagnostic / prognostic',items:[
+    {id:'dta-pird',label:'Diagnostic Test Accuracy (PIRD)',framework:'PIRD',
+      fields:{p:'Population',i:'Index test',c:'Reference standard',o:'Diagnostic accuracy outcome'},
+      placeholders:{p:'Adults being screened for diabetic retinopathy',i:'AI-enabled retinal image test',c:'Ophthalmologist assessment or gold standard',o:'Sensitivity, specificity, AUC'},
+      focusLabel:'Primary diagnostic metric',focusPlaceholder:'e.g. sensitivity and specificity',
+      note:'Use PRISMA-DTA / Cochrane DTA logic with explicit index and reference standard.'},
+    {id:'prog-picot',label:'Prognostic / Prediction Review (PICOT)',framework:'PICOT',
+      fields:{p:'Population',i:'Index prognostic factor / model',c:'Comparator',o:'Outcome / time horizon'},
+      placeholders:{p:'Adults with sepsis in ICU',i:'Risk score or prognostic biomarker',c:'Alternative model or standard care',o:'Mortality at 30 days / 1 year'},
+      focusLabel:'Primary prognostic endpoint',focusPlaceholder:'e.g. mortality prediction at 30 days',
+      note:'Keep time horizon explicit and assess model calibration and discrimination.'}
+  ]},
+  {label:'Etiology / risk factors',items:[
+    {id:'eti-peo',label:'Etiology / Risk Factors (PEO)',framework:'PEO',
+      fields:{p:'Population',i:'Exposure',c:'Context / comparator',o:'Outcome'},
+      placeholders:{p:'Adults with or without disease',i:'Lifestyle, environmental, or clinical exposure',c:'Healthcare or community setting',o:'Disease occurrence or adverse event'},
+      focusLabel:'Primary association outcome',focusPlaceholder:'e.g. odds ratio for disease risk',
+      note:'Use exposure-oriented logic and keep confounding concerns visible.'},
+    {id:'obs-peo',label:'Observational / Association Studies (PEO)',framework:'PEO',
+      fields:{p:'Population',i:'Exposure',c:'Context / comparator',o:'Outcome'},
+      placeholders:{p:'Defined cohort or case-control population',i:'Exposure of interest',c:'Setting or comparator group',o:'Association measure or event rate'},
+      focusLabel:'Primary association metric',focusPlaceholder:'e.g. hazard ratio, odds ratio, incidence rate ratio',
+      note:'Prefer explicit comparator/context rules for observational literature.'}
+  ]},
+  {label:'Scoping / mapping',items:[
+    {id:'scoping-pcc',label:'Scoping Review (PCC)',framework:'PCC',
+      fields:{p:'Population',i:'Concept',c:'Context',o:'Mapping objective'},
+      placeholders:{p:'Patients, clinicians, services, or policy populations',i:'Concept to map across the literature',c:'Clinical, community, digital, or policy context',o:'What the evidence landscape looks like'},
+      focusLabel:'Scoping objective',focusPlaceholder:'e.g. map intervention types, outcomes, and evidence gaps',
+      note:'Use PRISMA-ScR logic and frame eligibility with PCC, not intervention-only PICO.'},
+    {id:'map-pcc',label:'Evidence Map (PCC)',framework:'PCC',
+      fields:{p:'Population',i:'Concept',c:'Context',o:'Map output'},
+      placeholders:{p:'Target population',i:'Broad intervention or concept area',c:'Service or policy context',o:'Heatmap of evidence volume and gaps'},
+      focusLabel:'Mapping output',focusPlaceholder:'e.g. intervention-outcome evidence map',
+      note:'Bias the workflow toward mapping and evidence-gap description rather than pooling.'}
+  ]},
+  {label:'Other review types',items:[
+    {id:'narrative-general',label:'Narrative Review',framework:'Flexible',
+      fields:{p:'Population / topic',i:'Core concept',c:'Context / comparator',o:'Key questions / outcomes'},
+      placeholders:{p:'Topic population',i:'Main concept',c:'Context',o:'Main issues addressed'},
+      focusLabel:'Review focus',focusPlaceholder:'e.g. narrative synthesis aim',
+      note:'Flexible setup; keep eligibility explicit so screening remains reproducible.'}
+  ]}
+];
+const REVIEW_TYPE_INDEX={};
+REVIEW_TYPE_GROUPS.forEach(group=>group.items.forEach(item=>{REVIEW_TYPE_INDEX[item.id]=item;}));
+function getReviewTypeMeta(id){return REVIEW_TYPE_INDEX[id]||REVIEW_TYPE_INDEX['sr-pico'];}
+function ensureProjectTypeDefaults(p){
+  p=p||ST.project;
+  if(!p.reviewTypeId){
+    const match=Object.values(REVIEW_TYPE_INDEX).find(x=>x.label===p.type||x.legacy===p.type);
+    p.reviewTypeId=(match||getReviewTypeMeta('sr-pico')).id;
   }
-  if (s==='SELECT ai_credits FROM users WHERE id=$1')
-    return T.users.filter(u=>u.id===params[0]).map(u=>({ai_credits:u.ai_credits||0}));
-  if (s==='UPDATE users SET ai_credits=ai_credits-$1 WHERE id=$2 AND ai_credits >= $1 RETURNING ai_credits'){
-    const u=T.users.find(u=>u.id===params[1]);
-    if(!u || (u.ai_credits||0)<params[0]) return [];
-    u.ai_credits=(u.ai_credits||0)-params[0];
-    return [{ai_credits:u.ai_credits}];
-  }
-  if (s.startsWith('UPDATE users SET ai_credits=GREATEST')) {
-    const u=T.users.find(u=>u.id===params[1]);
-    if(!u)return [];
-    u.ai_credits=Math.max(0,(u.ai_credits||0)+params[0]);
-    return [{id:u.id,email:u.email,name:u.name,ai_credits:u.ai_credits}];
-  }
-  if (s==='SELECT id,password_hash FROM users WHERE email=$1')
-    return T.users.filter(u=>u.email===params[0]).map(u=>({id:u.id,password_hash:u.password_hash}));
-  if (s==='UPDATE users SET password_hash=$1 WHERE id=$2'){ const u=T.users.find(u=>u.id===params[1]); if(u)u.password_hash=params[0]; return []; }
+  const meta=getReviewTypeMeta(p.reviewTypeId);
+  p.type=meta.label;
+  p.framework=meta.framework;
+  return meta;
+}
+function protocolFieldMeta(p){return ensureProjectTypeDefaults(p).fields||{p:'Population',i:'Intervention',c:'Comparator',o:'Outcome'};}
+function protocolPlaceholders(p){return ensureProjectTypeDefaults(p).placeholders||{};}
+function protocolSummary(p){const meta=ensureProjectTypeDefaults(p);return `${meta.label} · ${meta.framework}`;}
+function buildReviewContext(p){
+  const meta=ensureProjectTypeDefaults(p);
+  return `REVIEW TYPE: ${meta.label}
+FRAMEWORK: ${meta.framework}
+FRAMEWORK AXES: ${meta.fields.p}; ${meta.fields.i}; ${meta.fields.c}; ${meta.fields.o}`;
+}
+function blankState(){return{
+  id:uid(),
+  project:{title:'',question:'',type:'Systematic Review (PICO)',reviewTypeId:'sr-pico',framework:'PICO',focus:'',registration:'',p:'',i:'',c:'',o:'',inc:'',exc:''},
+  agent:{trained:false,persona:'',glossary:[],rubric:[],synonyms:[],calibration:null,model:'gemini-flash',advModel:'gemini-flash',trainedAt:null},
+  refs:[], team:[], effects:[], engine:null,
+  prisma:{}, settings:{strictness:'balanced',screenMode:null,localThr:0.35,localMaybeBand:0.08},
+  createdAt:new Date().toISOString()
+};}
+function ensureAudit(){ST.audit=ST.audit||[];return ST.audit;}
+function listProjects(){try{return JSON.parse(localStorage.getItem(IDX))||[]}catch(e){return[]}}
+function writeIndex(arr){try{localStorage.setItem(IDX,JSON.stringify(arr))}catch(e){}}
+function projCounts(){const u=ST.refs.filter(r=>!r.dup);
+  return{total:ST.refs.length,incl:u.filter(r=>r.ft&&r.ft.decision==='include').length,
+    screened:u.filter(r=>r.ta).length};}
+function touchIndex(){
+  if(!ST.id)ST.id=uid();
+  let idx=listProjects().filter(p=>p.id!==ST.id);
+  idx.unshift({id:ST.id,title:ST.project.title||'Untitled review',question:ST.project.question||'',
+    updatedAt:new Date().toISOString(),counts:projCounts(),mode:ST.settings.screenMode||null,
+    trained:!!(ST.agent&&ST.agent.trained),localTrained:!!ST.engine});
+  writeIndex(idx);
+}
+function save(){
+  if(window.BK&&BK.isServer()){ serverSaveSoon(); return; }
+  try{if(!ST.id)ST.id=uid();localStorage.setItem(PKEY(ST.id),JSON.stringify(ST));
+  localStorage.setItem(ACTIVE,ST.id);touchIndex();}catch(e){}}
+/* debounced save — avoids writing the whole project to disk on every click during large screening */
+let _saveTimer=null;
+function saveSoon(){ if(window.BK&&BK.isServer()){ serverSaveSoon(); return; } if(_saveTimer)return;_saveTimer=setTimeout(()=>{_saveTimer=null;save();},1200);}
+function saveNow(){ if(window.BK&&BK.isServer()){ serverSaveNow(); return; } if(_saveTimer){clearTimeout(_saveTimer);_saveTimer=null;}save();}
+window.saveSoon=saveSoon;window.saveNow=saveNow;
+window.addEventListener('beforeunload',()=>{if(_saveTimer)saveNow();});
+function loadProject(id){try{const d=JSON.parse(localStorage.getItem(PKEY(id)));if(d){Object.keys(ST).forEach(k=>delete ST[k]);Object.assign(ST,d);window.ST=ST;return true}}catch(e){}return false}
+function load(){ // load active project if any (used at boot)
+  const id=localStorage.getItem(ACTIVE);
+  if(id&&localStorage.getItem(PKEY(id)))return loadProject(id);
+  // migrate a legacy single-project install
+  try{const legacy=JSON.parse(localStorage.getItem('asrma_v1'));if(legacy&&legacy.project){Object.assign(ST,legacy);ST.id=ST.id||uid();save();return true}}catch(e){}
+  return false;
+}
+function newProject(){
+  if(window.BK&&BK.isServer()){ serverNewProject(); return; }
+  const s=blankState();Object.keys(ST).forEach(k=>delete ST[k]);Object.assign(ST,s);window.ST=ST;
+  save();openWorkspace('protocol');toast('New project created','ok');
+}
+function openProject(id){
+  if(window.BK&&BK.isServer()){ serverOpenProject(id); return; }
+  if(loadProject(id)){updatePill();updateKeyBtn();updateAgentChip();renderTeam();
+  openWorkspace(ST.project.question?(ST.refs.length?'screen':'agents'):'protocol');}}
+function renameProject(id){const idx=listProjects();const p=idx.find(x=>x.id===id);
+  const name=prompt('Rename project:',p?p.title:'');if(name==null)return;
+  if(id===ST.id){ST.project.title=name;save();updatePill();}
+  else{const blob=JSON.parse(localStorage.getItem(PKEY(id)));blob.project.title=name;localStorage.setItem(PKEY(id),JSON.stringify(blob));
+    p.title=name;writeIndex(idx);}
+  renderHome();}
+function duplicateProject(id){const blob=JSON.parse(localStorage.getItem(PKEY(id)));blob.id=uid();
+  blob.project.title=(blob.project.title||'Untitled')+' (copy)';blob.createdAt=new Date().toISOString();
+  localStorage.setItem(PKEY(blob.id),JSON.stringify(blob));
+  let idx=listProjects();idx.unshift({id:blob.id,title:blob.project.title,question:blob.project.question||'',
+    updatedAt:new Date().toISOString(),counts:{total:blob.refs.length,incl:0,screened:0}});writeIndex(idx);
+  renderHome();toast('Project duplicated','ok');}
+function deleteProject(id){
+  if(window.BK&&BK.isServer()){ serverDeleteProject(id); return; }
+  if(!confirm('Delete this project permanently?'))return;
+  localStorage.removeItem(PKEY(id));writeIndex(listProjects().filter(p=>p.id!==id));
+  if(ST.id===id){localStorage.removeItem(ACTIVE);}renderHome();toast('Project deleted','ok');}
+function exportProjectById(id){const blob=id===ST.id?ST:JSON.parse(localStorage.getItem(PKEY(id)));
+  const b=new Blob([JSON.stringify(Object.assign({},blob,{_app:'asrma',_v:2}),null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);
+  a.download=(blob.project.title||'pramana-project').replace(/\W+/g,'_')+'.json';a.click();}
+window.listProjects=listProjects;window.newProject=newProject;window.openProject=openProject;
+window.renameProject=renameProject;window.duplicateProject=duplicateProject;window.deleteProject=deleteProject;
+window.exportProjectById=exportProjectById;window.loadProject=loadProject;
+function uid(){return Date.now().toString(36)+Math.random().toString(36).slice(2,7)}
+/* O(1) ref lookup — rebuilt lazily when the refs array identity/length changes */
+let _refIdx=null,_refIdxLen=-1,_refIdxRef=null;
+function refById(id){
+  if(_refIdxRef!==ST.refs||_refIdxLen!==ST.refs.length){
+    _refIdx=new Map();ST.refs.forEach(r=>_refIdx.set(r.id,r));_refIdxRef=ST.refs;_refIdxLen=ST.refs.length;}
+  let r=_refIdx.get(id);
+  if(!r){r=ST.refs.find(x=>x.id===id);if(r)_refIdx.set(id,r);} // fallback
+  return r;
+}
+window.refById=refById;
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+function toast(msg,kind){const t=document.createElement('div');
+  t.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:500;'+
+    'background:'+(kind==='err'?'var(--exc)':kind==='ok'?'var(--inc)':'var(--ink)')+';color:#fff;'+
+    'padding:11px 20px;border-radius:10px;font-size:13px;font-weight:600;box-shadow:var(--sh2);max-width:80vw';
+  t.textContent=msg;document.body.appendChild(t);
+  setTimeout(()=>{t.style.transition='.4s';t.style.opacity='0';t.style.transform='translateX(-50%) translateY(10px)';
+    setTimeout(()=>t.remove(),400)},2600);}
 
-  // ai_usage
-  if (s.startsWith('INSERT INTO ai_usage')){ T.usage.push({id:params[0],user_id:params[1],project_id:params[2],feature:params[3],model:params[4],credits:params[5]}); return []; }
+/* ===================== PHASES (the spine) ===================== */
+const PHASES=[
+  {id:'protocol', name:'Protocol & PICO', ico:'◈', count:()=>ST.project.question?'✓':'—'},
+  {id:'agents',   name:'Train agents',    ico:'⊹', count:()=>ST.agent.trained?(ST.agent.calibration?ST.agent.calibration.acc+'%':'✓'):'—'},
+  {id:'sources',  name:'Search sources',  ico:'⌕', count:()=>'—'},
+  {id:'import',   name:'Import studies',  ico:'⇲', count:()=>ST.refs.length},
+  {id:'dedup',    name:'De-duplicate',    ico:'⧉', count:()=>ST.refs.filter(r=>r.dup).length||'—'},
+  {id:'screen',   name:'Title / Abstract',ico:'⊜', count:()=>ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.final).length},
+  {id:'fulltext', name:'Full text',       ico:'▤', count:()=>ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe')).length},
+  {id:'extract',  name:'Extract data',    ico:'⊞', count:()=>ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe')&&r.ft&&r.ft.decision==='include').length},
+  {id:'quality',  name:'Risk of bias',    ico:'⚖', count:()=>ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe')&&r.ft&&r.ft.decision==='include'&&r.quality&&r.quality.overall).length||'—'},
+  {id:'synth',    name:'Meta-analysis',   ico:'⟿', count:()=>ST.effects.length||'—'},
+  {id:'grade',    name:'GRADE',           ico:'◆', count:()=>(ST.grade&&ST.grade.length)||'—'},
+  {id:'report',   name:'PRISMA & export', ico:'⎙', count:()=>'—'}
+];
+let CUR='protocol';
 
-  // jobs
-  if (s.startsWith('INSERT INTO jobs')) {
-    T.jobs.push({
-      id: params[0],
-      project_id: params[1],
-      user_id: params[2],
-      type: params[3],
-      status: params[4],
-      payload: JSON.parse(params[5] || '{}'),
-      progress: JSON.parse(params[6] || '{}'),
-      result: JSON.parse(params[7] || '{}'),
-      error: null,
-      cancel_requested: false
-    });
-    return [];
+function renderSpine(){
+  const list=document.getElementById('flow-list');
+  // keep line + fill
+  [...list.querySelectorAll('.phase')].forEach(p=>p.remove());
+  const reached=PHASES.findIndex(p=>p.id===CUR);
+  PHASES.forEach((ph,i)=>{
+    const c=ph.count();
+    const done=i<reached && c!=='—' && c!==0;
+    const el=document.createElement('div');
+    el.className='phase'+(ph.id===CUR?' on':'')+(done?' done':'');
+    el.onclick=()=>ASRMA.go(ph.id);
+    el.innerHTML=`<div class="ph-node">${ph.id===CUR?'●':done?'✓':ph.ico}</div>
+      <div class="ph-body"><div class="ph-name">${ph.name}</div>
+        <div class="ph-meta">phase ${String(i+1).padStart(2,'0')}</div></div>
+      <div class="ph-count">${c}</div>`;
+    list.appendChild(el);
+  });
+  // fill the spine proportional to progress
+  const pct=reached/(PHASES.length-1);
+  const total=list.scrollHeight-60;
+  document.getElementById('flow-fill').style.height=Math.max(0,total*pct)+'px';
+}
+
+/* ===================== NAV ===================== */
+const ASRMA={
+  go(id){
+    CUR=id;
+    document.querySelectorAll('.pane').forEach(p=>p.classList.remove('on'));
+    const pane=document.getElementById('pane-'+id);
+    if(pane)pane.classList.add('on');
+    const fn={protocol:renderProtocol,agents:renderAgents,sources:renderSources,import:renderImport,
+      dedup:renderDedup,screen:renderScreen,fulltext:renderFulltext,extract:renderExtract,
+      quality:renderQuality,synth:renderSynth,grade:renderGrade,report:renderReport,viveka:renderViveka}[id];
+    if(fn)fn();
+    renderSpine();
+    document.getElementById('work').scrollTop=0;
+    save();
+  },
+  keyModal,inviteModal,
+  trainAgents,screenAll,screenOne,setDecision,
+  importText:doImportText,importFile:doImportFile,parseAndAdd,
+  dedup:runDedup,fetchFullText,fetchAllFullText,
+  ftScreen,screenAllFullText,
+  addEffect,removeEffect,runMeta
+};
+window.ASRMA=ASRMA;
+function phaseRenderer(id){
+  return {protocol:renderProtocol,agents:renderAgents,sources:renderSources,import:renderImport,
+    dedup:renderDedup,screen:renderScreen,fulltext:renderFulltext,extract:renderExtract,
+    quality:renderQuality,synth:renderSynth,grade:renderGrade,report:renderReport,viveka:renderViveka}[id];
+}
+function renderCurrentPhaseNoSave(phase){
+  const id=phase||CUR||'protocol';
+  CUR=id;
+  document.querySelectorAll('.pane').forEach(p=>p.classList.remove('on'));
+  const pane=document.getElementById('pane-'+id);
+  if(pane)pane.classList.add('on');
+  const work=document.getElementById('work');
+  const top=work?work.scrollTop:0;
+  const fn=phaseRenderer(id);
+  if(fn)fn();
+  renderSpine();
+  if(work)work.scrollTop=top;
+}
+window.renderCurrentPhaseNoSave=renderCurrentPhaseNoSave;
+
+/* ===================== MODAL ===================== */
+function modal(html){const m=document.getElementById('modal');m.style.maxWidth='';m.innerHTML=html;document.getElementById('modal-bg').classList.add('on');}
+function closeModal(){document.getElementById('modal-bg').classList.remove('on');}
+document.getElementById('modal-bg').addEventListener('click',e=>{if(e.target.id==='modal-bg')closeModal()});
+
+/* ===================== TEAM ===================== */
+function renderTeam(){
+  const s=document.getElementById('team-stack');
+  const cols=['#4f46e5','#0d9488','#d97706','#dc2626','#7c3aed','#0891b2'];
+  s.innerHTML=ST.team.map((m,i)=>`<div class="av" style="background:${cols[i%cols.length]}" title="${esc(m.name)} — ${esc(m.role)}">${esc((m.name||'?')[0].toUpperCase())}</div>`).join('');
+}
+function inviteModal(){
+  modal(`<div class="modal-h">👥 Invite team member<button class="x" onclick="closeModal()">×</button></div>
+  <div class="modal-b">
+    <div class="banner info"><span class="bi">🤝</span><div>Add reviewers and assign roles. Each reviewer screens independently; conflicts route to the arbitrator. Share your project file (Report → Export) so collaborators load the same protocol & studies.</div></div>
+    <div class="fg"><label class="fl">Name</label><input class="inp" id="inv-name" placeholder="Dr. A. Reviewer"></div>
+    <div class="fg"><label class="fl">Email <span class="hint">optional</span></label><input class="inp" id="inv-email" placeholder="name@inst.edu"></div>
+    <div class="fg"><label class="fl">Role</label><select class="inp" id="inv-role">
+      <option>Reviewer 1</option><option>Reviewer 2</option><option>Arbitrator</option><option>Data extractor</option><option>Methodologist</option><option>Lead</option></select></div>
+    <div id="team-cur"></div>
+  </div>
+  <div class="modal-f"><button class="btn gh" onclick="closeModal()">Done</button>
+    <button class="btn" onclick="addMember()">Add member</button></div>`);
+  renderCurTeam();
+}
+function renderCurTeam(){
+  const el=document.getElementById('team-cur');if(!el)return;
+  if(!ST.team.length){el.innerHTML='<div class="muted" style="margin-top:8px">No members yet.</div>';return;}
+  el.innerHTML='<div class="divider"></div>'+ST.team.map((m,i)=>
+    `<div class="row" style="margin-bottom:6px"><b>${esc(m.name)}</b><span class="pill s">${esc(m.role)}</span>
+     <span class="muted">${esc(m.email||'')}</span><span class="spacer"></span>
+     <button class="vbtn exc" onclick="rmMember(${i})">×</button></div>`).join('');
+}
+function addMember(){
+  const n=document.getElementById('inv-name').value.trim();
+  if(!n){toast('Enter a name','err');return;}
+  ST.team.push({name:n,email:document.getElementById('inv-email').value.trim(),role:document.getElementById('inv-role').value});
+  document.getElementById('inv-name').value='';document.getElementById('inv-email').value='';
+  save();renderTeam();renderCurTeam();toast('Member added','ok');
+}
+function rmMember(i){ST.team.splice(i,1);save();renderTeam();renderCurTeam();}
+window.addMember=addMember;window.rmMember=rmMember;window.closeModal=closeModal;
+/* expose shared core across script blocks + to HTML onclick handlers */
+window.ST=ST;window.ASRMA=ASRMA;window.PHASES=PHASES;window.save=save;window.load=load;
+window.esc=esc;window.uid=uid;window.sleep=sleep;window.toast=toast;window.modal=modal;
+window.renderSpine=renderSpine;window.renderTeam=renderTeam;window.inviteModal=inviteModal;
+Object.defineProperty(window,'CUR',{get:()=>CUR,set:v=>{CUR=v}});
+
+
+/* ===================== LLM LAYER (multi-provider) ===================== */
+const MODELS={
+  'gemini-flash':{label:'Gemini 2.0 Flash',keyId:'gemini',free:true,hint:'aistudio.google.com — free tier'},
+  'gpt4o-mini':  {label:'GPT-4o mini',keyId:'openai',hint:'platform.openai.com'},
+  'claude-haiku':{label:'Claude Haiku',keyId:'claude',hint:'console.anthropic.com'},
+  'deepseek':    {label:'DeepSeek Chat',keyId:'deepseek',hint:'platform.deepseek.com — very cheap'},
+  'zai-glm':     {label:'Z.ai GLM-4',keyId:'zai',hint:'z.ai — cheap, strong'},
+};
+function browserAIKeysAllowed(){
+  return !(window.BK&&BK.isServer&&BK.isServer());
+}
+function getKey(m){
+  if(!browserAIKeysAllowed())return '';
+  return localStorage.getItem('asrma_key_'+MODELS[m].keyId)||'';
+}
+function serverAIReady(model){
+  return !!(window.BK&&BK.isServer&&BK.isServer()&&BK.config&&BK.config.aiServerEnabled&&
+    (!model||!Array.isArray(BK.config.aiModels)||!BK.config.aiModels.length||BK.config.aiModels.includes(model)));
+}
+function serverModelFor(model){
+  if(serverAIReady(model))return model;
+  if(serverAIReady()&&Array.isArray(BK.config.aiModels)&&BK.config.aiModels.length)return BK.config.aiModels[0];
+  return null;
+}
+function hasAnyAIKey(){
+  return serverAIReady() || Object.keys(MODELS).some(id=>getKey(id));
+}
+function purgeBrowserAIKeys(){
+  Object.values(MODELS).forEach(m=>{try{localStorage.removeItem('asrma_key_'+m.keyId);}catch(e){}});
+}
+function agentBusy(b){const d=document.getElementById('agent-dot');if(!d)return;
+  d.className='agent-dot '+(b?'busy':(ST.agent.trained?'ready':'untrained'));
+  const l=document.getElementById('agent-label');if(l&&b)l.textContent='Viveka working…';
+  else if(l)l.textContent=(ST.agent.trained?'Panel ready ✓':'Panel: not set up');}
+
+const _bucket=(()=>{let t=20,max=22,last=Date.now();
+  return{async acquire(){while(1){const now=Date.now();t=Math.min(max,t+(now-last)/60000*40);last=now;
+    if(t>=1){t--;return}await sleep(280)}}}})();
+
+async function LLM(prompt,maxTok,model){
+  model=model||ST.agent.model||'gemini-flash';maxTok=maxTok||900;
+  const serverModel=serverModelFor(model);
+  if(serverModel){
+    const r=await BK.api('POST','/api/ai/generate',{prompt,maxTok,model:serverModel},70000);
+    syncAICredits(r);
+    if(!r||!r.text)throw new Error('Empty server AI response');
+    return r.text;
   }
-  if (s==='SELECT id,project_id,user_id,type,status,payload,progress,result,error,cancel_requested FROM jobs WHERE id=$1')
-    return T.jobs.filter(j=>j.id===params[0]).map(clone);
-  if (s.startsWith('UPDATE jobs SET status=$1')) {
-    const j=T.jobs.find(j=>j.id===params[7]);
-    if(j){
-      j.status=params[0];
-      j.progress=JSON.parse(params[1] || '{}');
-      j.result=JSON.parse(params[2] || '{}');
-      j.error=params[3] || null;
-      j.cancel_requested=!!params[4];
+  const key=getKey(model);
+  if(!key){keyModal();throw new Error('No API key for '+MODELS[model].label+'. Add it under 🔑 Keys.');}
+  await _bucket.acquire();
+  for(let a=1;a<=4;a++){
+    try{
+      let r,txt;
+      if(model==='gemini-flash'){
+        r=await fetch('https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key='+key,
+          {method:'POST',headers:{'Content-Type':'application/json'},
+           body:JSON.stringify({contents:[{parts:[{text:prompt}]}],generationConfig:{maxOutputTokens:maxTok,temperature:.2}})});
+        if(r.status===429||r.status===503){await sleep(a*4000);continue}
+        const d=await r.json();
+        if(d.error)throw new Error(d.error.message||'Gemini error');
+        txt=d.candidates?.[0]?.content?.parts?.[0]?.text;
+      }else if(model==='claude-haiku'){
+        r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',
+          headers:{'Content-Type':'application/json','x-api-key':key,'anthropic-version':'2023-06-01','anthropic-dangerous-direct-browser-access':'true'},
+          body:JSON.stringify({model:'claude-3-5-haiku-20241022',max_tokens:maxTok,messages:[{role:'user',content:prompt}]})});
+        if(r.status===429||r.status===529){await sleep(a*5000);continue}
+        const d=await r.json();
+        if(d.error)throw new Error(d.error.message||'Claude error');
+        txt=d.content?.[0]?.text;
+      }else{ // OpenAI-compatible: openai, deepseek, zai
+        const ep={'gpt4o-mini':'https://api.openai.com/v1/chat/completions',
+          'deepseek':'https://api.deepseek.com/v1/chat/completions',
+          'zai-glm':'https://api.z.ai/api/paas/v4/chat/completions'}[model];
+        const mid={'gpt4o-mini':'gpt-4o-mini','deepseek':'deepseek-chat','zai-glm':'glm-4-flash'}[model];
+        r=await fetch(ep,{method:'POST',headers:{'Content-Type':'application/json','Authorization':'Bearer '+key},
+          body:JSON.stringify({model:mid,max_tokens:maxTok,temperature:.2,messages:[{role:'user',content:prompt}]})});
+        if(r.status===429||r.status===503){await sleep(a*5000);continue}
+        if(r.status===401)throw new Error('Invalid API key');
+        const d=await r.json();
+        if(d.error)throw new Error(d.error.message||'API error');
+        txt=d.choices?.[0]?.message?.content;
+      }
+      if(!txt)throw new Error('Empty response');
+      return txt;
+    }catch(e){if(a===4||/Invalid API key|No API key/.test(e.message))throw e;await sleep(a*1500);}
+  }
+  throw new Error('LLM failed after retries');
+}
+function parseJSON(raw){
+  let s=String(raw).replace(/```json|```/g,'').trim();
+  const a=s.indexOf('{'),b=s.lastIndexOf('}'),x=s.indexOf('['),y=s.lastIndexOf(']');
+  if(x>=0&&(x<a||a<0))s=s.slice(x,y+1);else if(a>=0)s=s.slice(a,b+1);
+  return JSON.parse(s);
+}
+
+/* ===================== KEY MODAL ===================== */
+function keyModal(){
+  const rows=Object.entries(MODELS).map(([id,m])=>`
+    <div class="fg"><label class="fl">${m.label}${m.free?' <span class="pill f">free</span>':''}
+      <span class="hint">${m.hint}</span></label>
+      <input class="inp" id="k-${m.keyId}" type="password" placeholder="paste key…" value="${esc(getKey(id))}"></div>`).join('');
+  modal(`<div class="modal-h">🔑 API keys<button class="x" onclick="closeModal()">×</button></div>
+  <div class="modal-b">
+    <div class="banner info"><span class="bi">🔒</span><div>Keys are stored only in <b>this browser</b> (localStorage) and sent directly to each provider — never to us. Add at least one. <b>Gemini Flash</b> is free and works well for screening.</div></div>
+    ${rows}
+    <div class="fg"><label class="fl">Default agent model</label>
+      <select class="inp" id="k-model">${Object.entries(MODELS).map(([id,m])=>`<option value="${id}" ${ST.agent.model===id?'selected':''}>${m.label}</option>`).join('')}</select></div>
+    <div class="fg"><label class="fl">Advanced model <span class="hint">for hard screening / extraction</span></label>
+      <select class="inp" id="k-adv">${Object.entries(MODELS).map(([id,m])=>`<option value="${id}" ${ST.agent.advModel===id?'selected':''}>${m.label}</option>`).join('')}</select></div>
+  </div>
+  <div class="modal-f"><button class="btn gh" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveKeys()">Save keys</button></div>`);
+}
+function saveKeys(){
+  let any=false;
+  Object.values(MODELS).forEach(m=>{const v=document.getElementById('k-'+m.keyId).value.trim();
+    if(v){localStorage.setItem('asrma_key_'+m.keyId,v);any=true}});
+  ST.agent.model=document.getElementById('k-model').value;
+  ST.agent.advModel=document.getElementById('k-adv').value;
+  save();updateKeyBtn();agentBusy(false);closeModal();
+  toast(any?'Keys saved':'Models updated','ok');
+}
+function updateKeyBtn(){const b=document.getElementById('key-btn');if(!b)return;
+  const ok=hasAnyAIKey();
+  b.textContent=serverAIReady()?'Server AI ✓':(ok?'🔑 Keys ✓':'🔑 Add keys');
+  b.style.borderColor=ok?'var(--inc)':'';b.style.color=ok?'var(--inc)':'';}
+window.saveKeys=saveKeys;
+function serverModelOptions(selected){
+  const entries=serverAIReady()&&Array.isArray(BK.config.aiModels)&&BK.config.aiModels.length
+    ? Object.entries(MODELS).filter(([id])=>BK.config.aiModels.includes(id))
+    : Object.entries(MODELS);
+  return entries.map(([id,m])=>`<option value="${id}" ${selected===id?'selected':''}>${m.label}</option>`).join('');
+}
+keyModal=function(){
+  const serverMode=!!(window.BK&&BK.isServer&&BK.isServer());
+  const body=serverMode
+    ? `<div class="banner info"><span class="bi">✓</span><div><b>${serverAIReady()?'Server AI is active.':'Server AI belongs in Railway.'}</b> API keys are stored in Railway variables and are not shown in the browser. Add or change provider keys only from the Railway service settings.</div></div>`
+    : `<div class="banner warn"><span class="bi">!</span><div>Server AI is not configured yet. For production, add provider keys in Railway variables instead of browser storage.</div></div>`+
+      Object.entries(MODELS).map(([id,m])=>`<div class="fg"><label class="fl">${m.label}${m.free?' <span class="pill f">free</span>':''} <span class="hint">${m.hint}</span></label><input class="inp" id="k-${m.keyId}" type="password" placeholder="paste key..." value="${esc(getKey(id))}"></div>`).join('');
+  modal(`<div class="modal-h">AI settings<button class="x" onclick="closeModal()">x</button></div>
+  <div class="modal-b">
+    ${body}
+    <div class="fg"><label class="fl">Default agent model</label><select class="inp" id="k-model">${serverModelOptions(ST.agent.model)}</select></div>
+    <div class="fg"><label class="fl">Advanced model <span class="hint">full-text, extraction, RoB</span></label><select class="inp" id="k-adv">${serverModelOptions(ST.agent.advModel)}</select></div>
+  </div>
+  <div class="modal-f"><button class="btn gh" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveKeys()">Save</button></div>`);
+};
+saveKeys=function(){
+  if(browserAIKeysAllowed()){
+    Object.values(MODELS).forEach(m=>{const el=document.getElementById('k-'+m.keyId);if(el){const v=el.value.trim();if(v)localStorage.setItem('asrma_key_'+m.keyId,v);}});
+  }else{
+    purgeBrowserAIKeys();
+  }
+  ST.agent.model=document.getElementById('k-model').value;
+  ST.agent.advModel=document.getElementById('k-adv').value;
+  save();updateKeyBtn();agentBusy(false);closeModal();toast('AI settings saved','ok');
+};
+updateKeyBtn=function(){
+  const b=document.getElementById('key-btn');if(!b)return;
+  const ok=hasAnyAIKey();
+  b.textContent=(window.BK&&BK.isServer&&BK.isServer())?(serverAIReady()?'Server AI ready':'Server AI missing'):(ok?'Keys ready':'Add keys');
+  b.style.borderColor=ok?'var(--inc)':'';b.style.color=ok?'var(--inc)':'';
+};
+window.saveKeys=saveKeys;
+
+/* ===================== AGENT TRAINING (headline feature) ===================== */
+async function trainAgents(){
+  const p=ST.project;
+  const reviewCtx=buildReviewContext(p);
+  if(!p.question){toast('Define your protocol & PICO first','err');ASRMA.go('protocol');return;}
+  if(!hasAnyAIKey()){keyModal();return;}
+  const btn=document.getElementById('train-btn');if(btn){btn.disabled=true;btn.innerHTML='⊹ Training…';}
+  agentBusy(true);
+  const steps=['s-domain','s-persona','s-rubric','s-gold','s-calib'];
+  const setStep=(i,cls)=>{const e=document.getElementById(steps[i]);if(e)e.className='tstep '+cls;};
+  try{
+    // 1. Domain modelling — glossary + synonyms
+    setStep(0,'run');
+    const dPrompt=`You are a methodology trainer building an expert screening agent for a systematic review.
+REVIEW TITLE: ${p.title||p.question}
+${reviewCtx}
+QUESTION: ${p.question}
+FRAMEWORK VALUES — 1:${p.p} | 2:${p.i} | 3:${p.c} | 4:${p.o}
+Return ONLY JSON:
+{"domain":"<one-line description of the clinical/research domain>",
+ "glossary":[{"term":"...","meaning":"short"}],   // 6-8 key domain terms a screener must know
+ "synonyms":["...","..."],                          // 10-15 alternate terms/spellings for the Population & Intervention (for highlighting & search)
+ "tricky":["...","..."]}                            // 3-5 borderline situations that commonly cause wrong include/exclude calls`;
+    const dom=parseJSON(await LLM(dPrompt,1500));
+    ST.agent.glossary=dom.glossary||[];ST.agent.synonyms=dom.synonyms||[];
+    setStep(0,'done');await sleep(150);
+
+    // 2. Reviewer persona
+    setStep(1,'run');
+    const persPrompt=`Write a concise expert-reviewer PERSONA + standing instructions for an AI agent that will screen titles/abstracts and full texts for THIS review, as if it were a senior systematic-review methods panel specialised in: ${dom.domain}.
+${reviewCtx}
+QUESTION: ${p.question}
+FRAMEWORK VALUES — 1:${p.p}|2:${p.i}|3:${p.c}|4:${p.o}
+INCLUSION: ${p.inc||'must match PICO'}
+EXCLUSION: ${p.exc||'outside PICO'}
+Return ONLY JSON: {"persona":"<150-220 words, second person, methodologically rigorous, Cochrane/JBI/PRISMA-aligned, names the specific expertise needed, states that title/abstract uncertainty should become MAYBE rather than false exclusion, and says full-text exclusion needs an explicit reason>"}`;
+    ST.agent.persona=(parseJSON(await LLM(persPrompt,1000)).persona)||'';
+    setStep(1,'done');await sleep(150);
+
+    // 3. Decision rubric
+    setStep(2,'run');
+    const rubPrompt=`Create a precise INCLUDE/EXCLUDE/MAYBE decision rubric for expert screeners of this review. 
+${reviewCtx}
+QUESTION:${p.question}; FRAMEWORK 1:${p.p}|2:${p.i}|3:${p.c}|4:${p.o}; INC:${p.inc}; EXC:${p.exc}
+Return ONLY JSON: {"rubric":[ "<8-12 short, testable decision rules; include hard-exclude rules, uncertainty/MAYBE rules for incomplete abstracts, and full-text exclusion categories; each starts with INCLUDE if / EXCLUDE if / MAYBE if>" ]}`;
+    ST.agent.rubric=(parseJSON(await LLM(rubPrompt,1500)).rubric)||[];
+    setStep(2,'done');await sleep(150);
+
+    // 4. Synthetic gold standard
+    setStep(3,'run');
+    const goldPrompt=`Generate a rigorous calibration test set of 14 realistic study ABSTRACTS for this review: clear includes, hard excludes, near-miss excludes, and genuinely borderline abstracts that should be MAYBE for full-text review.
+${reviewCtx}
+QUESTION:${p.question}; FRAMEWORK 1:${p.p}|2:${p.i}|3:${p.c}|4:${p.o}; INC:${p.inc}; EXC:${p.exc}
+Return ONLY JSON: {"cases":[{"title":"...","abstract":"2-4 sentences","gold":"include|exclude|maybe","why":"short"}]}`;
+    const gold=(parseJSON(await LLM(goldPrompt,4000)).cases)||[];
+    setStep(3,'done');await sleep(150);
+
+    // 5. Self-calibration — agent screens its own gold set
+    setStep(4,'run');
+    let correct=0,details=[];
+    for(const g of gold){
+      try{
+        const v=parseJSON(await LLM(buildScreenPrompt(g.title,g.abstract,'calibration'),350));
+        const pred=normDecision(v.v);
+        const ok=pred===g.gold;if(ok)correct++;
+        details.push({title:g.title,gold:g.gold,pred,ok});
+      }catch(e){details.push({title:g.title,gold:g.gold,pred:'error',ok:false})}
     }
-    return [];
-  }
+    const acc=gold.length?Math.round(correct/gold.length*100):0;
+    ST.agent.calibration={acc,n:gold.length,correct,details,domain:dom.domain,tricky:dom.tricky||[]};
+    setStep(4,'done');
 
-  // password_resets
-  if (s.startsWith('INSERT INTO password_resets')){ T.resets.push({token:params[0],user_id:params[1],expires_at:params[2],used:false}); return []; }
-  if (s==='SELECT user_id,expires_at,used FROM password_resets WHERE token=$1')
-    return T.resets.filter(r=>r.token===params[0]).map(r=>clone(r));
-  if (s==='UPDATE password_resets SET used=true WHERE token=$1'){ const r=T.resets.find(r=>r.token===params[0]); if(r)r.used=true; return []; }
-
-  // projects
-  if (s.startsWith('INSERT INTO projects')) {
-    const cols=s.match(/\(([^)]+)\) VALUES/)[1].split(',').map(c=>c.trim());
-    const row={version:1,updated_at:new Date().toISOString()}; cols.forEach((c,i)=>row[c]=params[i]);
-    if (typeof row.data==='string') row.data=JSON.parse(row.data); T.projects.push(row); return [];
+    ST.agent.trained=true;ST.agent.trainedAt=new Date().toISOString();
+    save();agentBusy(false);renderAgents();renderSpine();updateAgentChip();
+    toast('Agent trained — '+acc+'% on calibration set','ok');
+  }catch(e){
+    agentBusy(false);toast('Training failed: '+e.message,'err');
+    if(btn){btn.disabled=false;btn.innerHTML='⊹ Train agent';}
   }
-  if (s.startsWith('SELECT p.id,p.title,p.version,p.updated_at,m.role')) {
-    return T.members.filter(m=>m.user_id===params[0]).map(m=>{
-      const p=T.projects.find(p=>p.id===m.project_id);
-      const refs=Array.isArray(p.data&&p.data.refs)?p.data.refs:[];
-      return {id:p.id,title:p.title,version:p.version,updated_at:p.updated_at,role:m.role,
-        total_count:refs.length,
-        screened_count:refs.filter(r=>!r.dup&&r.ta&&r.ta.final).length,
-        included_count:refs.filter(r=>!r.dup&&r.ft&&r.ft.decision==='include').length,
-        member_count:T.members.filter(x=>x.project_id===p.id).length};
-    });
-  }
-  if (s==='SELECT id,title,data,version,updated_at,updated_by FROM projects WHERE id=$1') {
-    return T.projects.filter(p=>p.id===params[0]).map(p=>clone(p));
-  }
-  if (s==='SELECT data,version FROM projects WHERE id=$1') {
-    return T.projects.filter(p=>p.id===params[0]).map(p=>({data:clone(p.data),version:p.version}));
-  }
-  if (s==='SELECT version FROM projects WHERE id=$1')
-    return T.projects.filter(p=>p.id===params[0]).map(p=>({version:p.version}));
-  if (s==='SELECT title FROM projects WHERE id=$1')
-    return T.projects.filter(p=>p.id===params[0]).map(p=>({title:p.title}));
-  if (s.startsWith('UPDATE projects SET data=')) {
-    const p=T.projects.find(p=>p.id===params[4]); if(p){p.data=JSON.parse(params[0]);p.version=params[1];p.updated_by=params[2];p.title=params[3];p.updated_at=new Date().toISOString();} return [];
-  }
-  if (s==='DELETE FROM projects WHERE id=$1'){ T.projects=T.projects.filter(p=>p.id!==params[0]); return []; }
-
-  // members
-  if (s==='SELECT role FROM members WHERE project_id=$1 AND user_id=$2')
-    return T.members.filter(m=>m.project_id===params[0]&&m.user_id===params[1]).map(m=>({role:m.role}));
-  if (s.startsWith('INSERT INTO members')) {
-    const exists=T.members.find(m=>m.project_id===params[0]&&m.user_id===params[1]);
-    if(!exists) T.members.push({project_id:params[0],user_id:params[1],role:params[2]});
-    return [];
-  }
-  if (s.startsWith('SELECT u.id,u.email,u.name,m.role FROM members')) {
-    return T.members.filter(m=>m.project_id===params[0]).map(m=>{const u=T.users.find(u=>u.id===m.user_id);return {id:u.id,email:u.email,name:u.name,role:m.role};});
-  }
-  if (s==='DELETE FROM members WHERE project_id=$1 AND user_id=$2'){ T.members=T.members.filter(m=>!(m.project_id===params[0]&&m.user_id===params[1])); return []; }
-
-  // invites
-  if (s==='SELECT token,project_id,role FROM invites WHERE email=$1 AND accepted=false')
-    return T.invites.filter(i=>i.email===params[0]&&!i.accepted).map(clone);
-  if (s==='SELECT token FROM invites WHERE project_id=$1 AND email=$2 AND accepted=false')
-    return T.invites.filter(i=>i.project_id===params[0]&&i.email===params[1]&&!i.accepted).map(i=>({token:i.token}));
-  if (s.startsWith('INSERT INTO invites')) {
-    T.invites.push({token:params[0],project_id:params[1],email:params[2],role:params[3],invited_by:params[4],accepted:false}); return [];
-  }
-  if (s==='UPDATE invites SET accepted=true WHERE token=$1'){ const i=T.invites.find(i=>i.token===params[0]); if(i)i.accepted=true; return []; }
-  if (s==='SELECT project_id,role FROM invites WHERE token=$1')
-    return T.invites.filter(i=>i.token===params[0]).map(i=>({project_id:i.project_id,role:i.role}));
-  if (s.startsWith('SELECT email,role FROM invites WHERE project_id=$1'))
-    return T.invites.filter(i=>i.project_id===params[0]&&!i.accepted).map(i=>({email:i.email,role:i.role}));
-
-  throw new Error('UNHANDLED QUERY: ' + s);
 }
+function updateAgentChip(){
+  document.getElementById('agent-dot').className='agent-dot '+(ST.agent.trained?'ready':'untrained');
+  document.getElementById('agent-label').textContent=(ST.agent.trained?'Viveka ready ✓':'Viveka: not set up');
+}
+window.saveKeys=saveKeys;
 
-db.setQueryImpl(mockQuery);
-db.initSchema = async () => {};   // skip real schema
 
-const { app } = require('./server');
+/* ===================== PROTOCOL PANE ===================== */
+function renderProtocol(){
+  const p=ST.project;const meta=ensureProjectTypeDefaults(p);const labels=protocolFieldMeta(p);const ph=protocolPlaceholders(p);
+  document.getElementById('pane-protocol').innerHTML=`
+  <div class="pane-h"><div class="eyebrow">Phase 01 — define the question</div>
+    <h1>◈ Protocol & framework</h1>
+    <p>Everything downstream is trained from this. Choose the right review design first, then define the framework and criteria that your reviewer should follow.</p></div>
 
-/* ---- minimal HTTP test client with cookie jar ---- */
-function makeClient() {
-  let cookie = '';
-  return function call(method, path, body) {
-    return new Promise((resolve, reject) => {
-      const data = body ? JSON.stringify(body) : null;
-      const req = http.request({ method, path, host: '127.0.0.1', port: PORT,
-        headers: Object.assign({ 'Content-Type':'application/json' }, cookie?{Cookie:cookie}:{}, data?{'Content-Length':Buffer.byteLength(data)}:{}) },
-        res => { let b=''; res.on('data',d=>b+=d); res.on('end',()=>{
-          const sc=res.headers['set-cookie']; if(sc) cookie=sc.map(c=>c.split(';')[0]).join('; ');
-          let j={}; try{j=b?JSON.parse(b):{};}catch(e){j={raw:b};}
-          resolve({ status: res.statusCode, body: j });
-        }); });
-      req.on('error', reject);
-      if (data) req.write(data); req.end();
-    });
+  <div class="card">
+    <div class="card-h">Review identity</div>
+    <div class="grid2">
+      <div class="fg"><label class="fl">Working title</label><input class="inp" id="p-title" value="${esc(p.title)}" placeholder="e.g. mHealth interventions for hypertension control in LMICs"></div>
+      <div class="fg"><label class="fl">Review type</label><select class="inp" id="p-type" onchange="protocolTypeChanged(this.value)">
+        ${REVIEW_TYPE_GROUPS.map(group=>`<optgroup label="${esc(group.label)}">${group.items.map(item=>`<option value="${item.id}" ${meta.id===item.id?'selected':''}>${esc(item.label)}</option>`).join('')}</optgroup>`).join('')}</select></div>
+    </div>
+    <div class="grid2">
+      <div class="fg"><label class="fl">Registration (PROSPERO / OSF)</label><input class="inp" id="p-registration" value="${esc(p.registration||'')}" placeholder="e.g. CRD4202xxxxxxx or OSF.io/xxxxx"></div>
+      <div class="fg"><label class="fl">${esc(meta.focusLabel||'Primary outcome / focus')}</label><input class="inp" id="p-focus" value="${esc(p.focus||'')}" placeholder="${esc(meta.focusPlaceholder||'e.g. primary outcome, mapping objective, or diagnostic endpoint')}"></div>
+    </div>
+    <div class="fg"><label class="fl">Research question</label>
+      <textarea class="inp" id="p-question" placeholder="In [population], does [intervention] compared with [comparator] affect [outcomes]?">${esc(p.question)}</textarea></div>
+    <div class="banner info"><span class="bi">ⓘ</span><div><b>${esc(protocolSummary(p))}</b><br>${esc(meta.note||'')}</div></div>
+  </div>
+
+  <div class="card">
+    <div class="card-h">${esc(meta.framework)} framework <span class="tag">drives the reviewer</span></div>
+    <div class="grid2">
+      <div class="fg"><label class="fl">1 — ${esc(labels.p)}</label><textarea class="inp" id="p-p" placeholder="${esc(ph.p||'Define the first framework axis')}">${esc(p.p)}</textarea></div>
+      <div class="fg"><label class="fl">2 — ${esc(labels.i)}</label><textarea class="inp" id="p-i" placeholder="${esc(ph.i||'Define the second framework axis')}">${esc(p.i)}</textarea></div>
+      <div class="fg"><label class="fl">3 — ${esc(labels.c)}</label><textarea class="inp" id="p-c" placeholder="${esc(ph.c||'Define the third framework axis')}">${esc(p.c)}</textarea></div>
+      <div class="fg"><label class="fl">4 — ${esc(labels.o)}</label><textarea class="inp" id="p-o" placeholder="${esc(ph.o||'Define the fourth framework axis')}">${esc(p.o)}</textarea></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-h">Eligibility criteria</div>
+    <div class="grid2">
+      <div class="fg"><label class="fl">Inclusion criteria <span class="hint">one per line</span></label>
+        <textarea class="inp" id="p-inc" style="min-height:120px" placeholder="RCT or quasi-experimental design&#10;Adults ≥18 with diagnosed hypertension&#10;Reports BP outcome">${esc(p.inc)}</textarea></div>
+      <div class="fg"><label class="fl">Exclusion criteria <span class="hint">one per line</span></label>
+        <textarea class="inp" id="p-exc" style="min-height:120px" placeholder="Conference abstracts / protocols only&#10;Non-human studies&#10;No usable outcome data">${esc(p.exc)}</textarea></div>
+    </div>
+  </div>
+
+  <div class="row">
+    <button class="btn" onclick="saveProtocol(true)">Save & train agent →</button>
+    <button class="btn gh" onclick="saveProtocol(false)">Save protocol</button>
+    <span class="spacer"></span>
+    <button class="btn gh sm" onclick="loadExampleProtocol()">Load example</button>
+  </div>`;
+}
+function readProtocol(){
+  const g=id=>document.getElementById(id)?.value||'';
+  const reviewTypeId=g('p-type')||'sr-pico';const meta=getReviewTypeMeta(reviewTypeId);
+  Object.assign(ST.project,{title:g('p-title'),reviewTypeId,type:meta.label,framework:meta.framework,registration:g('p-registration'),focus:g('p-focus'),question:g('p-question'),
+    p:g('p-p'),i:g('p-i'),c:g('p-c'),o:g('p-o'),inc:g('p-inc'),exc:g('p-exc')});
+}
+function protocolTypeChanged(nextId){
+  readProtocol();
+  const meta=getReviewTypeMeta(nextId||'sr-pico');
+  ST.project.reviewTypeId=meta.id;ST.project.type=meta.label;ST.project.framework=meta.framework;
+  renderProtocol();
+}
+function saveProtocol(train){
+  readProtocol();
+  if(!ST.project.question.trim()){toast('Add a research question','err');return;}
+  // invalidate stale agent
+  if(ST.agent.trained){ST.agent.trained=false;ST.agent.calibration=null;updateAgentChip();}
+  save();updatePill();renderSpine();
+  if(train)ASRMA.go('agents'),setTimeout(trainAgents,200);
+  else toast('Protocol saved','ok');
+}
+function loadExampleProtocol(){
+  Object.assign(ST.project,{title:'mHealth interventions for blood-pressure control in LMICs',
+    reviewTypeId:'srma-pico',type:'Systematic Review + Meta-analysis (PICO)',framework:'PICO',registration:'',focus:'Blood-pressure control and adherence',
+    question:'In adults with hypertension in low- and middle-income countries, do mobile-health interventions compared with usual care improve blood-pressure control?',
+    p:'Adults (≥18) with diagnosed hypertension in low- or middle-income countries',
+    i:'Mobile health / smartphone app / SMS-based self-management interventions',
+    c:'Usual care, standard follow-up, or no mHealth component',
+    o:'Systolic & diastolic BP (mmHg), BP control rate, medication adherence',
+    inc:'Randomised or quasi-experimental design\nAdults with hypertension\nDelivered in an LMIC\nReports a BP or adherence outcome',
+    exc:'Protocols or conference abstracts only\nNon-hypertensive populations\nHigh-income-country settings\nNo usable quantitative outcome'});
+  renderProtocol();updatePill();toast('Example loaded','ok');
+}
+function updatePill(){const el=document.getElementById('proj-pill');
+  el.textContent=ST.project.title||ST.project.question?(ST.project.title||ST.project.question).slice(0,60):'No project — start in Protocol';}
+window.saveProtocol=saveProtocol;window.loadExampleProtocol=loadExampleProtocol;
+
+/* ===================== AGENTS PANE ===================== */
+function renderAgents(){
+  const a=ST.agent;const p=ST.project;
+  const trained=a.trained;
+  const cal=a.calibration;
+  document.getElementById('pane-agents').innerHTML=`
+  <div class="pane-h"><div class="eyebrow">Phase 02 — set up your reviewer</div>
+    <h1>⊹ Train Viveka</h1>
+    <p>Viveka is your screening reviewer. Rather than dropping a generic model on your studies, Viveka is <b>specialised on your protocol first</b>: she learns the domain vocabulary, adopts an expert-reviewer persona, derives a decision rubric, then self-tests on synthetic cases so you see a measured accuracy <i>before</i> she screens anything real.</p></div>
+  <div class="banner info"><span class="bi">ⓘ</span><div><b>What "train" means here:</b> Viveka runs on a large language model (the API key you set in ⚙ Settings). "Training" does <b>not</b> retrain that model's weights — it builds a protocol-specific brief (persona + glossary + rubric) the model follows, then calibrates it. New to this? Open <a href="#" onclick="aboutModal();return false" style="color:inherit;font-weight:700">About &amp; how to use</a>, or hit <b>▶ Demo</b> to watch a complete review run end-to-end with no key.</div></div>
+
+  ${!p.question?`<div class="banner warn"><span class="bi">⚠</span><div>No protocol yet. <a href="#" onclick="ASRMA.go('protocol');return false" style="color:inherit;font-weight:700">Define your question & PICO</a> first.</div></div>`:''}
+
+  <div class="agent-card">
+    <div class="agent-top">
+      <div class="agent-avatar">${trained?'🧠':'⊹'}</div>
+      <div style="flex:1">
+        <div style="font-size:16px;font-weight:800">${trained?'Viveka — your trained reviewer':'Viveka — not set up yet'}</div>
+        <div class="muted" style="margin-top:3px">${trained?('Specialised in '+esc(cal?.domain||p.type)+' · trained '+new Date(a.trainedAt).toLocaleString()):'Click train to specialise this agent on your review.'}</div>
+        <div style="margin-top:8px">
+          <span class="pill s">Model: ${MODELS[a.model].label}</span>
+          <span class="pill f">Advanced: ${MODELS[a.advModel].label}</span>
+          ${(a.corrections&&a.corrections.length)?`<span class="pill s">learned ${a.corrections.length} expert corrections</span>`:''}
+        </div>
+      </div>
+      ${cal?`<div style="text-align:center">
+        ${calRing(cal.acc)}
+        <div class="muted" style="margin-top:4px">calibration<br>${cal.correct}/${cal.n} gold cases</div></div>`:''}
+    </div>
+    <div class="train-steps">
+      <div class="tstep ${trained?'done':''}" id="s-domain"><div class="ic">①</div><div class="tx">Model the domain — glossary & synonyms</div></div>
+      <div class="tstep ${trained?'done':''}" id="s-persona"><div class="ic">②</div><div class="tx">Adopt expert-reviewer persona</div></div>
+      <div class="tstep ${trained?'done':''}" id="s-rubric"><div class="ic">③</div><div class="tx">Derive include / exclude rubric</div></div>
+      <div class="tstep ${trained?'done':''}" id="s-gold"><div class="ic">④</div><div class="tx">Generate synthetic gold-standard cases</div></div>
+      <div class="tstep ${trained?'done':''}" id="s-calib"><div class="ic">⑤</div><div class="tx">Self-test & calibrate</div></div>
+    </div>
+    <div style="padding:0 22px 22px"><div class="row">
+      <button class="btn flow" id="train-btn" onclick="ASRMA.trainAgents()">⊹ ${trained?'Re-train agent':'Train agent'}</button>
+      ${trained?'<button class="btn gh" onclick="ASRMA.go(\'import\')">Continue to import →</button>':''}
+    </div></div>
+  </div>
+
+  ${trained?`
+  <div class="grid2">
+    <div class="card"><div class="card-h">Reviewer persona</div>
+      <div style="font-size:12.5px;line-height:1.65;color:var(--t2)">${esc(a.persona)}</div></div>
+    <div class="card"><div class="card-h">Decision rubric</div>
+      ${a.rubric.map(r=>`<div class="kv"><span>${esc(r)}</span></div>`).join('')||'<div class="muted">—</div>'}</div>
+  </div>
+  <div class="grid2">
+    <div class="card"><div class="card-h">Domain glossary <span class="tag">${a.glossary.length} terms</span></div>
+      ${a.glossary.map(g=>`<div class="kv"><b style="font-family:var(--ff)">${esc(g.term)}</b><span class="muted" style="text-align:right;max-width:60%">${esc(g.meaning)}</span></div>`).join('')||'<div class="muted">—</div>'}</div>
+    <div class="card"><div class="card-h">Search synonyms <span class="tag">auto-highlight</span></div>
+      <div>${a.synonyms.map(s=>`<span class="pill">${esc(s)}</span>`).join('')||'<div class="muted">—</div>'}</div>
+      ${cal&&cal.tricky&&cal.tricky.length?`<div class="divider"></div><div class="card-h" style="margin-bottom:8px">Known pitfalls</div>
+        ${cal.tricky.map(t=>`<div class="kv"><span>⚠ ${esc(t)}</span></div>`).join('')}`:''}</div>
+  </div>
+  ${cal?`<div class="card"><div class="card-h">Calibration detail <span class="tag">${cal.acc}% agreement</span></div>
+    <table class="tbl"><thead><tr><th>Synthetic case</th><th>Gold</th><th>Viveka</th><th>Match</th></tr></thead><tbody>
+    ${cal.details.map(d=>`<tr><td>${esc(d.title)}</td><td><span class="dchip ${d.gold==='include'?'inc':'exc'}">${d.gold}</span></td>
+      <td><span class="dchip ${d.pred==='include'?'inc':'exc'}">${d.pred}</span></td>
+      <td>${d.ok?'✓':'✗'}</td></tr>`).join('')}</tbody></table>
+    <div class="muted" style="margin-top:10px">Calibration uses model-generated cases, so it measures internal consistency, not external validity. Treat it as a sanity check, then confirm on a human-labelled sample during screening.</div></div>`:''}
+  `:''}
+  ${localResultsSection()}`;
+}
+function localResultsSection(){
+  const e=ST.engine;
+  const head=`<div class="divider" style="margin:26px 0 18px"></div>
+    <div class="pane-h" style="margin-bottom:14px"><div class="eyebrow" style="color:var(--flow)">the free, in-browser reviewer</div>
+    <h1 style="font-size:19px">⚙ Viveka Local</h1>
+    <p style="margin:6px 0 16px">A classifier (TF-IDF + logistic regression) that learns your include/exclude pattern from a labelled seed, then screens every other paper in your browser with <b>zero tokens</b>. Best for large reviews. Trained in the <a href="#" onclick="ASRMA.go('screen');return false" style="color:var(--flow);font-weight:700">Screening phase</a>.</p></div>`;
+  if(!e){
+    return head+`<div class="banner info"><span class="bi">⚙</span><div>Not trained yet. Switch a review to <b>Viveka Local</b> in the Screening phase (auto-recommended above ${SCREEN_THRESHOLD} papers), label a small seed, and train — its results will appear here. Or hit <b>▶ Demo → Large review</b> to see it work on hundreds of papers.</div></div>`;
+  }
+  const v=e.val;const dv=e.demoEval;
+  const mtile=(val,lab,cls)=>`<div class="tile ${cls||''}"><div class="v" style="font-size:24px">${val}</div><div class="k">${lab}</div></div>`;
+  return head+`
+  <div class="agent-card"><div class="agent-top">
+    <div class="agent-avatar" style="background:linear-gradient(135deg,#0d9488,#0891b2)">⚙</div>
+    <div style="flex:1"><div style="font-size:16px;font-weight:800">Viveka Local — trained ✓</div>
+      <div class="muted" style="margin-top:3px">Seed of ${e.seedN} labels (${e.seedInc} include / ${e.seedExc} exclude) · vocabulary ${e.vocab.length} terms · trained ${new Date(e.trainedAt).toLocaleString()}</div>
+      <div style="margin-top:8px"><span class="pill f">runs locally</span><span class="pill f">0 tokens to screen</span><span class="pill s">~0.05 ms / paper</span></div></div>
+  </div></div>
+  ${v?`<div class="card"><div class="card-h">How it does — ${v.folds}-fold cross-validation on your labels <span class="tag">honest estimate</span></div>
+    <div class="tiles">${mtile(v.recall+'%','recall (sensitivity)','flow')}${mtile(v.prec+'%','precision','syn')}${mtile(v.f1+'%','F1 score')}${mtile(v.acc+'%','accuracy','inc')}</div>
+    <div class="muted">Recall is what matters most in screening — it's the share of true includes the engine catches. These come from holding out part of your seed during training, so they're realistic (not the optimistic resubstitution figure). Lower the include-threshold slider in Screening to push recall higher at the cost of more papers to review.</div></div>`:'<div class="banner warn"><span class="bi">⚠</span><div>Too few seed labels for cross-validation — label more includes & excludes for a reliable estimate.</div></div>'}
+  ${dv?`<div class="card"><div class="card-h">Demo benchmark — measured against known answers <span class="tag">${dv.n} held-out papers</span></div>
+    <div class="tiles">${mtile(dv.recall+'%','recall','flow')}${mtile(dv.prec+'%','precision','syn')}${mtile(dv.rankTop+'%','includes in top 30%','maybe')}${mtile(dv.scored,'papers scored free','inc')}</div>
+    <div class="muted">In this demo we know the true labels, so this is real held-out performance: of all the includes Viveka Local had never seen, it correctly flagged <b>${dv.recall}%</b>, and <b>${dv.rankTop}%</b> of true includes sit in the top 30% of its ranked list — so you'd find almost all of them while reading only a third of the pile. Real reviews are messier; expect a bit lower.</div></div>`:''}
+  <div class="grid2">
+    <div class="card"><div class="card-h">Words that push toward INCLUDE</div><div>${(e.topInc||[]).map(w=>`<span class="pill f">${esc(w)}</span>`).join('')}</div></div>
+    <div class="card"><div class="card-h">Words that push toward EXCLUDE</div><div>${(e.topExc||[]).map(w=>`<span class="pill" style="background:var(--exc-w);color:#b91c1c">${esc(w)}</span>`).join('')}</div></div>
+  </div>`;
+}
+function calRing(pct){
+  const r=34,c=2*Math.PI*r,off=c*(1-pct/100);
+  const col=pct>=80?'var(--inc)':pct>=60?'var(--maybe)':'var(--exc)';
+  return`<svg width="84" height="84" viewBox="0 0 84 84"><circle cx="42" cy="42" r="${r}" fill="none" stroke="var(--wash2)" stroke-width="8"/>
+    <circle cx="42" cy="42" r="${r}" fill="none" stroke="${col}" stroke-width="8" stroke-linecap="round"
+      stroke-dasharray="${c}" stroke-dashoffset="${off}" transform="rotate(-90 42 42)"/>
+    <text x="42" y="47" text-anchor="middle" font-size="20" font-weight="800" fill="${col}">${pct}%</text></svg>`;
+}
+ASRMA.trainAgents=trainAgents;
+
+
+/* ===================== SOURCES PANE — LIVE SEARCH ===================== */
+let SEARCH_RESULTS=[];
+function renderSources(){
+  const syn=ST.agent.synonyms||[];const p=ST.project;
+  const q0=ST.project._lastQuery||'';
+  document.getElementById('pane-sources').innerHTML=`
+  <div class="pane-h"><div class="eyebrow">Phase 03 — find the evidence</div>
+    <h1>⌕ Search sources</h1>
+    <p>Search live databases from here and pull records straight in — no manual export. Europe PMC, Crossref and OpenAlex are queried directly now; PubMed, Embase, Scopus, Web of Science, Semantic Scholar, IEEE Xplore, and Cochrane are available as one-click query launch targets from the same strategy.</p></div>
+
+  <div class="card"><div class="card-h">🔎 Live search <span class="tag">free · no key</span></div>
+    <div class="fg"><label class="fl">Query <span class="hint">keywords or Boolean — e.g. mhealth AND hypertension AND (LMIC OR "low income")</span></label>
+      <textarea class="inp" id="sq" style="min-height:60px;font-family:var(--fm);font-size:12.5px" placeholder="Type your search…">${esc(q0)}</textarea></div>
+    <div class="row" style="margin-bottom:12px">
+      <label class="row" style="gap:6px"><input type="checkbox" id="src-epmc" checked> Europe PMC</label>
+      <label class="row" style="gap:6px"><input type="checkbox" id="src-cr" checked> Crossref</label>
+      <label class="row" style="gap:6px"><input type="checkbox" id="src-oa" checked> OpenAlex</label>
+      <select class="inp" id="src-lim" style="width:auto"><option value="50">50 per source</option><option value="100" selected>100 per source</option><option value="200">200 per source</option></select>
+      ${p.question?'<button class="btn gh sm" onclick="suggestQuery()">⊹ Draft query from PICO</button>':''}
+      <span class="spacer"></span>
+      <button class="btn flow" id="search-btn" onclick="runLiveSearch()">Search & preview</button>
+    </div>
+    <div class="pbar" style="margin-bottom:10px"><i id="search-bar"></i></div>
+    <div id="search-status" class="muted"></div>
+    <div id="search-results"></div>
+    <div class="divider"></div>
+    <div class="card-h" style="margin-bottom:10px">Open the same query elsewhere</div>
+    <div class="row">
+      ${['pubmed','semantic','ieee','embase','scopus','wos','cochrane','doi'].map(t=>`<button class="btn gh sm" onclick="openSearchTarget('${t}')">${({pubmed:'PubMed',semantic:'Semantic Scholar',ieee:'IEEE Xplore',embase:'Embase',scopus:'Scopus',wos:'Web of Science',cochrane:'Cochrane',doi:'DOI / full text'})[t]}</button>`).join('')}
+    </div>
+    <div class="muted" style="margin-top:10px">Use these when a database needs a licensed institutional login or when you want to inspect DOI landing pages and full-text availability manually.</div>
+  </div>
+
+  <div class="card"><div class="card-h">Boolean strategy for licensed databases <span class="tag">copy & paste</span></div>
+    ${!p.question?'<div class="muted">Define your protocol first.</div>':`
+    <div class="row" style="margin-bottom:12px">
+      <button class="btn gh sm" onclick="buildBoolean()">⊹ Draft PubMed/Embase strategy</button>
+      <span class="muted">Uses synonyms (${syn.length}) + PICO blocks — paste into Embase, Scopus, Web of Science, then import the export file.</span></div>
+    <textarea class="inp" id="bool-out" style="min-height:140px;font-family:var(--fm);font-size:12px" placeholder="Your Boolean strategy will appear here…"></textarea>
+    <div class="row" style="margin-top:10px"><button class="btn gh sm" onclick="copyBool()">Copy</button>
+      <span class="muted">Database links: pubmed.ncbi.nlm.nih.gov · embase.com · scopus.com · webofscience.com · cochranelibrary.com</span></div>`}
+  </div>`;
+}
+function suggestQuery(){
+  const p=ST.project;const syn=(ST.agent.synonyms||[]);
+  const q=[p.i,p.p,p.o,p.focus].filter(Boolean).flatMap(x=>x.split(/\n|,|;|\/| or /i).map(s=>s.trim()).filter(Boolean));
+  const extra=syn.slice(0,8);
+  const terms=[...new Set(q.concat(extra))].filter(Boolean).slice(0,10);
+  document.getElementById('sq').value=terms.map(t=>/\s/.test(t)?`"${t}"`:t).join(' AND ');
+}
+function openSearchTarget(target){
+  const q=(document.getElementById('sq')||{}).value||ST.project._lastQuery||ST.project.question||'';
+  if(!q.trim()){toast('Enter or draft a query first','err');return;}
+  const urls={
+    pubmed:'https://pubmed.ncbi.nlm.nih.gov/?term=',
+    semantic:'https://www.semanticscholar.org/search?q=',
+    ieee:'https://ieeexplore.ieee.org/search/searchresult.jsp?queryText=',
+    embase:'https://www.embase.com/search/results?subaction=viewrecord&from=export&id=lui&query=',
+    scopus:'https://www.scopus.com/results/results.uri?sort=plf-f&src=s&st1=',
+    wos:'https://www.webofscience.com/wos/woscc/basic-search?search_mode=GeneralSearch&q=',
+    cochrane:'https://www.cochranelibrary.com/advanced-search/search?text=',
+    doi:'https://doi.org/'
   };
+  const url=target==='doi'
+    ? (SEARCH_RESULTS.find(r=>r.doi)?.doi ? urls.doi+encodeURIComponent(SEARCH_RESULTS.find(r=>r.doi).doi) : null)
+    : urls[target]+encodeURIComponent(q);
+  if(!url){toast('No DOI available in the current preview yet','err');return;}
+  window.open(url,'_blank','noopener');
+}
+async function runLiveSearch(){
+  const q=document.getElementById('sq').value.trim();
+  if(!q){toast('Type a query first','err');return;}
+  ST.project._lastQuery=q;
+  const lim=parseInt(document.getElementById('src-lim').value)||100;
+  const want={epmc:document.getElementById('src-epmc').checked,cr:document.getElementById('src-cr').checked,oa:document.getElementById('src-oa').checked};
+  const btn=document.getElementById('search-btn');btn.disabled=true;btn.textContent='Searching…';
+  const bar=document.getElementById('search-bar');const status=document.getElementById('search-status');
+  SEARCH_RESULTS=[];let steps=0,total=Object.values(want).filter(Boolean).length||1;
+  const log=[];
+  const run=async(name,fn)=>{try{const r=await fn();log.push(`${name}: ${r.length} records`);SEARCH_RESULTS=SEARCH_RESULTS.concat(r);}
+    catch(e){log.push(`${name}: failed (${e.message||'network/CORS'})`);}
+    steps++;if(bar)bar.style.width=Math.round(steps/total*100)+'%';if(status)status.textContent=log.join(' · ');};
+  if(want.epmc)await run('Europe PMC',()=>searchEPMC(q,lim));
+  if(want.cr)await run('Crossref',()=>searchCrossref(q,lim));
+  if(want.oa)await run('OpenAlex',()=>searchOpenAlex(q,lim));
+  // dedupe within results by DOI/title
+  const seen={};SEARCH_RESULTS=SEARCH_RESULTS.filter(r=>{const k=(r.doi||'').toLowerCase()||norm(r.title).slice(0,80);if(seen[k])return false;seen[k]=1;return true;});
+  btn.disabled=false;btn.textContent='Search & preview';
+  renderSearchResults();save();
+}
+function renderSearchResults(){
+  const el=document.getElementById('search-results');if(!el)return;
+  if(!SEARCH_RESULTS.length){el.innerHTML='<div class="muted" style="margin-top:10px">No records — try broader terms, or a different source. If all sources failed, your network may block them; use the Boolean strategy + file import instead.</div>';return;}
+  const existing=new Set(ST.refs.map(r=>(r.doi||'').toLowerCase()||norm(r.title).slice(0,80)));
+  const novel=SEARCH_RESULTS.filter(r=>!existing.has((r.doi||'').toLowerCase()||norm(r.title).slice(0,80)));
+  el.innerHTML=`<div class="row" style="margin:14px 0 10px">
+    <b>${SEARCH_RESULTS.length} records found</b> <span class="muted">(${novel.length} new, ${SEARCH_RESULTS.length-novel.length} already in project)</span>
+    <span class="spacer"></span>
+    <button class="btn" onclick="importSearchResults()">⇲ Import ${novel.length} new records</button></div>
+    ${SEARCH_RESULTS.slice(0,40).map(r=>`<div class="study" style="padding:11px 14px">
+      <div class="st-title" style="font-size:13.5px">${esc(r.title)}</div>
+      <div class="st-meta"><span>${esc((r.authors||'').split(';')[0]||'—')}</span><span>${esc(r.year||'')}</span>
+        <span>${esc(r.journal||'')}</span><span style="color:var(--flow)">${esc(r.source)}</span>
+        ${r.doi?`<span style="color:var(--t3)">doi:${esc(r.doi)}</span>`:''}
+        ${r.abstract?'':'<span style="color:var(--maybe)">no abstract</span>'}</div>
+    </div>`).join('')}
+    ${SEARCH_RESULTS.length>40?`<div class="muted" style="text-align:center;padding:10px">Showing 40 of ${SEARCH_RESULTS.length} — import to see all in screening.</div>`:''}`;
+}
+function importSearchResults(){
+  const existing=new Set(ST.refs.map(r=>(r.doi||'').toLowerCase()||norm(r.title).slice(0,80)));
+  let added=0;
+  SEARCH_RESULTS.forEach(r=>{const k=(r.doi||'').toLowerCase()||norm(r.title).slice(0,80);
+    if(existing.has(k))return;existing.add(k);
+    ST.refs.push(normalizeRef(Object.assign({id:uid(),dup:false},r)));added++;});
+  save();renderSpine();
+  toast(added+' records imported — they\'re in screening now','ok');
+  renderSearchResults();
+}
+/* ---- provider adapters (all CORS-friendly, no key) ---- */
+async function searchEPMC(q,lim){
+  const url='https://www.ebi.ac.uk/europepmc/webservices/rest/search?query='+encodeURIComponent(q)
+    +'&format=json&resultType=core&pageSize='+Math.min(lim,100);
+  const d=await (await fetch(url)).json();
+  const res=(d.resultList&&d.resultList.result)||[];
+  return res.map(h=>({title:(h.title||'').replace(/\.$/,''),abstract:(h.abstractText||'').replace(/<[^>]+>/g,''),
+    authors:(h.authorString||'').replace(/,/g,';'),year:(h.pubYear||'').toString(),
+    journal:(h.journalInfo&&h.journalInfo.journal&&h.journalInfo.journal.title)||h.bookOrReportDetails||'',
+    doi:h.doi||'',source:'Europe PMC'})).filter(r=>r.title);
+}
+async function searchCrossref(q,lim){
+  const url='https://api.crossref.org/works?query='+encodeURIComponent(q)+'&rows='+Math.min(lim,100)+'&mailto=research@pramana.app&select=title,author,container-title,issued,DOI,abstract';
+  const d=await (await fetch(url)).json();
+  const items=(d.message&&d.message.items)||[];
+  return items.map(it=>({title:(it.title&&it.title[0])||'',
+    abstract:(it.abstract||'').replace(/<[^>]+>/g,'').replace(/^Abstract/,''),
+    authors:(it.author||[]).map(a=>[a.family,a.given].filter(Boolean).join(' ')).join('; '),
+    year:(it.issued&&it.issued['date-parts']&&it.issued['date-parts'][0]&&it.issued['date-parts'][0][0])+''||'',
+    journal:(it['container-title']&&it['container-title'][0])||'',doi:it.DOI||'',source:'Crossref'})).filter(r=>r.title);
+}
+async function searchOpenAlex(q,lim){
+  const url='https://api.openalex.org/works?search='+encodeURIComponent(q)+'&per-page='+Math.min(lim,200)+'&mailto=research@pramana.app';
+  const d=await (await fetch(url)).json();
+  const res=d.results||[];
+  return res.map(w=>({title:w.title||w.display_name||'',
+    abstract:invertAbstract(w.abstract_inverted_index),
+    authors:(w.authorships||[]).map(a=>a.author&&a.author.display_name).filter(Boolean).join('; '),
+    year:(w.publication_year||'')+'',
+    journal:(w.primary_location&&w.primary_location.source&&w.primary_location.source.display_name)||'',
+    doi:(w.doi||'').replace(/^https?:\/\/doi\.org\//,''),source:'OpenAlex'})).filter(r=>r.title);
+}
+function invertAbstract(inv){if(!inv)return '';const words=[];
+  for(const w in inv)inv[w].forEach(pos=>words[pos]=w);
+  return words.join(' ').replace(/\s+/g,' ').trim();}
+window.runLiveSearch=runLiveSearch;window.renderSearchResults=renderSearchResults;
+window.importSearchResults=importSearchResults;window.suggestQuery=suggestQuery;
+async function buildBoolean(){
+  const p=ST.project;const out=document.getElementById('bool-out');out.value='Drafting…';
+  try{
+    const r=await LLM(`Draft a sensitive Boolean search strategy (PubMed syntax, with MeSH where useful) for:
+Q:${p.question}; P:${p.p}; I:${p.i}; C:${p.c}; O:${p.o}
+Use synonyms: ${(ST.agent.synonyms||[]).join(', ')}
+Return the strategy as PICO blocks combined with AND, plain text only, no commentary.`,900,ST.agent.advModel);
+    out.value=r.replace(/```/g,'').trim();
+  }catch(e){out.value='Error: '+e.message}
+}
+function copyBool(){const t=document.getElementById('bool-out');t.select();document.execCommand('copy');toast('Copied','ok');}
+window.buildBoolean=buildBoolean;window.copyBool=copyBool;
+
+/* ===================== IMPORT PANE ===================== */
+function renderImport(){
+  const n=ST.refs.length;
+  document.getElementById('pane-import').innerHTML=`
+  <div class="pane-h"><div class="eyebrow">Phase 04 — bring it in</div>
+    <h1>⇲ Import studies</h1>
+    <p>Drop your database exports here. The parser auto-detects RIS, BibTeX, EndNote XML, PubMed .nbib, and CSV (including Zotero & Mendeley column layouts).</p></div>
+
+  <div class="card">
+    <div id="drop" style="border:2px dashed var(--line2);border-radius:14px;padding:40px;text-align:center;transition:var(--trans);cursor:pointer">
+      <div style="font-size:40px;opacity:.4">⇲</div>
+      <h3 style="margin:10px 0 4px">Drop files or click to browse</h3>
+      <div class="muted">.ris · .bib · .nbib · .txt · .csv · .xml · .json</div>
+      <input type="file" id="file-in" multiple accept=".ris,.bib,.nbib,.txt,.csv,.xml,.json" style="display:none">
+    </div>
+    <div class="row" style="margin-top:14px;justify-content:center">
+      <span class="pill f">Zotero CSV ✓</span><span class="pill f">Mendeley CSV ✓</span><span class="pill s">EndNote XML ✓</span>
+      <span class="pill s">PubMed .nbib ✓</span><span class="pill">RIS ✓</span><span class="pill">BibTeX ✓</span>
+    </div>
+  </div>
+
+  <div class="card"><div class="card-h">Or paste records</div>
+    <textarea class="inp" id="paste-in" style="min-height:120px;font-family:var(--fm);font-size:11.5px" placeholder="Paste RIS / BibTeX / PubMed text here…"></textarea>
+    <div class="row" style="margin-top:10px"><button class="btn" onclick="ASRMA.importText()">Parse & add</button>
+      <button class="btn gh sm" onclick="document.getElementById('paste-in').value=SAMPLE_RIS">Insert sample RIS</button></div>
+  </div>
+
+  const files = {};
+  ST.refs.forEach(r => {
+    if(!files[r.source]) files[r.source] = { count: 0, db: r.db || 'Unknown' };
+    files[r.source].count++;
+  });
+  const fileRows = Object.entries(files).map(([src, info]) => {
+    const dbOptions = ['Unknown', 'PubMed', 'Scopus', 'Web of Science', 'Embase', 'Cochrane', 'Ovid', 'Other'].map(db => 
+      `<option value="${db}" ${info.db === db ? 'selected' : ''}>${db}</option>`
+    ).join('');
+    return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--line);background:#fff">
+      <div style="flex:1;font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(src)}">${esc(src)} <span class="muted" style="font-weight:400;margin-left:6px">(${info.count} records)</span></div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <select class="inp" style="padding:4px 8px;font-size:12px;height:auto;min-width:120px" onchange="window.updateSourceDb('${esc(src)}', this.value)">${dbOptions}</select>
+        <button class="btn danger gh sm" onclick="window.deleteSource('${esc(src)}')">Delete</button>
+      </div>
+    </div>`;
+  }).join('');
+  const fileListHTML = fileRows ? `<div class="card" style="padding:0;overflow:hidden;border-radius:12px;margin-bottom:16px">${fileRows}</div>` : '';
+
+  ${n?`<div class="tiles">
+    <div class="tile flow"><div class="v">${n}</div><div class="k">records imported</div></div>
+    <div class="tile"><div class="v">${new Set(ST.refs.map(r=>r.source)).size}</div><div class="k">sources</div></div>
+    <div class="tile maybe"><div class="v">${ST.refs.filter(r=>!r.abstract).length}</div><div class="k">missing abstract</div></div>
+  </div>
+  ${fileListHTML}
+  <div class="row"><button class="btn flow" onclick="ASRMA.go('dedup')">De-duplicate →</button>
+    <button class="btn danger gh sm" onclick="if(confirm('Remove all imported studies?')){ST.refs=[];ST.effects=[];save();renderImport();renderSpine()}">Clear all</button></div>`:''}`;
+  wireDrop();
+}
+function wireDrop(){
+  const d=document.getElementById('drop'),f=document.getElementById('file-in');if(!d)return;
+  d.onclick=()=>f.click();
+  f.onchange=e=>{[...e.target.files].forEach(readFile);f.value=''};
+  d.ondragover=e=>{e.preventDefault();d.style.borderColor='var(--syn)';d.style.background='var(--wash)'};
+  d.ondragleave=()=>{d.style.borderColor='';d.style.background=''};
+  d.ondrop=e=>{e.preventDefault();d.style.borderColor='';d.style.background='';[...e.dataTransfer.files].forEach(readFile)};
+}
+function readFile(file){const r=new FileReader();r.onload=()=>parseAndAdd(r.result,file.name);r.readAsText(file);}
+function doImportText(){const t=document.getElementById('paste-in').value;if(!t.trim()){toast('Nothing to parse','err');return;}parseAndAdd(t,'pasted');}
+function doImportFile(){}
+window.updateSourceDb = function(src, db) { ST.refs.forEach(r => { if(r.source === src) r.db = db; }); save(); renderImport(); };
+window.deleteSource = function(src) { if(!confirm('Delete all records imported from ' + src + '?')) return; ST.refs = ST.refs.filter(r => r.source !== src); ST.effects = []; save(); renderImport(); renderSpine(); };
+
+/* ---------- PARSERS ---------- */
+function parseAndAdd(text,fname){
+  let recs=[];const low=(fname||'').toLowerCase();
+  try{
+    if(low.endsWith('.json')){const j=JSON.parse(text);
+      if(j.refs){ST.refs=j.refs;ST.project=j.project||ST.project;ST.agent=j.agent||ST.agent;ST.effects=j.effects||[];ST.team=j.team||[];
+        save();toast('Project file loaded','ok');updatePill();updateAgentChip();renderTeam();renderImport();renderSpine();return;}
+      recs=Array.isArray(j)?j:[];}
+    else if(low.endsWith('.xml')||/<records>|<xml>|EndNote/.test(text.slice(0,400)))recs=parseEndNoteXML(text);
+    else if(/^TY  -|^\nTY  -/m.test(text)||low.endsWith('.ris'))recs=parseRIS(text);
+    else if(/^@\w+\s*{/m.test(text)||low.endsWith('.bib'))recs=parseBibTeX(text);
+    else if(/^PMID-|^TI  -|^AB  -/m.test(text)||low.endsWith('.nbib'))recs=parseNBIB(text);
+    else if(low.endsWith('.csv')||text.includes(',')&&text.includes('\n'))recs=parseCSV(text);
+    else recs=parseRIS(text);
+  }catch(e){toast('Parse error: '+e.message,'err');return;}
+  if(!recs.length){toast('No records found in '+(fname||'input'),'err');return;}
+  const src=(fname||'import').replace(/\.[^.]+$/,'');
+  recs.forEach(r=>{r.id=uid();r.source=r.source||src;r.dup=false;ST.refs.push(normalizeRef(r));});
+  save();renderImport();renderSpine();toast(recs.length+' records added from '+(fname||'paste'),'ok');
+}
+function normalizeRef(r){
+  return{id:r.id,title:(r.title||'').trim(),abstract:(r.abstract||'').trim(),
+    authors:(r.authors||'').trim(),year:(r.year||'').toString().slice(0,4),
+    journal:(r.journal||'').trim(),doi:(r.doi||'').replace(/^https?:\/\/(dx\.)?doi\.org\//,'').trim(),
+    source:r.source,db:r.db||'Unknown',dup:false,ta:null,ft:null,extract:null,quality:null};
+}
+function parseRIS(t){const recs=[];let cur=null;
+  t.split(/\r?\n/).forEach(line=>{
+    const m=line.match(/^([A-Z][A-Z0-9])\s{2}-\s?(.*)$/);
+    if(m){const[,tag,val]=m;
+      if(tag==='TY'){if(cur)recs.push(cur);cur={authors:''};}
+      if(!cur)return;
+      if(tag==='TI'||tag==='T1')cur.title=(cur.title?cur.title+' ':'')+val;
+      else if(tag==='AB'||tag==='N2')cur.abstract=(cur.abstract?cur.abstract+' ':'')+val;
+      else if(tag==='AU'||tag==='A1')cur.authors+=(cur.authors?'; ':'')+val;
+      else if(tag==='PY'||tag==='Y1')cur.year=val.replace(/[^0-9]/g,'').slice(0,4);
+      else if(tag==='JO'||tag==='JF'||tag==='JA'||tag==='T2')cur.journal=cur.journal||val;
+      else if(tag==='DO')cur.doi=val;
+      else if(tag==='ER'){recs.push(cur);cur=null;}
+    }else if(cur&&line.trim()&&cur.abstract){cur.abstract+=' '+line.trim();}
+  });
+  if(cur)recs.push(cur);return recs.filter(r=>r.title);
+}
+function parseNBIB(t){const recs=[];t.replace(/\r/g,'').split(/(?:\n\s*\n|\n(?=PMID-\s|PMID -\s))/).forEach(block=>{
+  if(!block.trim())return;const r={authors:''};const lines=block.split(/\n/);let lastTag='';
+  lines.forEach(l=>{const m=l.match(/^([A-Z]{2,4})\s*-\s?(.*)$/);
+    if(m){lastTag=m[1];const v=m[2];
+      if(lastTag==='TI')r.title=(r.title||'')+v+' ';
+      else if(lastTag==='AB')r.abstract=(r.abstract||'')+v+' ';
+      else if(lastTag==='FAU'||lastTag==='AU')r.authors+=(r.authors?'; ':'')+v;
+      else if(lastTag==='DP')r.year=v.replace(/[^0-9]/g,'').slice(0,4);
+      else if(lastTag==='JT'||lastTag==='TA')r.journal=r.journal||v;
+      else if(lastTag==='LID'||lastTag==='AID'){const d=v.match(/(10\.\d{4,}\/[^\s\[]+)/);if(d)r.doi=d[1];}
+    }else if(/^\s+/.test(l)&&lastTag){
+      if(lastTag==='TI')r.title+=l.trim()+' ';
+      else if(lastTag==='AB')r.abstract=(r.abstract||'')+l.trim()+' ';
+      else if(lastTag==='JT'||lastTag==='TA')r.journal=(r.journal||'')+' '+l.trim();
+    }
+  });
+  if(r.title){['title','abstract','journal','authors'].forEach(k=>r[k]&&(r[k]=r[k].replace(/\s+/g,' ').trim()));recs.push(r);}
+});return recs;
+}
+function parseBibTeX(t){const recs=[];const entries=t.split(/@\w+\s*{/).slice(1);
+  entries.forEach(e=>{const r={authors:''};
+    const fields={};const re=/(\w+)\s*=\s*[{"]([\s\S]*?)[}"]\s*,?\s*(?=\w+\s*=|$)/g;let m;
+    // simpler: match field={...}
+    const fre=/(\w+)\s*=\s*\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}/g;
+    while((m=fre.exec(e))){fields[m[1].toLowerCase()]=m[2].replace(/[{}]/g,'').trim();}
+    r.title=fields.title;r.abstract=fields.abstract;r.year=fields.year;
+    r.journal=fields.journal||fields.booktitle;r.doi=fields.doi;
+    r.authors=(fields.author||'').replace(/\s+and\s+/g,'; ');
+    if(r.title)recs.push(r);});
+  return recs;
+}
+function parseEndNoteXML(t){const recs=[];const doc=new DOMParser().parseFromString(t,'text/xml');
+  doc.querySelectorAll('record').forEach(rec=>{const g=s=>{const e=rec.querySelector(s);return e?e.textContent.trim():'';};
+    const auth=[...rec.querySelectorAll('contributors author')].map(a=>a.textContent.trim()).join('; ');
+    recs.push({title:g('titles title'),abstract:g('abstract'),authors:auth,
+      year:g('dates year'),journal:g('periodical full-title')||g('titles secondary-title'),
+      doi:g('electronic-resource-num')});});
+  return recs.filter(r=>r.title);
+}
+function parseCSV(t){
+  const rows=csvRows(t);if(rows.length<2)return[];
+  const head=rows[0].map(h=>h.toLowerCase().trim());
+  const find=(...keys)=>{for(const k of keys){const i=head.findIndex(h=>h===k||h.includes(k));if(i>=0)return i;}return -1;};
+  const iT=find('title','article title'),iA=find('abstract','abstract note'),
+    iAu=find('author','authors'),iY=find('year','publication year','date'),
+    iJ=find('journal','publication title','source','secondary title'),iD=find('doi');
+  return rows.slice(1).filter(r=>r.length>1).map(r=>({
+    title:iT>=0?r[iT]:'',abstract:iA>=0?r[iA]:'',authors:iAu>=0?r[iAu]:'',
+    year:iY>=0?(r[iY]||'').toString().replace(/[^0-9]/g,'').slice(0,4):'',
+    journal:iJ>=0?r[iJ]:'',doi:iD>=0?r[iD]:''})).filter(r=>r.title);
+}
+function csvRows(t){const rows=[];let row=[],cell='',q=false;
+  for(let i=0;i<t.length;i++){const c=t[i];
+    if(q){if(c==='"'){if(t[i+1]==='"'){cell+='"';i++}else q=false}else cell+=c}
+    else{if(c==='"')q=true;else if(c===','){row.push(cell);cell=''}
+      else if(c==='\n'){row.push(cell);rows.push(row);row=[];cell=''}
+      else if(c==='\r'){}else cell+=c}}
+  if(cell||row.length){row.push(cell);rows.push(row)}return rows;
 }
 
-let PORT, server;
-let pass=0, fail=0;
-function ok(name, cond){ if(cond){pass++;console.log('  ✓ '+name);} else {fail++;console.log('  ✗ FAIL: '+name);} }
-
-async function run() {
-  server = app.listen(0);
-  PORT = server.address().port;
-
-  console.log('\n=== AUTH ===');
-  const lead = makeClient();
-  let r = await lead('POST','/api/auth/register',{email:'lead@uni.edu',name:'Dr Lead',password:'secret123'});
-  ok('register lead', r.status===200 && r.body.user.email==='lead@uni.edu');
-  r = await lead('POST','/api/auth/register',{email:'lead@uni.edu',password:'secret123'});
-  ok('duplicate email rejected', r.status===409);
-  r = await lead('GET','/api/me');
-  ok('session works (cookie)', r.status===200 && r.body.user.email==='lead@uni.edu');
-  ok('new account starts with 50 Viveka AI credits', r.status===200 && r.body.user.aiCredits===50);
-  const bad = makeClient();
-  r = await bad('POST','/api/auth/login',{email:'lead@uni.edu',password:'wrong'});
-  ok('wrong password rejected', r.status===401);
-  r = await bad('GET','/api/me');
-  ok('no session => 401', r.status===401);
-
-  console.log('\n=== PROJECTS ===');
-  r = await lead('POST','/api/projects',{title:'mHealth HTN review', data:{project:{title:'mHealth HTN review',question:'Q'},refs:[{id:'r1',title:'A'}]}});
-  ok('create project', r.status===200 && r.body.id);
-  const pid = r.body.id;
-  r = await lead('GET','/api/projects');
-  ok('lists my project', r.status===200 && r.body.projects.length===1 && r.body.projects[0].role==='owner');
-  r = await lead('GET','/api/projects/'+pid);
-  ok('load project data', r.status===200 && r.body.project.data.refs.length===1 && r.body.role==='owner');
-  let version = r.body.project.version;
-
-  console.log('\n=== SAVE / CONCURRENCY ===');
-  r = await lead('PUT','/api/projects/'+pid,{version, data:{project:{title:'mHealth HTN review'},refs:[{id:'r1',title:'A',ta:{final:'include'}}]}});
-  ok('save bumps version', r.status===200 && r.body.version===version+1);
-  // stale save (old version) should conflict
-  r = await lead('PUT','/api/projects/'+pid,{version, data:{refs:[]}});
-  ok('stale save => 409 conflict', r.status===409 && r.body.currentVersion===version+1);
-
-  console.log('\n=== SERVER JOBS ===');
-  r = await lead('POST','/api/projects/'+pid+'/jobs',{type:'extract-all',refIds:[],fields:[]});
-  ok('create server extraction job', r.status===200 && r.body.job && r.body.job.id);
-  const jid = r.body.job.id;
-  await new Promise(resolve=>setTimeout(resolve,25));
-  r = await lead('GET','/api/jobs/'+jid);
-  ok('server extraction job is readable', r.status===200 && ['queued','running','succeeded'].includes(r.body.job.status));
-
-  console.log('\n=== INVITE + SHARED ACCESS ===');
-  // invite a reviewer who hasn't registered yet
-  r = await lead('POST','/api/projects/'+pid+'/invite',{email:'student@uni.edu',role:'reviewer'});
-  ok('invite created (returns link)', r.status===200 && /invite=/.test(r.body.link));
-  const inviteToken = r.body.link.split('invite=')[1];
-  // student registers -> should auto-join via pending invite
-  const student = makeClient();
-  r = await student('POST','/api/auth/register',{email:'student@uni.edu',name:'Asha',password:'pass123'});
-  ok('student registers', r.status===200);
-  r = await student('GET','/api/projects');
-  ok('student auto-joined invited project', r.status===200 && r.body.projects.some(p=>p.id===pid));
-  r = await student('GET','/api/projects/'+pid);
-  ok('student can load shared project', r.status===200 && r.body.role==='reviewer');
-  ok('student sees lead\'s saved decision', r.body.project.data.refs[0].ta && r.body.project.data.refs[0].ta.final==='include');
-
-  console.log('\n=== SHARED EDITING (the Rayyan thing) ===');
-  // student saves a change; lead reloads and sees it
-  let sv = r.body.project.version;
-  r = await student('PUT','/api/projects/'+pid,{version:sv, data:{project:{title:'mHealth HTN review'},refs:[{id:'r1',title:'A',ta:{final:'include'}},{id:'r2',title:'B',ta:{final:'exclude'}}]}});
-  ok('student saves to shared project', r.status===200);
-  r = await lead('GET','/api/projects/'+pid);
-  ok('lead sees student\'s new study (live shared data)', r.body.project.data.refs.length===2 && r.body.project.data.refs[1].ta.final==='exclude');
-
-  console.log('\n=== INVITE EXISTING USER + ACCEPT TOKEN ===');
-  const other = makeClient();
-  await other('POST','/api/auth/register',{email:'prof@uni.edu',name:'Prof',password:'pass123'});
-  r = await lead('POST','/api/projects/'+pid+'/invite',{email:'prof@uni.edu',role:'editor'});
-  ok('inviting existing user adds them immediately', r.status===200 && r.body.alreadyUser===true);
-  r = await other('GET','/api/projects');
-  ok('existing user now sees project', r.body.projects.some(p=>p.id===pid));
-
-  console.log('\n=== MEMBERS + PERMISSIONS ===');
-  r = await lead('GET','/api/projects/'+pid+'/members');
-  ok('members list shows 3', r.status===200 && r.body.members.length===3);
-  // reviewer cannot delete project
-  r = await student('DELETE','/api/projects/'+pid);
-  ok('reviewer cannot delete project', r.status===403);
-  // non-member cannot access
-  const outsider = makeClient();
-  await outsider('POST','/api/auth/register',{email:'nobody@uni.edu',password:'pass123'});
-  r = await outsider('GET','/api/projects/'+pid);
-  ok('non-member blocked (403)', r.status===403);
-
-  console.log('\n=== INVITE ACCEPT VIA TOKEN (link click) ===');
-  const linkUser = makeClient();
-  await linkUser('POST','/api/auth/register',{email:'link@uni.edu',password:'pass123'});
-  // simulate a fresh invite + clicking the link
-  r = await lead('POST','/api/projects/'+pid+'/invite',{email:'someoneelse@uni.edu',role:'reviewer'});
-  const tok2 = r.body.link.split('invite=')[1];
-  r = await linkUser('POST','/api/invites/accept',{token:tok2});
-  ok('accept invite by token joins project', r.status===200 && r.body.projectId===pid);
-
-  console.log('\n=== INVITE DEDUPE ===');
-  r = await lead('POST','/api/projects/'+pid+'/invite',{email:'repeat@uni.edu',role:'reviewer'});
-  ok('first invite for pending reviewer created', r.status===200 && /invite=/.test(r.body.link));
-  const firstRepeatLink = r.body.link;
-  r = await lead('POST','/api/projects/'+pid+'/invite',{email:'repeat@uni.edu',role:'reviewer'});
-  ok('second invite reuses existing pending invite', r.status===200 && r.body.pendingAlreadyExists===true && r.body.link===firstRepeatLink);
-  r = await lead('GET','/api/projects/'+pid+'/members');
-  const repeatPending = (r.body.pending||[]).filter(p => p.email==='repeat@uni.edu');
-  ok('pending members list stays deduplicated', repeatPending.length===1);
-
-  console.log('\n=== PASSWORD RESET ===');
-  // forgot for a real user — email not configured in test, so devLink is returned
-  r = await bad('POST','/api/auth/forgot',{email:'lead@uni.edu'});
-  ok('forgot returns ok + devLink (no email configured)', r.status===200 && /reset=/.test(r.body.devLink||''));
-  const resetTok = (r.body.devLink||'').split('reset=')[1];
-  // forgot for a non-existent user — still ok, but no link (don't reveal existence)
-  r = await bad('POST','/api/auth/forgot',{email:'ghost@uni.edu'});
-  ok('forgot hides whether email exists', r.status===200 && !r.body.devLink);
-  // reset with a too-short password
-  r = await bad('POST','/api/auth/reset',{token:resetTok,password:'123'});
-  ok('reset rejects weak password', r.status===400);
-  // reset properly -> logs in
-  const resetClient = makeClient();
-  r = await resetClient('POST','/api/auth/reset',{token:resetTok,password:'newpass456'});
-  ok('reset succeeds and logs in', r.status===200 && r.body.user.email==='lead@uni.edu');
-  // token can't be reused
-  r = await bad('POST','/api/auth/reset',{token:resetTok,password:'another789'});
-  ok('used reset token rejected', r.status===400);
-  // can log in with the NEW password, not the old
-  const relog = makeClient();
-  r = await relog('POST','/api/auth/login',{email:'lead@uni.edu',password:'newpass456'});
-  ok('login works with new password', r.status===200);
-  r = await relog('POST','/api/auth/login',{email:'lead@uni.edu',password:'secret123'});
-  ok('old password no longer works', r.status===401);
-
-  console.log('\n=== SERVER AI PHASE 1 ===');
-  r = await lead('GET','/api/config');
-  ok('config reports server AI disabled when no key set', r.status===200 && r.body.aiServerEnabled===false);
-  r = await lead('POST','/api/ai/generate',{model:'gemini-flash',prompt:'Return OK',maxTok:16});
-  ok('server AI endpoint requires configured provider key', r.status===503 && /not configured/i.test(r.body.error||''));
-  r = await lead('GET','/api/me');
-  ok('failed AI call does not deduct credits', r.status===200 && r.body.user.aiCredits===50);
-
-  console.log('\n=== SERVER AI PHASE 2 SCREENING ===');
-  r = await outsider('POST','/api/projects/'+pid+'/ai/screen',{stage:'ta',refId:'r2'});
-  ok('non-member blocked from server-side screening', r.status===403);
-  r = await lead('POST','/api/projects/'+pid+'/ai/screen',{stage:'ta',refId:'missing'});
-  ok('server-side screening rejects missing study', r.status===404);
-  r = await lead('POST','/api/projects/'+pid+'/ai/screen',{stage:'ta',refId:'r2'});
-  ok('server-side screening uses configured project and requires provider key', r.status===503 && /not configured/i.test(r.body.error||''));
-
-  console.log('\n=== SERVER AI PHASE 3 EXTRACTION ===');
-  r = await lead('GET','/api/projects/'+pid);
-  version = r.body.project.version;
-  r = await lead('PUT','/api/projects/'+pid,{version, data:{project:{title:'mHealth HTN review',question:'Q',inc:'Adults',exc:'Animal studies'},agent:{advModel:'deepseek'},refs:[{id:'r1',title:'Trial A',abstract:'Randomized trial with 100 adults.',ft:{decision:'include',pdfText:'Methods: randomized controlled trial of 100 adults. Results: systolic blood pressure decreased by 5 mmHg compared with control.'}}]}});
-  ok('prepare included full-text study for extraction', r.status===200);
-  r = await outsider('POST','/api/projects/'+pid+'/ai/extract',{refId:'r1'});
-  ok('non-member blocked from server-side extraction', r.status===403);
-  r = await lead('POST','/api/projects/'+pid+'/ai/extract',{refId:'missing'});
-  ok('server-side extraction rejects missing study', r.status===404);
-  r = await lead('POST','/api/projects/'+pid+'/ai/extract',{refId:'r1'});
-  ok('server-side extraction requires configured provider key', r.status===503 && /not configured/i.test(r.body.error||''));
-  r = await lead('GET','/api/me');
-  ok('failed extraction does not deduct credits', r.status===200 && r.body.user.aiCredits===50);
-
-  console.log('\n=== RATE LIMITING ===');
-  const rlc = makeClient();
-  let blocked=false;
-  for (let i=0;i<12;i++){ const rr=await rlc('POST','/api/auth/login',{email:'rate@uni.edu',password:'x'}); if(rr.status===429){blocked=true;break;} }
-  ok('brute-force login gets blocked (429)', blocked);
-
-  server.close();
-  console.log(`\n=== RESULT: ${pass} passed, ${fail} failed ===`);
-  process.exit(fail?1:0);
+/* ===================== DEDUP ===================== */
+function norm(s){return (s||'').toLowerCase().replace(/[^a-z0-9 ]/g,'').replace(/\s+/g,' ').trim();}
+function runDedup(){
+  const seen={};let dups=0;
+  ST.refs.forEach(r=>r.dup=false);
+  ST.refs.forEach(r=>{
+    const keyDoi=r.doi?'doi:'+r.doi.toLowerCase():null;
+    const keyTit='t:'+norm(r.title).slice(0,80)+'|'+(r.year||'');
+    const k=keyDoi||keyTit;
+    if(seen[k]||(keyDoi&&seen['t:'+norm(r.title).slice(0,80)+'|'+(r.year||'')])){r.dup=true;dups++;}
+    else{seen[k]=1;if(!keyDoi)seen[keyTit]=1;else seen['t:'+norm(r.title).slice(0,80)+'|'+(r.year||'')]=1;}
+  });
+  save();renderDedup();renderSpine();toast(dups+' duplicates flagged','ok');
 }
-run().catch(e=>{console.error('TEST CRASH:',e);process.exit(1);});
+function renderDedup(){
+  const dups=ST.refs.filter(r=>r.dup);const uniq=ST.refs.filter(r=>!r.dup);
+  document.getElementById('pane-dedup').innerHTML=`
+  <div class="pane-h"><div class="eyebrow">Phase 05 — clean the set</div>
+    <h1>⧉ De-duplicate</h1>
+    <p>Matches on DOI first, then normalised title + year. Duplicates are flagged, not deleted, so the PRISMA count stays auditable.</p></div>
+  <div class="tiles">
+    <div class="tile"><div class="v">${ST.refs.length}</div><div class="k">total records</div></div>
+    <div class="tile exc"><div class="v">${dups.length}</div><div class="k">duplicates</div></div>
+    <div class="tile flow"><div class="v">${uniq.length}</div><div class="k">unique studies</div></div>
+  </div>
+  <div class="row" style="margin-bottom:18px"><button class="btn flow" onclick="ASRMA.dedup()">⧉ Run de-duplication</button>
+    ${uniq.length?`<button class="btn" onclick="ASRMA.go('screen')">Screen titles/abstracts →</button>`:''}</div>
+  ${dups.length?`<div class="card"><div class="card-h">Flagged duplicates <span class="tag">${dups.length}</span></div>
+    ${dups.slice(0,40).map(r=>`<div class="kv"><span>${esc(r.title)}</span><button class="vbtn inc" title="Keep this one" onclick="unflag('${r.id}')">↺</button></div>`).join('')}
+    ${dups.length>40?`<div class="muted" style="margin-top:8px">+${dups.length-40} more</div>`:''}</div>`:
+    '<div class="empty"><div class="ico">⧉</div><h3>No duplicates flagged yet</h3><div>Run de-duplication to scan your imported set.</div></div>'}`;
+}
+function unflag(id){const r=ST.refs.find(x=>x.id===id);if(r){r.dup=false;save();renderDedup();renderSpine();}}
+window.unflag=unflag;
+
+
+/* ===================== SCREENING ENGINE ===================== */
+let SCREEN_FILTER='all', SCREEN_Q='';
+function ensureLiveSplit(){ if(!ST.liveSplit)ST.liveSplit={ta:{members:[],overlap:0,updatedAt:null,updatedBy:''}}; if(!ST.liveSplit.ta)ST.liveSplit.ta={members:[],overlap:0,updatedAt:null,updatedBy:''}; return ST.liveSplit; }
+function taAssignedIds(r){ return (r._assign&&Array.isArray(r._assign.ta))?r._assign.ta:[]; }
+function hasLiveAssignments(){ return ST.refs.some(r=>!r.dup&&taAssignedIds(r).length); }
+function isAssignedToMe(r){
+  if(!BK.isServer()||!BK.user) return true;
+  const ids=taAssignedIds(r);
+  if(!ids.length) return true;
+  return ids.includes(BK.user.id) || ids.includes(BK.user.email);
+}
+function myAssignedRefs(){
+  return ST.refs.filter(r=>!r.dup&&isAssignedToMe(r));
+}
+function myPendingAssignedCount(){
+  return ST.refs.filter(r=>!r.dup&&isAssignedToMe(r)&&!myStageReview(r,'ta')).length;
+}
+function titleAbstractScopeRefs(){
+  let refs=ST.refs.filter(r=>!r.dup);
+  if(BK.isServer&&BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())refs=refs.filter(r=>isAssignedToMe(r));
+  return refs;
+}
+function toggleMyAssignmentsOnly(){
+  BK.myAssignmentsOnly=!BK.myAssignmentsOnly;
+  renderScreen();
+}
+function loadLiveSplitDefaults(members){
+  ensureLiveSplit();
+  const prior=ST.liveSplit.ta.members||[];
+  const priorMap={};prior.forEach(m=>priorMap[m.id]=m);
+  const active=members.slice();
+  const even=active.length?Math.floor(100/active.length):100;
+  return active.map((m,idx)=>({
+    id:m.id,name:m.name||m.email,email:m.email,role:m.role,
+    pct:priorMap[m.id]?priorMap[m.id].pct:(idx===active.length-1?100-even*(active.length-1):even)
+  }));
+}
+function currentReviewerName(){
+  if(window.BK&&BK.isServer()&&BK.user)return BK.user.name||BK.user.email||'team reviewer';
+  return 'Local reviewer';
+}
+function reviewedMeta(entry){
+  if(!entry)return '';
+  const who=entry.reviewer||entry.by||'reviewer';
+  const when=entry.reviewedAt?(' · '+new Date(entry.reviewedAt).toLocaleString()):'';
+  return `${who}${when}`;
+}
+function ensureReviewWorkflow(){
+  ST.reviewWorkflow=ST.reviewWorkflow||{};
+  ST.reviewWorkflow.ta=Object.assign({blind:true,minReviewers:2,requireExcludeReason:true},ST.reviewWorkflow.ta||{});
+  ST.reviewWorkflow.ft=Object.assign({blind:false,minReviewers:1,requireExcludeReason:true},ST.reviewWorkflow.ft||{});
+  return ST.reviewWorkflow;
+}
+function reviewerKey(){
+  if(window.BK&&BK.isServer&&BK.isServer()&&BK.user)return BK.user.id||BK.user.email;
+  return 'local';
+}
+function reviewerInfo(){
+  if(window.BK&&BK.isServer&&BK.isServer()&&BK.user)return {id:reviewerKey(),name:BK.user.name||BK.user.email,email:BK.user.email||''};
+  return {id:'local',name:'Local reviewer',email:''};
+}
+function stageStore(r,stage){
+  r.reviews=r.reviews||{};
+  r.reviews[stage]=r.reviews[stage]||{};
+  return r.reviews[stage];
+}
+function stageReviews(r,stage){
+  const root=r.reviews||{};
+  const store=root[stage]||{};
+  const rows=Object.keys(store).map(k=>Object.assign({reviewerId:k},store[k])).filter(x=>x&&x.final);
+  if(stage==='ta'){
+    Object.keys(root).forEach(k=>{
+      if(k==='ta'||k==='ft')return;
+      const v=root[k];if(v&&v.final)rows.push(Object.assign({reviewerId:k,reviewer:k},v));
+    });
+  }
+  return rows;
+}
+function myStageReview(r,stage){
+  const store=(r.reviews&&r.reviews[stage])||{};
+  return store[reviewerKey()]||null;
+}
+function stageFinalObj(r,stage){return stage==='ft'?r.ft:r.ta;}
+function setStageFinalObj(r,stage,val){
+  if(stage==='ft'&&val&&val.final&&!val.decision)val.decision=val.final;
+  if(stage==='ft'){
+    if(!val){
+      const old=r.ft||{},keep={};
+      ['oa','pdfText','pdfName','fileId','fileMime','fileSize','fulltextUrl','source','doi','fetchedAt','serverExtractedAt','serverExtractedBy','pages'].forEach(k=>{if(old[k]!=null)keep[k]=old[k];});
+      r.ft=Object.keys(keep).length?keep:null;
+    }else r.ft=Object.assign({},r.ft||{},val);
+  }else r.ta=val;
+}
+function conflictFlag(stage){return stage==='ft'?'_ftConflict':'_conflict';}
+function visibleStageDecision(r,stage){
+  const own=myStageReview(r,stage);
+  const final=stageFinalObj(r,stage);
+  const wf=ensureReviewWorkflow()[stage];
+  if(window.BK&&BK.isServer&&BK.isServer()&&BK.role==='reviewer'&&wf.blind){
+    if(own)return own;
+    if(final&&(final.by==='consensus'||final.by==='arbitrator'||final.by==='agent'||final.by==='local'))return final;
+    return null;
+  }
+  return own||final||null;
+}
+function requireDecisionReason(stage,r,dec){
+  const existing=(myStageReview(r,stage)||stageFinalObj(r,stage)||{}).comment||'';
+  return existing;
+}
+function setReviewerStageDecision(r,stage,dec,comment,prev){
+  const info=reviewerInfo();
+  const store=stageStore(r,stage);
+  store[info.id]={final:dec,by:'human',reviewerId:info.id,reviewer:info.name,email:info.email,comment:comment||'',reason:comment||'human decision',conf:100,reviewedAt:new Date().toISOString(),seeded:prev&&prev.seeded};
+  computeStageConsensus(r,stage);
+  return store[info.id];
+}
+function computeStageConsensus(r,stage){
+  const wf=ensureReviewWorkflow()[stage];
+  const reviews=stageReviews(r,stage).filter(x=>x.by==='human');
+  const flag=conflictFlag(stage);
+  const current=stageFinalObj(r,stage)||{};
+  if(current.by==='arbitrator')return current;
+  if(reviews.length<Math.max(1,wf.minReviewers)){
+    if(!current.by||current.by==='conflict'||current.by==='consensus')setStageFinalObj(r,stage,null);
+    r[flag]=false;
+    return null;
+  }
+  const uniq=[...new Set(reviews.map(x=>x.final))];
+  if(uniq.length===1){
+    const first=reviews[0];
+    const final=Object.assign({},first,{by:'consensus',reviewer:'Reviewer consensus',reviewedBy:reviews.map(x=>x.reviewer||x.email||x.reviewerId).join(', '),reason:'Reviewer consensus: '+uniq[0],reviewedAt:new Date().toISOString()});
+    setStageFinalObj(r,stage,final);
+    r[flag]=false;
+    return final;
+  }
+  r[flag]=true;
+  setStageFinalObj(r,stage,{final:'maybe',by:'conflict',conf:50,reason:'Reviewer conflict: '+reviews.map(x=>(x.reviewer||x.email||x.reviewerId)+': '+x.final).join(' vs '),reviewedAt:new Date().toISOString(),reviewedBy:reviews.map(x=>x.reviewer||x.email||x.reviewerId).join(', ')});
+  return stageFinalObj(r,stage);
+}
+function resolveConsensus(stage,id,dec){
+  const r=refById(id);if(!r)return;
+  const info=reviewerInfo();
+  setStageFinalObj(r,stage,{final:dec,by:'arbitrator',conf:100,reason:'Consensus resolved by '+info.name,comment:'Consensus resolved by '+info.name,reviewer:info.name,reviewerId:info.id,reviewedAt:new Date().toISOString(),reviewedBy:stageReviews(r,stage).map(x=>x.reviewer||x.email||x.reviewerId).join(', ')});
+  r[conflictFlag(stage)]=false;
+  saveNow();showConsensusModal(stage);
+  if(stage==='ft'){renderFTStats();renderFulltextList();}else{renderScreenStats();renderScreenList();}
+  renderSpine();
+  toast('Consensus resolved','ok');
+}
+function reviewSummaryHTML(r,stage){
+  const reviews=stageReviews(r,stage);
+  if(!reviews.length)return '';
+  const wf=ensureReviewWorkflow()[stage];
+  if(window.BK&&BK.isServer&&BK.isServer()&&BK.role==='reviewer'&&wf.blind)return '<div class="muted" style="margin-top:8px;font-size:11.5px">Blind screening is on. You can see your own decision; other reviewer decisions stay hidden until consensus.</div>';
+  return '<div class="muted" style="margin-top:8px;font-size:11.5px"><b>Reviewer decisions:</b> '+reviews.map(x=>esc((x.reviewer||x.email||'reviewer')+': '+x.final+(x.comment?' - '+x.comment:''))).join(' | ')+'</div>';
+}
+function setDecisionComment(stage,id,val){
+  const r=refById(id);if(!r)return;
+  const mine=myStageReview(r,stage);
+  if(mine)mine.comment=val;
+  else if(stage==='ft'){r.ft=r.ft||{};r.ft.comment=val;}
+  else{r.ta=r.ta||{};r.ta.comment=val;}
+  saveSoon();
+}
+function ftEstimateMinutes(r){
+  const ft=r.ft||{};
+  if(ft.pdfText){
+    return Math.max(4,Math.min(18,Math.round(ft.pdfText.length/2200)));
+  }
+  if(ft.fulltextUrl||r.doi||r.abstract)return 8;
+  return 12;
+}
+function fmtMinutes(mins){
+  if(!mins)return '0 min';
+  if(mins<60)return mins+' min';
+  const h=Math.floor(mins/60),m=mins%60;
+  return h+'h'+(m?(' '+m+'m'):'');
+}
+function fmtDuration(ms){
+  ms=Math.max(0,Math.round(ms||0));
+  if(ms<1000)return ms+' ms';
+  const sec=Math.round(ms/1000);
+  if(sec<60)return sec+' sec';
+  const m=Math.floor(sec/60),s=sec%60;
+  return m+'m'+(s?(' '+s+'s'):'');
+}
+function progressTick(id,done,total,start,label){
+  const el=document.getElementById(id);if(!el)return;
+  const elapsed=Date.now()-start;
+  const per=done?elapsed/done:0;
+  const left=Math.max(0,total-done);
+  el.textContent=`${label||'Screening'}: ${done}/${total} · elapsed ${fmtDuration(elapsed)} · ${done?('~'+fmtDuration(per)+' / article · ETA '+fmtDuration(per*left)):'starting...'}`;
+}
+const BATCH_CTRL={ta:{running:false,stop:false},ftCloud:{running:false,stop:false},ftLocal:{running:false,stop:false},fetchFT:{running:false,stop:false}};
+function batchStart(k){BATCH_CTRL[k]=BATCH_CTRL[k]||{};BATCH_CTRL[k].running=true;BATCH_CTRL[k].stop=false;updateBatchButtons();}
+function stopBatch(k){if(BATCH_CTRL[k]){BATCH_CTRL[k].stop=true;toast('Stopping after the current article finishes','ok');updateBatchButtons();}}
+function batchEnd(k){if(BATCH_CTRL[k]){BATCH_CTRL[k].running=false;updateBatchButtons();}}
+function updateBatchButtons(){
+  const pairs=[['ta','screen-stop-btn'],['ftCloud','ft-cloud-stop-btn'],['ftLocal','ft-local-stop-btn'],['fetchFT','ft-fetch-stop-btn']];
+  pairs.forEach(([k,id])=>{const b=document.getElementById(id);if(b)b.disabled=!(BATCH_CTRL[k]&&BATCH_CTRL[k].running);});
+}
+window.stopBatch=stopBatch;window.updateBatchButtons=updateBatchButtons;
+function logAIDiscrepancy(stage,r,prev,human){
+  const aiDecision=prev&&(prev.final||prev.decision);
+  if(!prev||!aiDecision||!prev.by||prev.by==='human'||aiDecision===human)return false;
+  const item={id:uid('disc_'),stage,refId:r.id,title:r.title||'',aiBy:prev.by,model:prev.model||'',aiDecision,humanDecision:human,
+    aiReason:prev.reason||'',reviewer:currentReviewerName(),at:new Date().toISOString()};
+  ensureAudit().push(item);
+  ST.agent=ST.agent||{};ST.agent.corrections=ST.agent.corrections||[];
+  ST.agent.corrections.push(item);
+  ST.agent.corrections=ST.agent.corrections.slice(-30);
+  ST.agent.adaptedAt=item.at;
+  return true;
+}
+function correctionMemory(stage){
+  const rows=(ST.agent&&ST.agent.corrections||[]).filter(x=>!stage||x.stage===stage).slice(-8);
+  if(!rows.length)return '';
+  return '\nHUMAN CORRECTIONS / ACTIVE-LEARNING LESSONS:\n'
+    +'Use these as reviewer feedback. Do not repeat the same mistake pattern; apply the correction only when the current study is substantively similar.\n'
+    +rows.map((x,i)=>`${i+1}. ${x.title||'Study'}: prior AI said ${x.aiDecision}; human expert changed to ${x.humanDecision}. Prior reason: ${x.aiReason||'not recorded'}`).join('\n')+'\n';
+}
+function normDecision(v){
+  v=(v||'').toString().toLowerCase();
+  if(v.includes('inc'))return 'include';
+  if(v.includes('may')||v.includes('unclear')||v.includes('border'))return 'maybe';
+  if(v.includes('exc'))return 'exclude';
+  return 'maybe';
+}
+let _localRetrainT=null;
+function scheduleLocalRetrain(){
+  if(!ST.engine)return;
+  const t=localTrainable();
+  if(!t.ok)return;
+  clearTimeout(_localRetrainT);
+  _localRetrainT=setTimeout(()=>{_localRetrainT=null;try{trainLocalEngine();toast('Viveka Local learned from the human correction and re-scored the queue','ok');}catch(e){}},1200);
+}
+function buildScreenPrompt(title,abstract,mode){
+  const a=ST.agent,p=ST.project;
+  const persona=a.persona||'You are a senior systematic reviewer trained in Cochrane/JBI methodology.';
+  const rubric=(a.rubric||[]).map((r,i)=>`  ${i+1}. ${r}`).join('\n')||'  Match the PICO and eligibility criteria.';
+  const strict=ST.settings.strictness;
+  const reviewCtx=buildReviewContext(p);
+  return`${persona}
+
+You are screening a title/abstract for this systematic review. Act like a careful dual-reviewer panel:
+- First judge Population, concept/intervention/exposure, comparator/context, outcome, and study design separately.
+- Then make the final decision.
+- In title/abstract screening, avoid false exclusions. If the abstract is incomplete but plausibly eligible, choose "maybe" for human/full-text review.
+- Only exclude when a clear exclusion rule is met.
+Strictness: ${strict} (when unsure, ${strict==='strict'?'lean EXCLUDE only if a clear exclusion is present':strict==='lenient'?'lean INCLUDE/MAYBE for full-text check':'mark MAYBE'}).
+
+${reviewCtx}
+QUESTION: ${p.question}
+FRAMEWORK VALUES — 1:${p.p||'any'} | 2:${p.i||'any'} | 3:${p.c||'any'} | 4:${p.o||'any'}
+INCLUDE if: ${p.inc||'matches PICO'}
+EXCLUDE if: ${p.exc||'outside PICO'}
+
+DECISION RUBRIC:
+${rubric}
+${correctionMemory('ta')}
+
+STUDY
+Title: ${title}
+Abstract: ${abstract||'(no abstract available)'}
+
+Decide. Return ONLY JSON:
+{"v":"include|exclude|maybe","conf":0-100,"reason":"<specific one-clause eligibility rationale>","pico":{"p":true/false,"i":true/false,"o":true/false}}`;
+}
+async function screenOne(id,useAdv){
+  const r=ST.refs.find(x=>x.id===id);if(!r)return;
+  const started=Date.now();
+  const model=useAdv?ST.agent.advModel:ST.agent.model;
+  if(window.BK&&BK.isServer&&BK.isServer()&&serverAIReady(model)&&ST.id){
+    if(typeof _srvTimer!=='undefined'&&_srvTimer)await serverSaveNow();
+    const res=await BK.api('POST','/api/projects/'+ST.id+'/ai/screen',{stage:'ta',refId:id},70000);
+    syncAICredits(res);
+    const dec=normDecision(res.decision||res.v);
+    r.ta={a:dec,b:null,final:dec,conf:res.conf||50,reason:res.reason||'',comment:(r.ta&&r.ta.comment)||'',pico:res.pico||{},by:'agent',model:res.model||model,reviewer:'Viveka',reviewedAt:new Date().toISOString(),ms:Date.now()-started,server:true};
+    return r;
+  }
+  const res=parseJSON(await LLM(buildScreenPrompt(r.title,r.abstract,'screen'),320,model));
+  const dec=normDecision(res.v);
+  r.ta={a:dec,b:null,final:dec,conf:res.conf||50,reason:res.reason||'',comment:(r.ta&&r.ta.comment)||'',pico:res.pico||{},by:'agent',model,reviewer:'Viveka',reviewedAt:new Date().toISOString(),ms:Date.now()-started};
+  return r;
+}
+async function screenAll(resume){
+  if(!ST.agent.trained){toast('Train the agent first','err');ASRMA.go('agents');return;}
+  if(BATCH_CTRL.ta.running){updateBatchButtons();toast('Viveka Cloud is already screening - use Stop if you want to pause it','err');return;}
+  const scope=titleAbstractScopeRefs();
+  const assignedMode=BK.isServer&&BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments();
+  const pend=assignedMode?scope.filter(r=>!myStageReview(r,'ta')):scope.filter(r=>!r.ta);
+  const queue=resume?pend:(pend.length?pend:scope);
+  if(!queue.length){toast('Nothing to screen','err');return;}
+  if(!resume&&pend.length===0&&!confirm('Re-screen all '+queue.length+' studies?'))return;
+  const btn=document.getElementById('screen-btn');if(btn)btn.disabled=true;
+  batchStart('ta');
+  agentBusy(true);
+  const bar=document.getElementById('screen-bar');let done=0;const list=queue;const started=Date.now();
+  const scopeLabel=(BK.isServer&&BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())?'Viveka Cloud - assigned only':'Viveka Cloud';
+  progressTick('screen-time',0,list.length,started,scopeLabel);
+  for(const r of list){
+    if(BATCH_CTRL.ta.stop)break;
+    try{await screenOne(r.id);}catch(e){r.ta={a:'maybe',final:'maybe',conf:0,reason:'error: '+e.message,by:'agent'};}
+    done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';
+    progressTick('screen-time',done,list.length,started,scopeLabel);
+    if(done%10===0){saveSoon();renderScreenStats();}
+  }
+  const stopped=BATCH_CTRL.ta.stop;
+  batchEnd('ta');saveNow();agentBusy(false);renderScreen();renderSpine();
+  toast((stopped?'Stopped after ':'Screened ')+done+' '+((BK.isServer&&BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())?'assigned ':'')+'studies','ok');
+}
+function setDecision(id,dec,ev){
+  const r=refById(id);if(!r)return;
+  const prev=visibleStageDecision(r,'ta')||r.ta||{};
+  const comment=requireDecisionReason('ta',r,dec);
+  if(comment===null)return;
+  const learned=logAIDiscrepancy('ta',r,r.ta||prev,dec);
+  if(window.BK&&BK.isServer&&BK.isServer()){
+    setReviewerStageDecision(r,'ta',dec,comment,prev);
+  }else{
+    r.ta=Object.assign({},prev,{final:dec,human:dec,by:'human',conf:100,reason:comment||prev.reason||'human decision',comment:comment||prev.comment||'',reviewer:currentReviewerName(),reviewedAt:new Date().toISOString(),seeded:prev.seeded});
+    if(r._conflict)r._conflict=false;
+  }
+  if(learned&&prev.by==='local')scheduleLocalRetrain();
+  saveSoon();
+  if(currentMode()==='local'&&!ST.engine){renderScreen();renderSpine();return;}
+  renderScreenList();renderScreenStats();renderSpine();
+  return;
+  const card=(ev&&ev.target&&ev.target.closest)?ev.target.closest('.study'):document.querySelector('.study[data-id="'+id+'"]');
+  if(card){
+    card.className='study '+dec;
+    const tag=card.querySelector('.st-foot .dchip.pend, .st-foot .dchip:not(.ai)');
+    if(tag){tag.className='dchip '+dec;tag.textContent=dec==='include'?'✓ Include':dec==='exclude'?'✗ Exclude':'? Maybe';}
+    const inc=card.querySelector('.vbtn.inc'),exc=card.querySelector('.vbtn.exc'),mb=card.querySelector('.vbtn.maybe');
+    if(inc)inc.classList.toggle('act-inc',dec==='include');
+    if(exc)exc.classList.toggle('act-exc',dec==='exclude');
+    if(mb)mb.classList.toggle('act-maybe',dec==='maybe');
+  }
+  statsSoon();spineSoon();
+}
+/* throttle the heavier redraws so rapid clicking stays smooth */
+let _statsT=null,_spineT=null;
+function statsSoon(){if(_statsT)return;_statsT=setTimeout(()=>{_statsT=null;renderScreenStats();},180);}
+function spineSoon(){if(_spineT)return;_spineT=setTimeout(()=>{_spineT=null;renderSpine();},300);}
+window.statsSoon=statsSoon;window.spineSoon=spineSoon;
+function hl(text){const syn=ST.agent.synonyms||[];if(!syn.length||!text)return esc(text);
+  let s=esc(text);
+  syn.slice(0,18).forEach(w=>{if(w.length<3)return;
+    const re=new RegExp('('+w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','gi');
+    s=s.replace(re,'<span class="hl">$1</span>');});
+  return s;
+}
+const SCREEN_THRESHOLD=250; // auto-recommend local engine above this many unique papers
+function uniqueCount(){return ST.refs.filter(r=>!r.dup).length;}
+function recommendedMode(){return uniqueCount()>SCREEN_THRESHOLD?'local':'llm';}
+function currentMode(){return ST.settings.screenMode||recommendedMode();}
+function setMode(m){ST.settings.screenMode=m;save();renderScreen();}
+function renderScreen(){
+  const n=uniqueCount();const mode=currentMode();const rec=recommendedMode();const splitOn=BK.isServer()&&hasLiveAssignments();
+  const recTxt=rec==='llm'
+    ? `${n} papers — small enough that <b>Viveka (LLM)</b> can screen them all directly. On a free Gemini key this is typically <b>free</b> and most accurate at this size.`
+    : `${n} papers — large enough that Viveka Local pays off: label a small seed, then screen the rest with <b>zero tokens</b>.`;
+  document.getElementById('pane-screen').innerHTML=`
+  <div class="pane-h"><div class="eyebrow">Phase 06 — sift</div>
+    <h1>⊜ Title / abstract screening</h1>
+    <p>Viveka works two ways: <b>Viveka · Cloud</b> reads every abstract on an LLM (uses tokens, best accuracy), and <b>Viveka · Local</b> — her on-device agent — learns from a small labelled seed and then screens everything else free, in your browser, with no tokens.</p></div>
+  <div class="banner ${rec===mode?'info':'warn'}"><span class="bi">${rec==='local'?'⚙':'⊹'}</span><div>
+    <b>Recommended: ${rec==='llm'?'Viveka (LLM)':'Viveka Local'}.</b> ${recTxt}
+    ${mode!==rec?` You've selected <b>${mode==='llm'?'Viveka (LLM)':'Viveka Local'}</b> instead — that's fine.`:''}</div></div>
+  <div class="toolbar" style="margin-bottom:14px">
+    <div class="seg">
+      <button class="${mode==='llm'?'on':''}" onclick="setMode('llm')">⊹ Viveka · Cloud${rec==='llm'?' ★':''}</button>
+      <button class="${mode==='local'?'on':''}" onclick="setMode('local')">⚙ Viveka Local${rec==='local'?' ★':''}</button>
+    </div>
+    <span class="muted">★ = recommended for ${n} papers · switch anytime</span>
+    <span class="spacer"></span>
+    ${splitOn?`<button class="btn gh sm" onclick="toggleMyAssignmentsOnly()" title="Show only studies assigned to you">${BK.myAssignmentsOnly?'My assigned only: on':'My assigned only: off'}</button>`:''}
+    <button class="btn gh sm" onclick="teamBatchModal()" title="${BK.isServer()?'Assign studies across live project members':'Split articles between reviewers and merge their work'}">👥 Team & batches</button>
+    ${BK.isServer()?`<button class="btn gh sm" onclick="showConsensusModal('ta')" title="Reviewer progress, conflicts, and kappa">Consensus & IRR</button>`:''}
+  </div>
+  <div id="screen-stats"></div>
+  <div class="toolbar"><button class="btn gh sm" onclick="resetTitleAbstractScreening()" title="Clear all title/abstract screening decisions">Reset title/abstract screening</button></div>
+  ${mode==='llm'?renderLLMControls():renderLocalControls()}
+  ${mode==='local'?`<div class="toolbar"><span class="muted" id="screen-time">Timer appears after Viveka Local scores or re-thresholds.</span></div>`:''}
+  <div class="toolbar">
+    <div class="seg" id="screen-seg">
+      ${['all','pending','include','maybe','exclude'].map(f=>`<button class="${SCREEN_FILTER===f?'on':''}" onclick="setScreenFilter('${f}')">${f[0].toUpperCase()+f.slice(1)}</button>`).join('')}
+      ${mode==='local'&&ST.engine?`<button class="${SCREEN_FILTER==='al'?'on':''}" onclick="setScreenFilter('al')" title="Most uncertain papers">Uncertain</button>`:''}
+      ${tbConflicts().length?`<button class="${SCREEN_FILTER==='conflict'?'on':''}" onclick="setScreenFilter('conflict')" title="Reviewer disagreements" style="color:var(--exc)">⚠ Conflicts (${tbConflicts().length})</button>`:''}
+    </div>
+    <div class="search-box"><input placeholder="Search titles…" value="${esc(SCREEN_Q)}" oninput="onSearchInput(this.value)"></div>
+  </div>
+  <div id="screen-list"></div>`;
+  renderScreenStats();renderScreenList();
+  updateBatchButtons();
+}
+function renderLLMControls(){
+  return `<div class="toolbar">
+    <button class="btn flow sm" id="screen-btn" onclick="ASRMA.screenAll()">⊹ Auto-screen with Viveka</button>
+    <button class="btn gh sm" id="screen-stop-btn" onclick="stopBatch('ta')" disabled>Stop</button>
+    <button class="btn gh sm" onclick="ASRMA.screenAll(true)">Resume pending</button>
+    <div class="pbar" style="width:140px"><i id="screen-bar"></i></div>
+    <span class="muted" id="screen-time">Timer appears while Viveka Cloud is screening.</span>
+    <select class="inp" style="width:auto" onchange="ST.settings.strictness=this.value;save()">
+      ${['lenient','balanced','strict'].map(s=>`<option value="${s}" ${ST.settings.strictness===s?'selected':''}>${s} strictness</option>`).join('')}</select>
+    <span class="muted">Uses ~1 LLM call per paper.</span>
+  </div>`;
+}
+/* ===================== LOCAL AI SCREENING ENGINE =====================
+   High-recall TF-IDF ensemble, trained in-browser on a labelled
+   seed, then scores all remaining papers with ZERO LLM tokens.
+   Model is stored locally in ST.engine and reused across sessions.        */
+const STOP=new Set(('the a an and or of in to for with on at by is are was were be been being this that these those we our us study studies result results method methods background conclusion conclusions aim aims objective objectives using used use also from as it its their which who whom between among versus vs than then more most less can may might will shall not no but however thus therefore can could would should has have had do does did such into over under out up down about after before during per via both each either neither all any some many few one two three new also based show shown showed found compared comparison group groups patient patients trial paper article review report data analysis significant significantly associated association effect effects outcome outcomes').split(' '));
+function lstem(w){return w.replace(/(ational|ization|iveness|fulness)$/,'').replace(/(ies)$/,'y').replace(/(ing|edly|edness|ed|ly|es|s)$/,'').replace(/(.)\1$/,'$1');}
+function ltok(s){
+  const base=(s||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').split(/\s+/)
+    .filter(w=>w.length>2&&w.length<25&&!STOP.has(w)&&!/^\d+$/.test(w)).map(lstem).filter(w=>w.length>2);
+  const out=base.slice();
+  for(let i=0;i<base.length-1;i++)out.push(base[i]+'_'+base[i+1]);
+  for(let i=0;i<base.length-2;i++)out.push(base[i]+'_'+base[i+1]+'_'+base[i+2]);
+  return out;
+}
+function docText(r){return (r.title||'')+' '+(r.title||'')+' '+(r.abstract||'');} // title weighted x2
+
+function buildVocab(docs){
+  const df={};const toks=docs.map(d=>{const t=ltok(d.text);const u=new Set(t);u.forEach(w=>df[w]=(df[w]||0)+1);return t;});
+  let vocab=Object.keys(df).filter(w=>df[w]>=2);
+  vocab.sort((a,b)=>df[b]-df[a]);vocab=vocab.slice(0,5000);
+  const vidx={};vocab.forEach((w,i)=>vidx[w]=i);
+  const N=docs.length;const idf=vocab.map(w=>Math.log((N+1)/(df[w]+1))+1);
+  return {vocab,vidx,idf,N};
+}
+function tfidf(tokens,eng){
+  const tf={};tokens.forEach(w=>{const i=eng.vidx[w];if(i!=null)tf[i]=(tf[i]||0)+1;});
+  let norm=0;const v={};
+  for(const i in tf){const val=(1+Math.log(tf[i]))*eng.idf[i];v[i]=val;norm+=val*val;}
+  norm=Math.sqrt(norm)||1;for(const i in v)v[i]/=norm;
+  return v;
+}
+function trainLR(samples,dim,epochs){
+  const w=new Float64Array(dim);let b=0;const lr=0.6,lam=2e-4;epochs=epochs||350;
+  // class weights to handle imbalance (includes usually rarer)
+  const pos=samples.filter(s=>s.y===1).length||1,neg=samples.length-pos||1;
+  const wPos=samples.length/(2*pos),wNeg=samples.length/(2*neg);
+  for(let e=0;e<epochs;e++){
+    for(let k=samples.length-1;k>0;k--){const j=(Math.random()*(k+1))|0;const t=samples[k];samples[k]=samples[j];samples[j]=t;}
+    for(const s of samples){
+      let z=b;for(const i in s.v)z+=w[i]*s.v[i];
+      const p=1/(1+Math.exp(-z));const cw=s.y===1?wPos:wNeg;const g=(p-s.y)*cw;
+      for(const i in s.v)w[i]-=lr*(g*s.v[i]+lam*w[i]);
+      b-=lr*g;
+    }
+  }
+  return {w:Array.from(w),b};
+}
+function lrPredict(v,model){let z=model.b;for(const i in v)z+=model.w[i]*v[i];return 1/(1+Math.exp(-z));}
+function centroid(samples,target){
+  const c={};let n=0;
+  samples.forEach(s=>{if(s.y!==target)return;n++;for(const i in s.v)c[i]=(c[i]||0)+s.v[i];});
+  if(!n)return null;
+  let norm=0;for(const i in c){c[i]/=n;norm+=c[i]*c[i];}
+  norm=Math.sqrt(norm)||1;for(const i in c)c[i]/=norm;
+  return c;
+}
+function dotSparse(a,b){let s=0;if(!a||!b)return 0;for(const i in a)if(b[i]!=null)s+=a[i]*b[i];return s;}
+function sigmoid(x){return 1/(1+Math.exp(-Math.max(-30,Math.min(30,x))));}
+function localProbability(v,eng){
+  const lr=lrPredict(v,{w:eng.w,b:eng.b});
+  if(!eng.incCentroid||!eng.excCentroid)return lr;
+  const simInc=dotSparse(v,eng.incCentroid),simExc=dotSparse(v,eng.excCentroid);
+  const sim=sigmoid((simInc-simExc)*5);
+  return Math.max(0.001,Math.min(0.999,(lr*0.65)+(sim*0.35)));
+}
+function recallThreshold(samples,eng,target){
+  const pos=samples.filter(s=>s.y===1).map(s=>localProbability(s.v,eng)).sort((a,b)=>a-b);
+  if(pos.length<3)return 0.35;
+  const ix=Math.max(0,Math.min(pos.length-1,Math.floor(pos.length*(1-(target||0.95)))));
+  return Math.max(0.12,Math.min(0.45,pos[ix]));
+}
+
+function localTrainingLabels(){
+  const rows=[];
+  ST.refs.filter(r=>!r.dup).forEach(r=>{
+    const final=stageFinalObj(r,'ta');
+    if(final&&['include','exclude'].includes(final.final)&&['human','consensus','arbitrator'].includes(final.by||'')){
+      rows.push({r,label:final.final});return;
+    }
+    const mine=myStageReview(r,'ta');
+    if(mine&&['include','exclude'].includes(mine.final)){rows.push({r,label:mine.final});return;}
+    if(r.ta&&r.ta.by==='human'&&['include','exclude'].includes(r.ta.final))rows.push({r,label:r.ta.final});
+  });
+  return rows;
+}
+function localTrainable(){
+  const lab=localTrainingLabels();
+  const inc=lab.filter(x=>x.label==='include').length,exc=lab.filter(x=>x.label==='exclude').length;
+  return {inc,exc,total:lab.length,ok:inc>=5&&exc>=5};
+}
+function crossValLocal(samples,dim){
+  const k=Math.min(5,Math.floor(samples.length/2));
+  if(k<2)return null;
+  const idx=samples.map((_,i)=>i);for(let i=idx.length-1;i>0;i--){const j=(Math.random()*(i+1))|0;[idx[i],idx[j]]=[idx[j],idx[i]];}
+  let tp=0,fp=0,fn=0,tn=0;
+  for(let f=0;f<k;f++){
+    const test=new Set(idx.filter((_,i)=>i%k===f));
+    const tr=[],te=[];samples.forEach((s,i)=>{(test.has(i)?te:tr).push(s);});
+    if(!tr.some(s=>s.y===1)||!tr.some(s=>s.y===0))continue;
+    const m=trainLR(tr.map(s=>({v:s.v,y:s.y})),dim,220);
+    const tmp={w:m.w,b:m.b,incCentroid:centroid(tr,1),excCentroid:centroid(tr,0)};
+    const thr=recallThreshold(tr,tmp,0.97);
+    te.forEach(s=>{const p=localProbability(s.v,tmp)>=thr?1:0;
+      if(s.y===1&&p===1)tp++;else if(s.y===0&&p===1)fp++;else if(s.y===1&&p===0)fn++;else tn++;});
+  }
+  const recall=tp+fn?tp/(tp+fn):0,prec=tp+fp?tp/(tp+fp):0;
+  const f1=prec+recall?2*prec*recall/(prec+recall):0;
+  return {recall:Math.round(recall*100),prec:Math.round(prec*100),f1:Math.round(f1*100),
+    acc:Math.round((tp+tn)/(tp+fp+fn+tn||1)*100),tp,fp,fn,tn,folds:k};
+}
+function trainLocalEngine(){
+  const t=localTrainable();
+  if(!t.ok){toast('Label at least 5 includes and 5 excludes first','err');return;}
+  const docs=ST.refs.filter(r=>!r.dup).map(r=>({id:r.id,text:docText(r)}));
+  const eng=buildVocab(docs);
+  const vmap={};docs.forEach(d=>vmap[d.id]=tfidf(ltok(d.text),eng));
+  const samples=localTrainingLabels().map(x=>({v:vmap[x.r.id],y:x.label==='include'?1:0}));
+  // honest performance estimate BEFORE fitting the final model
+  const val=crossValLocal(samples,eng.vocab.length);
+  const model=trainLR(samples,eng.vocab.length);
+  const idxs=model.w.map((wt,i)=>[i,wt]);
+  const topInc=idxs.slice().sort((a,b)=>b[1]-a[1]).slice(0,12).map(p=>eng.vocab[p[0]]);
+  const topExc=idxs.slice().sort((a,b)=>a[1]-b[1]).slice(0,12).map(p=>eng.vocab[p[0]]);
+  let correct=0;samples.forEach(s=>{if((lrPredict(s.v,model)>=0.5?1:0)===s.y)correct++;});
+  const incCentroid=centroid(samples,1),excCentroid=centroid(samples,0);
+  const tmpEngine={vocab:eng.vocab,vidx:eng.vidx,idf:eng.idf,w:model.w,b:model.b,incCentroid,excCentroid};
+  const autoThr=recallThreshold(samples,tmpEngine,0.97);
+  ST.settings.localThr=autoThr;
+  if(ST.settings.localMaybeBand==null)ST.settings.localMaybeBand=0.08;
+  ST.engine={vocab:eng.vocab,vidx:eng.vidx,idf:eng.idf,w:model.w,b:model.b,
+    incCentroid,excCentroid,mode:'recall-ensemble',autoThr,
+    trainedAt:new Date().toISOString(),seedN:t.total,seedInc:t.inc,seedExc:t.exc,topInc,topExc,
+    trainAcc:Math.round(correct/samples.length*100),val};
+  // prime the vector cache so later threshold tweaks re-score instantly
+  _vecCache.clear();const sig=engSig(ST.engine);docs.forEach(d=>_vecCache.set(d.id,{sig,v:vmap[d.id]}));
+  scoreAllLocal(vmap);
+  save();renderScreen();renderSpine();updateAgentChip();
+  toast('Viveka Local trained on '+t.total+' labels'+(val?(' — cross-val recall '+val.recall+'%'):'')+' — scored '+ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.by==='local').length+' papers, free','ok');
+}
+const _vecCache=new Map(); // id -> {sig, v}  (memory only; never serialized)
+function engSig(eng){return (eng.trainedAt||'')+':'+eng.vocab.length;}
+function vecFor(r,eng){const sig=engSig(eng);const c=_vecCache.get(r.id);
+  if(c&&c.sig===sig)return c.v;
+  const v=tfidf(ltok(docText(r)),eng);_vecCache.set(r.id,{sig,v});return v;}
+function scoreAllLocal(vmap,opts){
+  const eng=ST.engine;if(!eng)return;
+  opts=opts||{};
+  const started=Date.now();let scored=0;
+  const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
+  const maybeBand=ST.settings.localMaybeBand!=null?ST.settings.localMaybeBand:0.08;
+  const scope=titleAbstractScopeRefs();
+  titleAbstractScopeRefs().forEach(r=>{
+    const final=stageFinalObj(r,'ta');
+    if(myStageReview(r,'ta')||(final&&['human','consensus','arbitrator','conflict'].includes(final.by)))return; // never overwrite reviewer labels
+    if(opts.pendingOnly&&final&&final.by==='local')return;
+    const v=(vmap&&vmap[r.id])||vecFor(r,eng);
+    const p=localProbability(v,eng);
+    const dec=p>=thr?'include':(p>=thr-maybeBand?'maybe':'exclude');
+    const distance=dec==='exclude'?Math.max(0,(thr-maybeBand)-p):Math.abs(p-thr);
+    scored++;
+    r.ta={a:dec,final:dec,prob:p,conf:Math.min(99,Math.round(Math.max(8,distance*220))),reason:'local recall score '+(p*100).toFixed(0)+'% at '+Math.round(thr*100)+'% threshold'+(dec==='maybe'?' (borderline - human review)':''),by:'local',ms:0};
+  });
+  eng.lastScoreMs=Date.now()-started;
+  eng.lastScoreN=scored;
+  eng.lastScoreTotal=scope.length;
+  eng.lastScorePerMs=scored?eng.lastScoreMs/scored:0;
+  eng.lastScoreAt=new Date().toISOString();
+  eng.lastScoreMode=opts.pendingOnly?'pending':'rescore';
+  progressTick('screen-time',scored,scored||1,started,'Viveka Local');
+  return scored;
+}
+function localEngineCounts(){
+  const scope=titleAbstractScopeRefs();
+  const local=scope.filter(r=>r.ta&&r.ta.by==='local').length;
+  const protectedN=scope.filter(r=>myStageReview(r,'ta')||(stageFinalObj(r,'ta')&&['human','consensus','arbitrator','conflict'].includes(stageFinalObj(r,'ta').by))).length;
+  return {total:scope.length,local,pending:Math.max(0,scope.length-local-protectedN),protectedN};
+}
+function formatMs(ms){
+  ms=Number(ms||0);
+  if(ms<1000)return Math.round(ms)+' ms';
+  if(ms<60000)return (ms/1000).toFixed(1)+' sec';
+  return Math.round(ms/60000)+' min '+Math.round((ms%60000)/1000)+' sec';
+}
+function runLocalPending(){
+  if(!ST.engine){toast('Train Viveka Local first','err');return;}
+  const started=Date.now();
+  const n=scoreAllLocal(null,{pendingOnly:true})||0;
+  saveSoon();renderScreen();renderSpine();
+  toast('Viveka Local screened '+n+' pending papers in '+formatMs(Date.now()-started),'ok');
+}
+function rescoreLocalQueue(){
+  if(!ST.engine){toast('Train Viveka Local first','err');return;}
+  const started=Date.now();
+  const n=scoreAllLocal(null,{pendingOnly:false})||0;
+  saveSoon();renderScreen();renderSpine();
+  toast('Viveka Local re-scored '+n+' unconfirmed papers in '+formatMs(Date.now()-started),'ok');
+}
+let _thrDeb=null;
+function reThreshold(v){
+  ST.settings.localThr=parseFloat(v);
+  const lbl=document.getElementById('thr-val');if(lbl)lbl.textContent=Math.round(v*100)+'%';
+  if(ST.engine)scoreAllLocal();            // instant — vectors are cached
+  renderScreenStats();renderScreenList();
+  clearTimeout(_thrDeb);_thrDeb=setTimeout(saveNow,400);
+}
+function setLocalPreset(kind){
+  if(kind==='high'){ST.settings.localThr=0.25;ST.settings.localMaybeBand=0.12;}
+  else if(kind==='strict'){ST.settings.localThr=0.5;ST.settings.localMaybeBand=0.05;}
+  else {ST.settings.localThr=ST.engine&&ST.engine.autoThr!=null?ST.engine.autoThr:0.35;ST.settings.localMaybeBand=0.08;}
+  if(ST.engine)scoreAllLocal();
+  saveSoon();renderScreen();
+}
+function activeLearningQueue(n){ // most-uncertain unlabelled (prob near the active include threshold)
+  const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
+  return titleAbstractScopeRefs().filter(r=>r.ta&&r.ta.by==='local')
+    .map(r=>({r,u:Math.abs((r.ta.prob||.5)-thr)})).sort((a,b)=>a.u-b.u).slice(0,n||20).map(o=>o.r.id);
+}
+let SEED_MODE=false;
+function startSeeding(){SEED_MODE=true;SCREEN_FILTER='pending';renderScreen();toast('Label papers below with ✓ / ✗ to build the seed','ok');}
+async function vivekaSeed(){ // optional: one small LLM batch to seed labels
+  if(!ST.agent.trained){toast('Set up Viveka first (Phase 02), or label the seed by hand','err');return;}
+  const pend=titleAbstractScopeRefs().filter(r=>!r.ta||r.ta.by==='local').slice(0,40);
+  if(!pend.length){toast('No unlabelled papers to seed from','err');return;}
+  agentBusy(true);const bar=document.getElementById('seed-bar');let done=0;
+  for(const r of pend){try{const res=parseJSON(await LLM(buildScreenPrompt(r.title,r.abstract,'seed'),300));
+    const dec=normDecision(res.v);r.ta={a:dec,final:dec,conf:res.conf||60,reason:'seed label (Viveka): '+(res.reason||''),by:'human',seeded:true};
+  }catch(e){}done++;if(bar)bar.style.width=Math.round(done/pend.length*100)+'%';if(done%5===0)renderScreenStats();}
+  agentBusy(false);save();renderScreen();toast('Viveka labelled '+done+' seed papers — now train the local engine','ok');
+}
+function renderLocalControls(){
+  const t=localTrainable();const eng=ST.engine;const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
+  const lc=localEngineCounts();
+  const scored=lc.local;
+  const last=eng&&eng.lastScoreAt?new Date(eng.lastScoreAt):null;
+  const lastTxt=eng&&eng.lastScoreAt?`Last local run: ${scored} scored - ${formatMs(eng.lastScoreMs)} total - ${eng.lastScorePerMs?eng.lastScorePerMs.toFixed(2):'0'} ms/article - ${last.toLocaleString()}`:'Not run yet after this training.';
+  return `<div class="card tight" style="margin-bottom:14px">
+    <div class="card-h">⚙ Viveka Local <span class="muted" style="font-weight:500">— in-browser screening engine</span> <span class="tag">${eng?'trained':'not trained'}</span></div>
+    <div class="banner info" style="margin-bottom:12px"><span class="bi">ⓘ</span><div>
+      <b>How this works:</b> label a balanced seed (at least 5 includes and 5 excludes; ideally 20-40 total), then <b>Train</b>. The engine learns with a high-recall TF-IDF phrase ensemble and scores every other paper <b>free, in your browser</b> - no tokens. Borderline papers become <b>Maybe</b> for human review instead of being silently excluded.</div></div>
+    <div class="row" style="margin-bottom:10px">
+      <span class="pill ${t.inc>=5?'f':''}">${t.inc} includes labelled</span>
+      <span class="pill ${t.exc>=5?'f':''}">${t.exc} excludes labelled</span>
+      ${eng?`<span class="pill s">seed ${eng.seedN} · ${eng.val?('cross-val recall '+eng.val.recall+'% · prec '+eng.val.prec+'%'):('resub '+eng.trainAcc+'%')} · scored ${scored}</span>`:''}
+    </div>
+    <div class="row">
+      <button class="btn gh sm" onclick="startSeeding()">① Label seed by hand</button>
+      <button class="btn gh sm" onclick="vivekaSeed()" title="Optional: use one small LLM batch to label ~40 seed papers">① …or let Viveka label a seed batch</button>
+      <div class="pbar" style="width:90px"><i id="seed-bar"></i></div>
+      <button class="btn flow sm" onclick="trainLocalEngine()" ${t.ok?'':'disabled'}>② ${eng?'Re-train':'Train engine'}</button>
+      ${eng?`<button class="btn gh sm" onclick="loadActiveLearning()">③ Label uncertain (active learning)</button>`:''}
+    </div>
+    ${eng?`<div class="divider"></div>
+    <div class="row"><label class="fl" style="margin:0">Include threshold <b id="thr-val">${Math.round(thr*100)}%</b></label>
+      <input type="range" min="0.1" max="0.8" step="0.01" value="${thr}" style="flex:1;max-width:280px" oninput="reThreshold(this.value)">
+      <span class="muted">lower = more sensitive; auto threshold targets high recall</span></div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn gh sm" onclick="setLocalPreset('high')">High recall 25%</button>
+      <button class="btn gh sm" onclick="setLocalPreset('balanced')">Balanced 35%</button>
+      <button class="btn gh sm" onclick="setLocalPreset('strict')">Strict 50%</button>
+      <span class="muted">Use high recall when missing an includable paper is worse than reviewing extra maybes.</span>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <span class="pill f">favours include: ${(eng.topInc||[]).slice(0,8).join(', ')}</span></div>
+    <div class="row" style="margin-top:4px">
+      <span class="pill" style="background:var(--exc-w);color:#b91c1c">favours exclude: ${(eng.topExc||[]).slice(0,8).join(', ')}</span></div>`:''}
+  </div>`;
+}
+function loadActiveLearning(){
+  const ids=activeLearningQueue(15);
+  if(!ids.length){toast('Nothing to review — train the engine first','err');return;}
+  window._alSet=new Set(ids);SCREEN_FILTER='al';renderScreen();
+  toast('Showing the 15 most uncertain papers — label them and re-train','ok');
+}
+function renderLocalControls(){
+  const t=localTrainable();
+  const eng=ST.engine;
+  const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
+  const lc=localEngineCounts();
+  const scored=lc.local;
+  const last=eng&&eng.lastScoreAt?new Date(eng.lastScoreAt):null;
+  const lastTxt=eng&&eng.lastScoreAt
+    ? `Last local run: ${scored} scored - ${formatMs(eng.lastScoreMs)} total - ${eng.lastScorePerMs?eng.lastScorePerMs.toFixed(2):'0'} ms/article - ${last.toLocaleString()}`
+    : 'Not run yet after this training.';
+  return `<div class="card tight" style="margin-bottom:14px">
+    <div class="card-h">Viveka Local <span class="muted" style="font-weight:500">- in-browser screening engine</span> <span class="tag">${eng?'trained':'not trained'}</span></div>
+    <div class="banner info" style="margin-bottom:12px"><span class="bi">i</span><div>
+      <b>How this works:</b> label a balanced seed (at least 5 includes and 5 excludes; ideally 20-40 total), then <b>Train</b>. Training also screens the pending queue once. After that, use <b>Screen pending</b> or <b>Re-score</b> whenever you change thresholds or add corrections. It is <b>free, in your browser</b> - no tokens.</div></div>
+    <div class="row" style="margin-bottom:10px">
+      <span class="pill ${t.inc>=5?'f':''}">${t.inc} includes labelled</span>
+      <span class="pill ${t.exc>=5?'f':''}">${t.exc} excludes labelled</span>
+      ${eng?`<span class="pill s">seed ${eng.seedN} - ${eng.val?('cross-val recall '+eng.val.recall+'% - prec '+eng.val.prec+'%'):('resub '+eng.trainAcc+'%')} - local scored ${scored}</span>
+      <span class="pill">pending for local ${lc.pending}</span>
+      <span class="pill f">${formatMs(eng.lastScorePerMs||0)} / article</span>`:''}
+    </div>
+    <div class="row">
+      <button class="btn gh sm" onclick="startSeeding()">1. Label seed by hand</button>
+      <button class="btn gh sm" onclick="vivekaSeed()" title="Optional: use one small LLM batch to label about 40 seed papers">1. Let Viveka label seed batch</button>
+      <div class="pbar" style="width:90px"><i id="seed-bar"></i></div>
+      <button class="btn flow sm" onclick="trainLocalEngine()" ${t.ok?'':'disabled'}>2. ${eng?'Re-train + screen':'Train + screen pending'}</button>
+      ${eng?`<button class="btn flow sm" onclick="runLocalPending()">Screen pending with Viveka Local</button>
+      <button class="btn gh sm" onclick="rescoreLocalQueue()">Re-score local queue</button>
+      <button class="btn gh sm" onclick="loadActiveLearning()">3. Label uncertain</button>`:''}
+    </div>
+    ${eng?`<div class="divider"></div>
+    <div class="banner info" style="margin-bottom:12px"><span class="bi">✓</span><div><b>Viveka Local status:</b> ${lastTxt}. Human-confirmed and consensus records are protected and will not be overwritten.</div></div>
+    <div class="row"><label class="fl" style="margin:0">Include threshold <b id="thr-val">${Math.round(thr*100)}%</b></label>
+      <input type="range" min="0.1" max="0.8" step="0.01" value="${thr}" style="flex:1;max-width:280px" oninput="reThreshold(this.value)">
+      <span class="muted">lower = more sensitive; auto threshold targets high recall</span></div>
+    <div class="row" style="margin-top:8px">
+      <button class="btn gh sm" onclick="setLocalPreset('high')">High recall 25%</button>
+      <button class="btn gh sm" onclick="setLocalPreset('balanced')">Balanced 35%</button>
+      <button class="btn gh sm" onclick="setLocalPreset('strict')">Strict 50%</button>
+      <span class="muted">Use high recall when missing an includable paper is worse than reviewing extra maybes.</span>
+    </div>
+    <div class="row" style="margin-top:8px">
+      <span class="pill f">favours include: ${(eng.topInc||[]).slice(0,8).join(', ')}</span></div>
+    <div class="row" style="margin-top:4px">
+      <span class="pill" style="background:var(--exc-w);color:#b91c1c">favours exclude: ${(eng.topExc||[]).slice(0,8).join(', ')}</span></div>`:''}
+  </div>`;
+}
+window.setMode=setMode;window.trainLocalEngine=trainLocalEngine;window.startSeeding=startSeeding;
+window.vivekaSeed=vivekaSeed;window.reThreshold=reThreshold;window.setLocalPreset=setLocalPreset;window.loadActiveLearning=loadActiveLearning;
+window.runLocalPending=runLocalPending;window.rescoreLocalQueue=rescoreLocalQueue;
+window.recommendedMode=recommendedMode;window.currentMode=currentMode;window.uniqueCount=uniqueCount;
+
+function renderScreenStats(){
+  const el=document.getElementById('screen-stats');if(!el)return;
+  const allUnique=ST.refs.filter(r=>!r.dup);
+  const splitOn=BK.isServer()&&hasLiveAssignments();
+  const assignedOnly=splitOn&&BK.myAssignmentsOnly;
+  const pool=assignedOnly?allUnique.filter(r=>isAssignedToMe(r)):allUnique;
+  let total=0,inc=0,maybe=0,exc=0,pend=0,byHuman=0,byEngine=0;
+  for(const r of pool){total++;
+    const ta=(assignedOnly&&splitOn)?myStageReview(r,'ta'):visibleStageDecision(r,'ta');
+    if(!ta){pend++;continue;}
+    const f=ta.final;if(f==='include')inc++;else if(f==='maybe')maybe++;else if(f==='exclude')exc++;
+    if(ta.by==='human')byHuman++;else if(ta.by==='local')byEngine++;}
+  const local=currentMode()==='local';
+  const mine=splitOn?myAssignedRefs().length:0;
+  const minePend=splitOn?myPendingAssignedCount():0;
+  const disc=ensureAudit().filter(x=>x.stage==='ta').length;
+  const scopeNote=splitOn?`<div class="muted" style="margin:6px 0 12px">${assignedOnly?'Showing only studies assigned to you. Turn this off to view the full project.':'Showing the full project. Your assigned queue has '+mine+' studies, '+minePend+' still pending.'}</div>`:'';
+  el.innerHTML=`<div class="tiles">
+    <div class="tile"><div class="v">${total}</div><div class="k">${assignedOnly?'assigned queue':'to screen'}</div></div>
+    ${splitOn&&!assignedOnly?`<div class="tile syn"><div class="v">${mine}</div><div class="k">assigned to you</div></div>`:''}
+    ${splitOn&&!assignedOnly?`<div class="tile flow"><div class="v">${minePend}</div><div class="k">your pending</div></div>`:''}
+    <div class="tile inc"><div class="v">${inc}</div><div class="k">include</div></div>
+    <div class="tile maybe"><div class="v">${maybe}</div><div class="k">maybe</div></div>
+    <div class="tile exc"><div class="v">${exc}</div><div class="k">exclude</div></div>
+    ${local?`<div class="tile syn"><div class="v">${byHuman}</div><div class="k">you confirmed</div></div>
+      <div class="tile flow"><div class="v">${byEngine}</div><div class="k">engine-scored</div></div>`
+      :`<div class="tile"><div class="v">${pend}</div><div class="k">pending</div></div>`}
+    ${disc?`<div class="tile maybe"><div class="v">${disc}</div><div class="k">AI discrepancies logged</div></div>`:''}
+  </div>${(inc||maybe)?`<div class="row" style="margin-bottom:6px"><button class="btn" onclick="ASRMA.go('fulltext')">Full-text screening (${inc+maybe}) →</button></div>`:''}`;
+  if(scopeNote)el.insertAdjacentHTML('beforeend',scopeNote);
+}
+let SCREEN_PAGE=1;const PAGE_SIZE=50;
+function setScreenFilter(f){SCREEN_FILTER=f;SCREEN_PAGE=1;document.querySelectorAll('#screen-seg button').forEach(b=>b.classList.remove('on'));
+  const btn=document.querySelector(`#screen-seg button[onclick*="'${f}'"]`);if(btn)btn.classList.add('on');renderScreenList();}
+function filteredRefs(){
+  let u=ST.refs.filter(r=>!r.dup);
+  if(SCREEN_FILTER==='al'){const s=window._alSet||new Set();u=u.filter(r=>s.has(r.id));}
+  else if(SCREEN_FILTER==='conflict'){u=u.filter(r=>r._conflict);}
+  else if(SCREEN_FILTER==='pending')u=u.filter(r=>{
+    const ta=(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())?myStageReview(r,'ta'):visibleStageDecision(r,'ta');
+    return !ta||ta.by==='local';
+  });
+  else if(SCREEN_FILTER!=='all')u=u.filter(r=>{
+    const ta=(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())?myStageReview(r,'ta'):visibleStageDecision(r,'ta');
+    return ta&&ta.final===SCREEN_FILTER;
+  });
+  if(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())u=u.filter(r=>isAssignedToMe(r));
+  if(SCREEN_Q){const q=SCREEN_Q.toLowerCase();u=u.filter(r=>(r.title+' '+r.authors).toLowerCase().includes(q));}
+  if(currentMode()==='local'&&ST.engine)u=u.slice().sort((a,b)=>((b.ta&&b.ta.prob)||0)-((a.ta&&a.ta.prob)||0));
+  return u;
+}
+function renderScreenList(){
+  const el=document.getElementById('screen-list');if(!el)return;
+  const u=filteredRefs();
+  if(!u.length){el.innerHTML='<div class="empty"><div class="ico">⊜</div><h3>Nothing here</h3><div>Import studies, then screen — or change the filter.</div></div>';return;}
+  const shown=Math.min(u.length,SCREEN_PAGE*PAGE_SIZE);
+  el.innerHTML=u.slice(0,shown).map(r=>studyCard(r)).join('')+
+    (shown<u.length?`<div style="text-align:center;padding:16px"><button class="btn gh" onclick="moreCards()">Load more — showing ${shown} of ${u.length}</button></div>`:
+      (u.length>PAGE_SIZE?`<div class="muted" style="text-align:center;padding:12px">All ${u.length} shown</div>`:''));
+}
+function moreCards(){SCREEN_PAGE++;renderScreenList();
+  // keep scroll near the button (browser keeps position since we append within same node)
+}
+let _searchDeb=null;
+function onSearchInput(v){SCREEN_Q=v;clearTimeout(_searchDeb);_searchDeb=setTimeout(()=>{SCREEN_PAGE=1;renderScreenList();},220);}
+window.moreCards=moreCards;window.onSearchInput=onSearchInput;
+function studyCard(r){
+  const ta=visibleStageDecision(r,'ta');const dec=ta?ta.final:'';
+  let chip='';
+  if(ta){
+    if(ta.by==='agent')chip=`<span class="dchip ai" title="Screening reviewer">⊹ Viveka ${ta.conf}%</span>`;
+    else if(ta.by==='local')chip=`<span class="dchip ai" title="Viveka Local score">⚙ Viveka Local ${Math.round((ta.prob||0)*100)}%</span>`;
+    else chip='<span class="dchip ai">👤 you'+(ta.seeded?' · seed':'')+'</span>';
+  }
+  return`<div class="study ${dec}" data-id="${r.id}">
+    <div class="st-title">${hl(r.title)}</div>
+    <div class="st-meta"><span>${esc(r.authors?r.authors.split(';')[0]+(r.authors.includes(';')?' et al.':''):'—')}</span>
+      <span>${esc(r.year||'n.d.')}</span><span>${esc(r.journal||'')}</span>
+      ${r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi ↗</a>`:''}
+      <span style="color:var(--t3)">${esc(r.source)}</span>
+      ${taAssignedIds(r).length?`<span style="color:var(--flow)">assigned: ${esc(taAssignedIds(r).length>1?'double-screened':'single reviewer')}</span>`:''}</div>
+    ${r.abstract?`<div class="st-abs" onclick="this.classList.toggle('open')">${hl(r.abstract)}</div>`:'<div class="muted">No abstract — consider fetching it in Full text.</div>'}
+    <div class="st-foot">
+      ${ta?`<span class="dchip ${dec} ">${dec==='include'?'✓ Include':dec==='exclude'?'✗ Exclude':'? Maybe'}</span>
+        ${chip}
+        <div class="conf-bar"><i style="width:${ta.conf||0}%"></i></div>
+        <span class="muted" style="flex:1">${esc(ta.reason||'')}</span>`:'<span class="dchip pend">pending</span><span class="spacer"></span>'}
+      <button class="vbtn maybe ${dec==='maybe'?'act-maybe':''}" title="Maybe" onclick="ASRMA.setDecision('${r.id}','maybe',event)">?</button>
+      <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" title="Exclude" onclick="ASRMA.setDecision('${r.id}','exclude',event)">✗</button>
+      <button class="vbtn inc ${dec==='include'?'act-inc':''}" title="Include" onclick="ASRMA.setDecision('${r.id}','include',event)">✓</button>
+      ${currentMode()==='llm'?`<button class="vbtn" title="Re-ask Viveka (advanced model)" onclick="reAsk('${r.id}')">⊹</button>`:''}
+    </div></div>`;
+}
+async function reAsk(id){agentBusy(true);try{await screenOne(id,true);saveSoon();patchCard(id);renderScreenStats();toast('Re-screened (advanced)','ok');}catch(e){toast(e.message,'err')}agentBusy(false);}
+window.setScreenFilter=setScreenFilter;window.reAsk=reAsk;window.setDecisionComment=setDecisionComment;
+function studyCard(r){
+  const ta=visibleStageDecision(r,'ta');const dec=ta?ta.final:'';let chip='';
+  if(ta){
+    if(ta.by==='agent')chip=`<span class="dchip ai" title="Screening reviewer">⊹ Viveka ${ta.conf}%</span>`;
+    else if(ta.by==='local')chip=`<span class="dchip ai" title="Viveka Local score">⚙ Viveka Local ${Math.round((ta.prob||0)*100)}%</span>`;
+    else chip='<span class="dchip ai">Reviewer'+(ta.seeded?' · seed':'')+'</span>';
+  }
+  return`<div class="study ${dec}" data-id="${r.id}">
+    <div class="st-title">${hl(r.title)}</div>
+    <div class="st-meta"><span>${esc(r.authors?r.authors.split(';')[0]+(r.authors.includes(';')?' et al.':''):'—')}</span>
+      <span>${esc(r.year||'n.d.')}</span><span>${esc(r.journal||'')}</span>
+      ${r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi ↗</a>`:''}
+      <span style="color:var(--t3)">${esc(r.source)}</span></div>
+    ${r.abstract?`<div class="st-abs" onclick="this.classList.toggle('open')">${hl(r.abstract)}</div>`:'<div class="muted">No abstract — consider fetching it in Full text.</div>'}
+    <div class="st-foot">
+      ${ta?`<span class="dchip ${dec} ">${dec==='include'?'✓ Include':dec==='exclude'?'✗ Exclude':'? Maybe'}</span>
+        ${chip}
+        <div class="conf-bar"><i style="width:${ta.conf||0}%"></i></div>
+        <span class="muted" style="flex:1">${esc(ta.reason||'')}</span>`:'<span class="dchip pend">pending</span><span class="spacer"></span>'}
+      <button class="vbtn maybe ${dec==='maybe'?'act-maybe':''}" title="Maybe" onclick="ASRMA.setDecision('${r.id}','maybe',event)">?</button>
+      <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" title="Exclude" onclick="ASRMA.setDecision('${r.id}','exclude',event)">✗</button>
+      <button class="vbtn inc ${dec==='include'?'act-inc':''}" title="Include" onclick="ASRMA.setDecision('${r.id}','include',event)">✓</button>
+      ${currentMode()==='llm'?`<button class="vbtn" title="Re-ask Viveka (advanced model)" onclick="reAsk('${r.id}')">⊹</button>`:''}
+    </div>
+    ${ta?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ta))}</div>`:''}
+    ${reviewSummaryHTML(r,'ta')}
+    <div class="fg" style="margin:10px 0 0">
+      <label class="fl">Comment / reason</label>
+      <textarea class="inp" style="min-height:56px" placeholder="Add reviewer comments, conflict notes, or a decision reason" oninput="setDecisionComment('ta','${r.id}',this.value)">${esc((ta&&ta.comment)||'')}</textarea>
+    </div></div>`;
+}
+
+
+/* ===================== FULL-TEXT RETRIEVAL ===================== */
+const UNPAYWALL_EMAIL='research@asrma.app';
+async function retrieveFT(r){
+  let got={};
+  // 1) Europe PMC — abstract + OA full text
+  try{
+    const q=r.doi?('DOI:'+r.doi):('TITLE:"'+r.title.slice(0,120).replace(/"/g,'')+'"');
+    const u='https://www.ebi.ac.uk/europepmc/webservices/rest/search?query='+encodeURIComponent(q)+'&format=json&resultType=core&pageSize=1';
+    const d=await (await fetch(u)).json();
+    const hit=d.resultList&&d.resultList.result&&d.resultList.result[0];
+    if(hit){
+      if(!r.abstract&&hit.abstractText)got.abstract=hit.abstractText.replace(/<[^>]+>/g,'');
+      if(!r.doi&&hit.doi)got.doi=hit.doi;
+      got.pmcid=hit.pmcid;got.source=hit.source;got.id=hit.id;
+      if(hit.isOpenAccess==='Y')got.oa=true;
+      if(hit.fullTextUrlList&&hit.fullTextUrlList.fullTextUrl){
+        const pdf=hit.fullTextUrlList.fullTextUrl.find(f=>f.documentStyle==='pdf');
+        const html=hit.fullTextUrlList.fullTextUrl.find(f=>f.documentStyle==='html');
+        got.url=(pdf||html||hit.fullTextUrlList.fullTextUrl[0]).url;
+      }
+      // OA full text plain
+      if(hit.pmcid){try{
+        const ft=await (await fetch('https://www.ebi.ac.uk/europepmc/webservices/rest/'+hit.source+'/'+hit.id+'/fullTextXML')).text();
+        const plain=ft.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim();
+        if(plain.length>800)got.text=plain.slice(0,16000);
+      }catch(e){}}
+    }
+  }catch(e){}
+  // 2) Unpaywall — best OA PDF
+  if(r.doi&&!got.url){try{
+    const d=await (await fetch('https://api.unpaywall.org/v2/'+encodeURIComponent(r.doi)+'?email='+UNPAYWALL_EMAIL)).json();
+    if(d.best_oa_location){got.oa=true;got.url=d.best_oa_location.url_for_pdf||d.best_oa_location.url;}
+  }catch(e){}}
+  return got;
+}
+async function fetchFullText(id,silent){
+  const r=ST.refs.find(x=>x.id===id);if(!r)return;
+  const got=await retrieveFT(r);
+  if(got.abstract)r.abstract=got.abstract;
+  if(got.doi)r.doi=got.doi;
+  r.ft=r.ft||{};
+  Object.assign(r.ft,{fulltextUrl:got.url||r.ft.fulltextUrl,oa:got.oa||false,pdfText:got.text||r.ft.pdfText,retrieved:true});
+  if(!silent)save();return r;
+}
+async function fetchAllFullText(){
+  const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  if(!list.length){toast('No included studies to fetch','err');return;}
+  if(BATCH_CTRL.fetchFT.running){toast('Full-text fetch is already running','err');return;}
+  const btn=document.getElementById('ft-fetch-btn');if(btn)btn.disabled=true;
+  batchStart('fetchFT');
+  let done=0;const bar=document.getElementById('ft-bar');const started=Date.now();
+  progressTick('ft-fetch-time',0,list.length,started,'Open-access fetch');
+  for(const r of list){
+    if(BATCH_CTRL.fetchFT.stop)break;
+    try{await fetchFullText(r.id,true);}catch(e){}
+    done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';
+    progressTick('ft-fetch-time',done,list.length,started,'Open-access fetch');
+    if(done%10===0){saveSoon();renderFTStats();}}
+  const stopped=BATCH_CTRL.fetchFT.stop;
+  batchEnd('fetchFT');saveNow();renderFulltext();renderSpine();toast((stopped?'Stopped after ':'Retrieved metadata for ')+done+' studies','ok');
+}
+async function ftScreen(id,mode){
+  mode=mode||'cloud';
+  const silent=arguments.length>2&&arguments[2]===true;
+  if(mode==='local')return ftScreenLocal(id,silent);
+  const r=ST.refs.find(x=>x.id===id);if(!r)return;
+  agentBusy(true);
+  try{
+    const started=Date.now();
+    if(window.BK&&BK.isServer&&BK.isServer()&&serverAIReady(ST.agent.advModel)&&ST.id){
+      if(typeof _srvTimer!=='undefined'&&_srvTimer)await serverSaveNow();
+      const res=await BK.api('POST','/api/projects/'+ST.id+'/ai/screen',{stage:'fulltext',refId:id},70000);
+      syncAICredits(res);
+      r.ft=r.ft||{};r.ft.decision=normDecision(res.decision||res.v);
+      r.ft.reason=res.reason||'';r.ft.exclCat=res.exclCat||'';r.ft.by='agent';r.ft.model=res.model||ST.agent.advModel;r.ft.reviewer='Viveka';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';r.ft.ms=Date.now()-started;r.ft.server=true;
+      if(!silent){save();renderFulltext();renderSpine();}
+      agentBusy(false);
+      return r;
+    }
+    const ctx=r.ft&&r.ft.pdfText?('FULL TEXT (excerpt):\n'+r.ft.pdfText.slice(0,9000)):('ABSTRACT:\n'+r.abstract);
+    const p=ST.project;
+    const reviewCtx=buildReviewContext(p);
+    const res=parseJSON(await LLM(`${ST.agent.persona||'You are a senior systematic reviewer.'}
+${reviewCtx}
+Full-text eligibility assessment for: ${p.question}
+INCLUDE if: ${p.inc}
+EXCLUDE if: ${p.exc}
+${correctionMemory('ft')}
+STUDY: ${r.title}
+${ctx}
+Assess as a full-text eligibility reviewer. Use the full paper text when available; if only an abstract is available, be cautious and choose include unless a clear exclusion is present. Exclusion must name the single strongest PRISMA reason.
+Return ONLY JSON: {"v":"include|exclude|maybe","reason":"<specific full-text eligibility rationale>","excl_cat":"<if exclude: wrong population|wrong intervention|wrong comparator|wrong outcome|wrong design|no usable data|other>"}`,450,ST.agent.advModel));
+    r.ft=r.ft||{};r.ft.decision=normDecision(res.v);
+    r.ft.reason=res.reason;r.ft.exclCat=res.excl_cat||'';r.ft.by='agent';r.ft.model=ST.agent.advModel;r.ft.reviewer='Viveka';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';r.ft.ms=Date.now()-started;
+    if(!silent){save();renderFulltext();renderSpine();}
+  }catch(e){toast(e.message,'err')}
+  agentBusy(false);
+}
+async function ftScreenLocal(id,silent){
+  const r=ST.refs.find(x=>x.id===id);if(!r)return;
+  if(!ST.engine){toast('Train Viveka Local in title/abstract screening first','err');return;}
+  const started=Date.now();
+  const text=(r.title||'')+' '+(r.title||'')+' '+((r.ft&&r.ft.pdfText)||r.abstract||'');
+  const v=tfidf(ltok(text),ST.engine);
+  const p=localProbability(v,ST.engine);
+  const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
+  const band=ST.settings.localMaybeBand!=null?ST.settings.localMaybeBand:0.08;
+  const dec=p>=thr?'include':(p>=thr-band?'maybe':'exclude');
+  r.ft=r.ft||{};
+  r.ft.decision=dec;r.ft.reason='Viveka Local full-text score '+(p*100).toFixed(0)+'% at '+Math.round(thr*100)+'% threshold'+(dec==='maybe'?' (borderline - human review)':'');
+  r.ft.exclCat=dec==='exclude'?'other':'';r.ft.by='local';r.ft.reviewer='Viveka Local';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';r.ft.prob=p;r.ft.ms=Date.now()-started;
+  if(!silent)save();return r;
+}
+async function screenAllFullText(mode,resume){
+  mode=mode||'cloud';
+  const listAll=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  if(!listAll.length){toast('No title/abstract included studies for full text','err');return;}
+  if(mode==='cloud'&&!ST.agent.trained){toast('Train Viveka Cloud first','err');ASRMA.go('agents');return;}
+  if(mode==='local'&&!ST.engine){toast('Train Viveka Local first','err');ASRMA.go('screen');return;}
+  const key=mode==='local'?'ftLocal':'ftCloud';
+  if(BATCH_CTRL[key].running){toast('Full-text screening is already running','err');return;}
+  const pending=listAll.filter(r=>{const ft=visibleStageDecision(r,'ft')||r.ft;return !(ft&&(ft.decision||ft.final));});
+  const list=pending.length?pending:listAll;
+  if(resume&&!pending.length){toast('No pending full-text articles to resume','ok');return;}
+  if(!resume&&!pending.length&&!confirm('Re-assess all '+list.length+' full-text studies with Viveka '+(mode==='local'?'Local':'Cloud')+'?'))return;
+  const btn=document.getElementById(mode==='local'?'ft-local-btn':'ft-cloud-btn');if(btn)btn.disabled=true;
+  batchStart(key);
+  agentBusy(mode==='cloud');
+  const bar=document.getElementById('ft-screen-bar');let done=0;const started=Date.now();
+  progressTick('ft-screen-time',0,list.length,started,'Full-text '+(mode==='local'?'Local':'Cloud'));
+  for(const r of list){
+    if(BATCH_CTRL[key].stop)break;
+    try{await ftScreen(r.id,mode,true);}catch(e){r.ft=r.ft||{};r.ft.decision='maybe';r.ft.reason='error: '+e.message;r.ft.by=mode==='local'?'local':'agent';}
+    done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';
+    progressTick('ft-screen-time',done,list.length,started,'Full-text '+(mode==='local'?'Local':'Cloud'));
+    if(done%10===0){saveSoon();renderFTStats();}
+  }
+  const stopped=BATCH_CTRL[key].stop;
+  batchEnd(key);saveNow();agentBusy(false);renderFulltext();renderSpine();toast((stopped?'Stopped after ':'Full-text assessed ')+done+' studies with Viveka '+(mode==='local'?'Local':'Cloud'),'ok');
+}
+function ftDecide(id,dec,cat){const r=ST.refs.find(x=>x.id===id);if(!r)return;
+  const prev=visibleStageDecision(r,'ft')||r.ft||{};
+  const comment=requireDecisionReason('ft',r,dec);
+  if(comment===null)return;
+  const learned=logAIDiscrepancy('ft',r,prev,dec);
+  if(window.BK&&BK.isServer&&BK.isServer()){
+    setReviewerStageDecision(r,'ft',dec,comment,prev);
+    r.ft=r.ft||{};
+    if(cat!==undefined)r.ft.exclCat=cat;
+  }else{
+    r.ft=r.ft||{};r.ft.decision=dec;r.ft.final=dec;r.ft.by='human';r.ft.reviewer=currentReviewerName();r.ft.reviewedAt=new Date().toISOString();r.ft.comment=comment||r.ft.comment||'';if(cat!==undefined)r.ft.exclCat=cat;
+    if(r._ftConflict)r._ftConflict=false;
+  }
+  if(learned&&prev.by==='local')scheduleLocalRetrain();
+  save();renderFulltextList();renderFTStats();renderSpine();}
+function renderFulltext(){
+  if(typeof FT_PAGE!=='undefined')FT_PAGE=1;
+  document.getElementById('pane-fulltext').innerHTML=`
+  <div class="pane-h"><div class="eyebrow">Phase 07 — confirm eligibility</div>
+    <h1>▤ Full-text screening</h1>
+    <p>Pull open-access full text from Europe PMC & Unpaywall, or attach a PDF / paste the text yourself, then assess eligibility against the full paper. Comments or exclusion reasons can be added when useful.</p></div>
+  <div id="ft-stats"></div>
+  <div class="toolbar">
+    <button class="btn flow sm" id="ft-fetch-btn" onclick="ASRMA.fetchAllFullText()">🌐 Fetch full text</button>
+    <button class="btn gh sm" id="ft-fetch-stop-btn" onclick="stopBatch('fetchFT')" disabled>Stop</button>
+    <div class="pbar" style="width:160px"><i id="ft-bar"></i></div>
+    <span class="muted" id="ft-fetch-time">Open-access papers are retrieved from Europe PMC and Unpaywall, not AI tokens.</span>
+  </div>
+  <div class="toolbar">
+    <button class="btn flow sm" id="ft-cloud-btn" onclick="screenAllFullText('cloud')">⊹ Full-text screen all · Cloud</button>
+    <button class="btn gh sm" id="ft-local-btn" onclick="screenAllFullText('local')">⚙ Full-text screen all · Local</button>
+    <button class="btn gh sm" id="ft-cloud-stop-btn" onclick="stopBatch('ftCloud')" disabled>Stop Cloud</button>
+    <button class="btn gh sm" id="ft-local-stop-btn" onclick="stopBatch('ftLocal')" disabled>Stop Local</button>
+    <button class="btn gh sm" onclick="screenAllFullText('cloud',true)">Resume Cloud</button>
+    <button class="btn gh sm" onclick="screenAllFullText('local',true)">Resume Local</button>
+    <div class="pbar" style="width:160px"><i id="ft-screen-bar"></i></div>
+    <span class="muted" id="ft-screen-time">Timer appears while full-text screening runs.</span>
+  </div>
+  <div id="ft-list"></div>`;
+  renderFTStats();renderFulltextList();
+}
+function renderFTStats(){
+  const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  const inc=list.filter(r=>r.ft&&r.ft.decision==='include').length;
+  const exc=list.filter(r=>r.ft&&r.ft.decision==='exclude').length;
+  const oa=list.filter(r=>r.ft&&r.ft.oa).length;
+  const el=document.getElementById('ft-stats');if(!el)return;
+  el.innerHTML=`<div class="tiles">
+    <div class="tile"><div class="v">${list.length}</div><div class="k">at full text</div></div>
+    <div class="tile flow"><div class="v">${oa}</div><div class="k">open access</div></div>
+    <div class="tile inc"><div class="v">${inc}</div><div class="k">included</div></div>
+    <div class="tile exc"><div class="v">${exc}</div><div class="k">excluded</div></div>
+  </div>${inc?`<div class="row" style="margin-bottom:6px"><button class="btn" onclick="ASRMA.go('extract')">Extract data (${inc}) →</button></div>`:''}`;
+}
+let FT_PAGE=1;const FT_PAGE_SIZE=30;
+function moreFulltextCards(){FT_PAGE++;renderFulltextList();}
+window.moreFulltextCards=moreFulltextCards;
+function renderFulltextList(){
+  const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  const el=document.getElementById('ft-list');if(!el)return;
+  if(!list.length){el.innerHTML='<div class="empty"><div class="ico">▤</div><h3>No studies at full text</h3><div>Include some studies in title/abstract screening first.</div></div>';return;}
+  const shown=Math.min(list.length,FT_PAGE*FT_PAGE_SIZE);
+  el.innerHTML=list.slice(0,shown).map(r=>{const ft=r.ft||{};const dec=ft.decision;
+    return`<div class="study ${dec}">
+      <div class="st-title">${esc(r.title)}</div>
+      <div class="st-meta"><span>${esc(r.year||'')}</span><span>${esc(r.journal||'')}</span>
+        ${ft.oa?'<span style="color:var(--inc);font-weight:700">● OA</span>':''}
+        ${ft.fulltextUrl?`<a href="${esc(ft.fulltextUrl)}" target="_blank">full text ↗</a>`:r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi ↗</a>`:''}
+        ${ft.pdfText?`<span style="color:var(--flow)">✓ ${esc(ft.pdfName||'text')} (${(ft.pdfText.length/1000).toFixed(0)}k chars)</span>`:'<span style="color:var(--maybe)">no full text yet</span>'}</div>
+      <div class="st-foot">
+        ${dec?`<span class="dchip ${dec}">${dec==='include'?'✓ Included':'✗ Excluded'}</span>
+          ${ft.exclCat?`<span class="pill">${esc(ft.exclCat)}</span>`:''}
+          <span class="muted" style="flex:1">${esc(ft.reason||'')}</span>`:'<span class="dchip pend">not assessed</span><span class="spacer"></span>'}
+        <button class="btn gh sm" onclick="ASRMA.fetchFullText('${r.id}').then(()=>{renderFulltextList()})" title="Fetch open-access text online">🌐 Fetch</button>
+        <button class="btn gh sm" onclick="attachFullText('${r.id}')" title="Upload a PDF or .txt">📎 Attach</button>
+        <button class="btn gh sm" onclick="pasteFullText('${r.id}')" title="Paste text">📝 Paste</button>
+        <button class="btn flow sm" onclick="ftScreen('${r.id}')">⊹ Assess</button>
+        <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" onclick="ftDecide('${r.id}','exclude')">✗</button>
+        <button class="vbtn inc ${dec==='include'?'act-inc':''}" onclick="ftDecide('${r.id}','include')">✓</button>
+      </div></div>`;}).join('')+
+    (shown<list.length?`<div style="text-align:center;padding:16px"><button class="btn gh" onclick="moreFulltextCards()">Load more full-text studies — showing ${shown} of ${list.length}</button></div>`:
+      (list.length>FT_PAGE_SIZE?`<div class="muted" style="text-align:center;padding:12px">All ${list.length} full-text studies shown</div>`:''));
+}
+window.ftScreen=ftScreen;window.ftScreenLocal=ftScreenLocal;window.screenAllFullText=screenAllFullText;window.ftDecide=ftDecide;
+function renderFTStats(){
+  const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  const inc=list.filter(r=>r.ft&&r.ft.decision==='include').length;
+  const maybe=list.filter(r=>r.ft&&r.ft.decision==='maybe').length;
+  const exc=list.filter(r=>r.ft&&r.ft.decision==='exclude').length;
+  const oa=list.filter(r=>r.ft&&r.ft.oa).length;
+  const estTotal=list.reduce((sum,r)=>sum+ftEstimateMinutes(r),0);
+  const estPending=list.filter(r=>!(r.ft&&r.ft.decision)).reduce((sum,r)=>sum+ftEstimateMinutes(r),0);
+  const disc=ensureAudit().filter(x=>x.stage==='ft').length;
+  const el=document.getElementById('ft-stats');if(!el)return;
+  el.innerHTML=`<div class="tiles">
+    <div class="tile"><div class="v">${list.length}</div><div class="k">at full text</div></div>
+    <div class="tile flow"><div class="v">${oa}</div><div class="k">open access</div></div>
+    <div class="tile inc"><div class="v">${inc}</div><div class="k">included</div></div>
+    <div class="tile maybe"><div class="v">${maybe}</div><div class="k">maybe</div></div>
+    <div class="tile exc"><div class="v">${exc}</div><div class="k">excluded</div></div>
+    ${disc?`<div class="tile maybe"><div class="v">${disc}</div><div class="k">AI discrepancies logged</div></div>`:''}
+  </div><div class="muted" style="margin:-6px 0 14px">Estimated full-text review time: <b>${fmtMinutes(estTotal)}</b> total · <b>${fmtMinutes(estPending)}</b> still pending.</div>${inc?`<div class="row" style="margin-bottom:6px"><button class="btn" onclick="ASRMA.go('extract')">Extract data (${inc}) →</button></div>`:''}`;
+}
+function renderFulltextList(){
+  const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  const el=document.getElementById('ft-list');if(!el)return;
+  if(!list.length){el.innerHTML='<div class="empty"><div class="ico">▤</div><h3>No studies at full text</h3><div>Include some studies in title/abstract screening first.</div></div>';return;}
+  el.innerHTML=list.map(r=>{const ft=r.ft||{};const dec=ft.decision;
+    return`<div class="study ${dec}">
+      <div class="st-title">${esc(r.title)}</div>
+      <div class="st-meta"><span>${esc(r.year||'')}</span><span>${esc(r.journal||'')}</span>
+        ${ft.oa?'<span style="color:var(--inc);font-weight:700">● OA</span>':''}
+        ${ft.fulltextUrl?`<a href="${esc(ft.fulltextUrl)}" target="_blank">full text ↗</a>`:r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi ↗</a>`:''}
+        ${ft.pdfText?`<span style="color:var(--flow)">✓ ${esc(ft.pdfName||'text')} (${(ft.pdfText.length/1000).toFixed(0)}k chars)</span>`:'<span style="color:var(--maybe)">no full text yet</span>'}
+        <span style="color:var(--t3)">⏱ ~${fmtMinutes(ftEstimateMinutes(r))}</span></div>
+      <div class="st-foot">
+        ${dec?`<span class="dchip ${dec}">${dec==='include'?'✓ Included':'✗ Excluded'}</span>
+          ${ft.exclCat?`<span class="pill">${esc(ft.exclCat)}</span>`:''}
+          <span class="muted" style="flex:1">${esc(ft.reason||'')}</span>`:'<span class="dchip pend">not assessed</span><span class="spacer"></span>'}
+        <button class="btn gh sm" onclick="ASRMA.fetchFullText('${r.id}').then(()=>{renderFulltextList()})" title="Fetch open-access text online">🌐 Fetch</button>
+        <button class="btn gh sm" onclick="attachFullText('${r.id}')" title="Upload a PDF or .txt">📎 Attach</button>
+        <button class="btn gh sm" onclick="pasteFullText('${r.id}')" title="Paste text">📝 Paste</button>
+        <button class="btn flow sm" onclick="ftScreen('${r.id}')">⊹ Assess</button>
+        <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" onclick="ftDecide('${r.id}','exclude')">✗</button>
+        <button class="vbtn inc ${dec==='include'?'act-inc':''}" onclick="ftDecide('${r.id}','include')">✓</button>
+      </div>
+      ${ft.reviewedAt?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ft))}</div>`:''}
+      ${reviewSummaryHTML(r,'ft')}
+      ${ft.pdfText?`<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--flow);font-weight:700">Preview retrieved full text</summary><div style="margin-top:8px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--wash);max-height:220px;overflow:auto;white-space:pre-wrap;font-size:12px;line-height:1.55">${esc(ft.pdfText.slice(0,2200))}</div></details>`:''}
+      <div class="fg" style="margin:10px 0 0">
+        <label class="fl">Comment / reason</label>
+        <textarea class="inp" style="min-height:64px" placeholder="Add reviewer comments, exclusion rationale, or notes for extraction" oninput="setDecisionComment('ft','${r.id}',this.value)">${esc(ft.comment||'')}</textarea>
+      </div></div>`;}).join('');
+}
+
+function renderFulltextList(){
+  const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  const el=document.getElementById('ft-list');if(!el)return;
+  if(!list.length){el.innerHTML='<div class="empty"><div class="ico">▤</div><h3>No studies at full text</h3><div>Include some studies in title/abstract screening first.</div></div>';return;}
+  el.innerHTML=list.map(r=>{const ft=r.ft||{};const dec=ft.decision;
+    return`<div class="study ${dec||''}">
+      <div class="st-title">${esc(r.title)}</div>
+      <div class="st-meta"><span>${esc(r.year||'')}</span><span>${esc(r.journal||'')}</span>
+        ${ft.oa?'<span style="color:var(--inc);font-weight:700">OA</span>':''}
+        ${ft.fulltextUrl?`<a href="${esc(ft.fulltextUrl)}" target="_blank">full text</a>`:r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi</a>`:''}
+        ${ft.fileId?`<span style="color:var(--flow);font-weight:700">PDF attached</span>`:''}
+        ${ft.pdfText?`<span style="color:var(--flow)">text attached (${(ft.pdfText.length/1000).toFixed(0)}k chars)</span>`:'<span style="color:var(--maybe)">no full text yet</span>'}
+        <span style="color:var(--t3)">estimated human time: ~${fmtMinutes(ftEstimateMinutes(r))}</span>
+        ${ft.ms?`<span style="color:var(--t3)">Viveka time: ${fmtDuration(ft.ms)}</span>`:''}</div>
+      <div class="st-foot">
+        ${dec?`<span class="dchip ${dec}">${dec==='include'?'Included':dec==='maybe'?'Maybe':'Excluded'}</span>
+          ${ft.exclCat?`<span class="pill">${esc(ft.exclCat)}</span>`:''}
+          <span class="muted" style="flex:1">${esc(ft.reason||'')}</span>`:'<span class="dchip pend">not assessed</span><span class="spacer"></span>'}
+        <button class="btn gh sm" onclick="ASRMA.fetchFullText('${r.id}').then(()=>{renderFulltextList()})" title="Fetch open-access text online">Fetch</button>
+        <button class="btn gh sm" onclick="attachFullText('${r.id}')" title="Upload a PDF or .txt">Attach</button>
+        ${ft.fileId?`<button class="btn flow sm" onclick="openPdfViewer('${r.id}')" title="Read the attached PDF beside this screening record">Open PDF</button>`:''}
+        <button class="btn gh sm" onclick="pasteFullText('${r.id}')" title="Paste text">Paste</button>
+        <button class="btn flow sm" onclick="ftScreen('${r.id}','cloud')">Viveka Cloud</button>
+        <button class="btn gh sm" onclick="ftScreen('${r.id}','local').then(()=>{renderFulltextList();renderFTStats();})">Viveka Local</button>
+        <button class="vbtn maybe ${dec==='maybe'?'act-maybe':''}" onclick="ftDecide('${r.id}','maybe')">?</button>
+        <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" onclick="ftDecide('${r.id}','exclude')">x</button>
+        <button class="vbtn inc ${dec==='include'?'act-inc':''}" onclick="ftDecide('${r.id}','include')">✓</button>
+      </div>
+      ${ft.reviewedAt?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ft))}</div>`:''}
+      ${ft.pdfText?`<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--flow);font-weight:700">Preview retrieved full text</summary><div style="margin-top:8px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--wash);max-height:220px;overflow:auto;white-space:pre-wrap;font-size:12px;line-height:1.55">${esc(ft.pdfText.slice(0,2200))}</div></details>`:''}
+      <div class="fg" style="margin:10px 0 0">
+        <label class="fl">Comment / reason</label>
+        <textarea class="inp" style="min-height:64px" placeholder="Add reviewer comments, exclusion rationale, or notes for extraction" oninput="setDecisionComment('ft','${r.id}',this.value)">${esc(ft.comment||'')}</textarea>
+      </div></div>`;}).join('');
+}
+
+function renderFulltextList(){
+  const list=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  const el=document.getElementById('ft-list');if(!el)return;
+  if(!list.length){el.innerHTML='<div class="empty"><div class="ico">▤</div><h3>No studies at full text</h3><div>Include some studies in title/abstract screening first.</div></div>';return;}
+  const shown=Math.min(list.length,FT_PAGE*FT_PAGE_SIZE);
+  el.innerHTML=list.slice(0,shown).map(r=>{const ft=r.ft||{};const dec=ft.decision;
+    return`<div class="study ${dec||''}">
+      <div class="st-title">${esc(r.title)}</div>
+      <div class="st-meta"><span>${esc(r.year||'')}</span><span>${esc(r.journal||'')}</span>
+        ${ft.oa?'<span style="color:var(--inc);font-weight:700">OA</span>':''}
+        ${ft.fulltextUrl?`<a href="${esc(ft.fulltextUrl)}" target="_blank">full text</a>`:r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi</a>`:''}
+        ${ft.fileId?`<span style="color:var(--flow);font-weight:700">PDF attached</span>`:''}
+        ${ft.pdfText?`<span style="color:var(--flow)">text attached (${(ft.pdfText.length/1000).toFixed(0)}k chars)</span>`:'<span style="color:var(--maybe)">no full text yet</span>'}
+        <span style="color:var(--t3)">estimated human time: ~${fmtMinutes(ftEstimateMinutes(r))}</span>
+        ${ft.ms?`<span style="color:var(--t3)">Viveka time: ${fmtDuration(ft.ms)}</span>`:''}</div>
+      <div class="st-foot">
+        ${dec?`<span class="dchip ${dec}">${dec==='include'?'Included':dec==='maybe'?'Maybe':'Excluded'}</span>
+          ${ft.exclCat?`<span class="pill">${esc(ft.exclCat)}</span>`:''}
+          <span class="muted" style="flex:1">${esc(ft.reason||'')}</span>`:'<span class="dchip pend">not assessed</span><span class="spacer"></span>'}
+        <button class="btn gh sm" onclick="ASRMA.fetchFullText('${r.id}').then(()=>{renderFulltextList()})" title="Fetch open-access text online">Fetch</button>
+        <button class="btn gh sm" onclick="attachFullText('${r.id}')" title="Upload a PDF or .txt">Attach</button>
+        ${ft.fileId?`<button class="btn flow sm" onclick="openPdfViewer('${r.id}')" title="Read the attached PDF beside this screening record">Open PDF</button>`:''}
+        <button class="btn gh sm" onclick="pasteFullText('${r.id}')" title="Paste text">Paste</button>
+        <button class="btn flow sm" onclick="ftScreen('${r.id}','cloud')">Viveka Cloud</button>
+        <button class="btn gh sm" onclick="ftScreen('${r.id}','local').then(()=>{renderFulltextList();renderFTStats();})">Viveka Local</button>
+        <button class="vbtn maybe ${dec==='maybe'?'act-maybe':''}" onclick="ftDecide('${r.id}','maybe')">?</button>
+        <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" onclick="ftDecide('${r.id}','exclude')">x</button>
+        <button class="vbtn inc ${dec==='include'?'act-inc':''}" onclick="ftDecide('${r.id}','include')">✓</button>
+      </div>
+      ${ft.reviewedAt?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ft))}</div>`:''}
+      ${ft.pdfText?`<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--flow);font-weight:700">Preview retrieved full text</summary><div style="margin-top:8px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--wash);max-height:220px;overflow:auto;white-space:pre-wrap;font-size:12px;line-height:1.55">${esc(ft.pdfText.slice(0,2200))}</div></details>`:''}
+      <div class="fg" style="margin:10px 0 0">
+        <label class="fl">Comment / reason</label>
+        <textarea class="inp" style="min-height:64px" placeholder="Add reviewer comments, exclusion rationale, or notes for extraction" oninput="setDecisionComment('ft','${r.id}',this.value)">${esc(ft.comment||'')}</textarea>
+      </div></div>`;}).join('')+
+    (shown<list.length?`<div style="text-align:center;padding:16px"><button class="btn gh" onclick="moreFulltextCards()">Load more full-text studies - showing ${shown} of ${list.length}</button></div>`:
+      (list.length>FT_PAGE_SIZE?`<div class="muted" style="text-align:center;padding:12px">All ${list.length} full-text studies shown</div>`:''));
+}
+
+let FT_FILTER='all';
+function fullTextBaseRefs(){
+  return ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+}
+function filteredFullTextRefs(){
+  let list=fullTextBaseRefs();
+  if(FT_FILTER==='pending')list=list.filter(r=>{const ft=visibleStageDecision(r,'ft')||r.ft;return !(ft&&(ft.decision||ft.final));});
+  else if(FT_FILTER!=='all')list=list.filter(r=>{const ft=visibleStageDecision(r,'ft')||r.ft;return ft&&(ft.decision||ft.final)===FT_FILTER;});
+  return list;
+}
+function setFTFilter(f){
+  FT_FILTER=f;FT_PAGE=1;
+  document.querySelectorAll('#ft-seg button').forEach(b=>b.classList.remove('on'));
+  const btn=document.querySelector(`#ft-seg button[onclick*="'${f}'"]`);if(btn)btn.classList.add('on');
+  renderFulltextList();
+}
+function resetTitleAbstractScreening(){
+  if(BATCH_CTRL.ta&&BATCH_CTRL.ta.running){toast('Stop Viveka first, then reset','err');return;}
+  const scope=titleAbstractScopeRefs();
+  if(!scope.length){toast('No title/abstract records to reset','err');return;}
+  if(!confirm('Reset title/abstract screening decisions for '+scope.length+' visible records? Imported records and assignments will stay.'))return;
+  scope.forEach(r=>{delete r.ta;delete r._conflict;if(r.reviews)delete r.reviews.ta;});
+  saveNow();renderScreen();renderSpine();toast('Title/abstract screening reset','ok');
+}
+function resetFullTextScreening(){
+  if((BATCH_CTRL.ftCloud&&BATCH_CTRL.ftCloud.running)||(BATCH_CTRL.ftLocal&&BATCH_CTRL.ftLocal.running)){toast('Stop full-text screening first, then reset','err');return;}
+  const list=filteredFullTextRefs();
+  if(!list.length){toast('No full-text records in this filter to reset','err');return;}
+  if(!confirm('Reset full-text screening decisions for '+list.length+' records in the current filter? Retrieved full text/PDF text will be kept.'))return;
+  list.forEach(r=>{
+    if(!r.ft)return;
+    const keep={};
+    ['oa','pdfText','pdfName','fileId','fileMime','fileSize','fulltextUrl','source','doi','fetchedAt','serverExtractedAt','serverExtractedBy','pages'].forEach(k=>{if(r.ft[k]!=null)keep[k]=r.ft[k];});
+    r.ft=keep;
+    delete r._ftConflict;
+    if(r.reviews)delete r.reviews.ft;
+  });
+  saveNow();renderFulltext();renderSpine();toast('Full-text screening reset','ok');
+}
+window.setFTFilter=setFTFilter;window.resetTitleAbstractScreening=resetTitleAbstractScreening;window.resetFullTextScreening=resetFullTextScreening;
+renderFulltext=function(){
+  if(typeof FT_PAGE!=='undefined')FT_PAGE=1;
+  document.getElementById('pane-fulltext').innerHTML=`
+  <div class="pane-h"><div class="eyebrow">Phase 07 - confirm eligibility</div>
+    <h1>Full-text screening</h1>
+    <p>Pull open-access full text from Europe PMC and Unpaywall, or attach a PDF / paste the text yourself, then assess eligibility against the full paper. Comments or exclusion reasons can be added when useful.</p></div>
+  <div id="ft-stats"></div>
+  <div class="toolbar">
+    <button class="btn flow sm" id="ft-fetch-btn" onclick="ASRMA.fetchAllFullText()">Fetch full text</button>
+    <button class="btn gh sm" id="ft-fetch-stop-btn" onclick="stopBatch('fetchFT')" disabled>Stop</button>
+    <div class="pbar" style="width:160px"><i id="ft-bar"></i></div>
+    <span class="muted" id="ft-fetch-time">Open-access papers are retrieved from Europe PMC and Unpaywall, not AI tokens.</span>
+  </div>
+  <div class="toolbar">
+    <button class="btn flow sm" id="ft-cloud-btn" onclick="screenAllFullText('cloud')">Full-text screen all - Cloud</button>
+    <button class="btn gh sm" id="ft-local-btn" onclick="screenAllFullText('local')">Full-text screen all - Local</button>
+    <button class="btn gh sm" id="ft-cloud-stop-btn" onclick="stopBatch('ftCloud')" disabled>Stop Cloud</button>
+    <button class="btn gh sm" id="ft-local-stop-btn" onclick="stopBatch('ftLocal')" disabled>Stop Local</button>
+    <button class="btn gh sm" onclick="screenAllFullText('cloud',true)">Resume Cloud</button>
+    <button class="btn gh sm" onclick="screenAllFullText('local',true)">Resume Local</button>
+    ${BK.isServer()?`<button class="btn gh sm" onclick="showConsensusModal('ft')">Consensus & IRR</button>`:''}
+    <button class="btn gh sm" onclick="resetFullTextScreening()">Reset current full-text filter</button>
+    <div class="pbar" style="width:160px"><i id="ft-screen-bar"></i></div>
+    <span class="muted" id="ft-screen-time">Timer appears while full-text screening runs.</span>
+  </div>
+  <div class="toolbar">
+    <div class="seg" id="ft-seg">
+      ${['all','pending','include','maybe','exclude'].map(f=>`<button class="${FT_FILTER===f?'on':''}" onclick="setFTFilter('${f}')">${f[0].toUpperCase()+f.slice(1)}</button>`).join('')}
+    </div>
+  </div>
+  <div id="ft-list"></div>`;
+  renderFTStats();renderFulltextList();updateBatchButtons();
+};
+renderFTStats=function(){
+  const list=fullTextBaseRefs();
+  const decOf=r=>{const ft=visibleStageDecision(r,'ft')||r.ft;return ft&&(ft.decision||ft.final);};
+  const inc=list.filter(r=>decOf(r)==='include').length;
+  const maybe=list.filter(r=>decOf(r)==='maybe').length;
+  const exc=list.filter(r=>decOf(r)==='exclude').length;
+  const pend=list.filter(r=>!decOf(r)).length;
+  const oa=list.filter(r=>r.ft&&r.ft.oa).length;
+  const estTotal=list.reduce((sum,r)=>sum+ftEstimateMinutes(r),0);
+  const estPending=list.filter(r=>!decOf(r)).reduce((sum,r)=>sum+ftEstimateMinutes(r),0);
+  const disc=ensureAudit().filter(x=>x.stage==='ft').length;
+  const tile=(f,val,label,cls)=>`<div class="tile ${cls||''}" style="cursor:pointer" onclick="setFTFilter('${f}')"><div class="v">${val}</div><div class="k">${label}</div></div>`;
+  const el=document.getElementById('ft-stats');if(!el)return;
+  el.innerHTML=`<div class="tiles">
+    ${tile('all',list.length,'at full text','')}
+    ${tile('pending',pend,'pending','')}
+    <div class="tile flow"><div class="v">${oa}</div><div class="k">open access</div></div>
+    ${tile('include',inc,'included','inc')}
+    ${tile('maybe',maybe,'maybe','maybe')}
+    ${tile('exclude',exc,'excluded','exc')}
+    ${disc?`<div class="tile maybe"><div class="v">${disc}</div><div class="k">AI discrepancies logged</div></div>`:''}
+  </div><div class="muted" style="margin:-6px 0 14px">Estimated full-text review time: <b>${fmtMinutes(estTotal)}</b> total - <b>${fmtMinutes(estPending)}</b> still pending.</div>${inc?`<div class="row" style="margin-bottom:6px"><button class="btn" onclick="ASRMA.go('extract')">Extract data (${inc}) -></button></div>`:''}`;
+};
+renderFulltextList=function(){
+  const list=filteredFullTextRefs();
+  const el=document.getElementById('ft-list');if(!el)return;
+  if(!list.length){el.innerHTML='<div class="empty"><div class="ico">FT</div><h3>No full-text studies in this filter</h3><div>Switch to All, Pending, Include, Maybe, or Exclude.</div></div>';return;}
+  const shown=Math.min(list.length,FT_PAGE*FT_PAGE_SIZE);
+  el.innerHTML=list.slice(0,shown).map(r=>{const ft=Object.assign({},r.ft||{},visibleStageDecision(r,'ft')||{});const dec=ft.decision||ft.final;
+    return`<div class="study ${dec||''}">
+      <div class="st-title">${esc(r.title)}</div>
+      <div class="st-meta"><span>${esc(r.year||'')}</span><span>${esc(r.journal||'')}</span>
+        ${ft.oa?'<span style="color:var(--inc);font-weight:700">OA</span>':''}
+        ${ft.fulltextUrl?`<a href="${esc(ft.fulltextUrl)}" target="_blank">full text</a>`:r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi</a>`:''}
+        ${ft.pdfText?`<span style="color:var(--flow)">text attached (${(ft.pdfText.length/1000).toFixed(0)}k chars)</span>`:'<span style="color:var(--maybe)">no full text yet</span>'}
+        <span style="color:var(--t3)">estimated human time: ~${fmtMinutes(ftEstimateMinutes(r))}</span>
+        ${ft.ms?`<span style="color:var(--t3)">Viveka time: ${fmtDuration(ft.ms)}</span>`:''}</div>
+      <div class="st-foot">
+        ${dec?`<span class="dchip ${dec}">${dec==='include'?'Included':dec==='maybe'?'Maybe':'Excluded'}</span>
+          ${ft.exclCat?`<span class="pill">${esc(ft.exclCat)}</span>`:''}
+          <span class="muted" style="flex:1">${esc(ft.reason||'')}</span>`:'<span class="dchip pend">not assessed</span><span class="spacer"></span>'}
+        <button class="btn gh sm" onclick="ASRMA.fetchFullText('${r.id}').then(()=>{renderFulltextList()})" title="Fetch open-access text online">Fetch</button>
+        <button class="btn gh sm" onclick="attachFullText('${r.id}')" title="Upload a PDF or .txt">Attach</button>
+        <button class="btn gh sm" onclick="pasteFullText('${r.id}')" title="Paste text">Paste</button>
+        <button class="btn flow sm" onclick="ftScreen('${r.id}','cloud')">Viveka Cloud</button>
+        <button class="btn gh sm" onclick="ftScreen('${r.id}','local').then(()=>{renderFulltextList();renderFTStats();})">Viveka Local</button>
+        <button class="vbtn maybe ${dec==='maybe'?'act-maybe':''}" onclick="ftDecide('${r.id}','maybe')">?</button>
+        <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" onclick="ftDecide('${r.id}','exclude')">x</button>
+        <button class="vbtn inc ${dec==='include'?'act-inc':''}" onclick="ftDecide('${r.id}','include')">✓</button>
+      </div>
+      ${ft.reviewedAt?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ft))}</div>`:''}
+      ${ft.pdfText?`<details style="margin-top:10px"><summary style="cursor:pointer;color:var(--flow);font-weight:700">Preview retrieved full text</summary><div style="margin-top:8px;padding:12px;border:1px solid var(--line);border-radius:10px;background:var(--wash);max-height:220px;overflow:auto;white-space:pre-wrap;font-size:12px;line-height:1.55">${esc(ft.pdfText.slice(0,2200))}</div></details>`:''}
+      <div class="fg" style="margin:10px 0 0">
+        <label class="fl">Comment / reason</label>
+        <textarea class="inp" style="min-height:64px" placeholder="Add reviewer comments, exclusion rationale, or notes for extraction" oninput="setDecisionComment('ft','${r.id}',this.value)">${esc(ft.comment||'')}</textarea>
+      </div></div>`;}).join('')+
+    (shown<list.length?`<div style="text-align:center;padding:16px"><button class="btn gh" onclick="moreFulltextCards()">Load more full-text studies - showing ${shown} of ${list.length}</button></div>`:
+      (list.length>FT_PAGE_SIZE?`<div class="muted" style="text-align:center;padding:12px">All ${list.length} full-text studies shown</div>`:''));
+};
+
+/* ===================== DATA EXTRACTION ===================== */
+const DEFAULT_FIELDS=[
+  {k:'design',label:'Study design'},{k:'country',label:'Country / setting'},
+  {k:'n',label:'Sample size (N)'},{k:'population',label:'Population'},
+  {k:'intervention',label:'Intervention'},{k:'comparator',label:'Comparator'},
+  {k:'followup',label:'Follow-up'},{k:'outcome',label:'Primary outcome'},
+  {k:'effect',label:'Effect estimate (with 95% CI)'}
+];
+function getFields(){return ST.project.extractFields||DEFAULT_FIELDS;}
+let EXTRACT_JOB_ID=null;
+async function refreshServerProjectPhase(phase){
+  if(!(window.BK&&BK.isServer&&BK.isServer()&&ST.id))return;
+  const res=await BK.api('GET','/api/projects/'+ST.id,null,30000);
+  const id=ST.id;
+  const data=res.project&&res.project.data?res.project.data:{};
+  Object.keys(ST).forEach(k=>delete ST[k]);
+  Object.assign(ST,blankState(),data,{id});
+  window.ST=ST;
+  BK.version=res.project.version;
+  BK.role=res.role;
+  updatePill();updateKeyBtn();updateAgentChip();renderTeam();
+  renderCurrentPhaseNoSave(phase||'extract');
+}
+function setExtractJobUi(running,text,pct){
+  const bar=document.getElementById('ext-bar');
+  const label=document.getElementById('ext-job-status');
+  const stop=document.getElementById('ext-stop-btn');
+  if(bar)bar.style.width=Math.max(0,Math.min(100,pct||0))+'%';
+  if(label)label.textContent=text||'';
+  if(stop)stop.disabled=!running;
+}
+async function pollServerJob(jobId,onTick){
+  let last=null;
+  while(true){
+    await new Promise(resolve=>setTimeout(resolve,1500));
+    const res=await BK.api('GET','/api/jobs/'+jobId,null,30000);
+    const job=res.job||{};
+    last=job;
+    if(onTick)onTick(job);
+    if(['succeeded','failed','cancelled'].includes(job.status))return job;
+  }
+}
+async function serverExtractAllJob(list){
+  if(EXTRACT_JOB_ID){toast('Extraction is already running','err');return;}
+  if(typeof _srvTimer!=='undefined'&&_srvTimer)await serverSaveNow();
+  agentBusy(true);
+  const started=Date.now();
+  try{
+    const fields=getFields();
+    const model=serverModelFor(ST.agent.advModel||ST.agent.model);
+    const res=await BK.api('POST','/api/projects/'+ST.id+'/jobs',{type:'extract-all',refIds:list.map(r=>r.id),fields,model},30000);
+    EXTRACT_JOB_ID=res.job&&res.job.id;
+    setExtractJobUi(true,'Server extraction queued...',3);
+    const job=await pollServerJob(EXTRACT_JOB_ID,j=>{
+      const p=j.progress||{};
+      const total=Number(p.total||list.length||0);
+      const done=Number(p.done||0);
+      const pct=total?Math.round(done/total*100):5;
+      const elapsed=Math.max(1,Math.round((Date.now()-started)/1000));
+      const per=done?Math.round(elapsed/done):0;
+      const eta=done&&total>done?' - ETA ~'+Math.round((total-done)*per/60)+' min':'';
+      setExtractJobUi(true,'Server extraction: '+done+'/'+total+' - '+(p.ok||0)+' ok - '+(p.failed||0)+' failed - '+elapsed+'s elapsed'+eta,pct);
+    });
+    EXTRACT_JOB_ID=null;
+    setExtractJobUi(false,'Refreshing extracted data...',100);
+    await refreshServerProjectPhase('extract');
+    if(job.status==='succeeded')toast('Extracted '+((job.result&&job.result.ok)||0)+' studies on server','ok');
+    else if(job.status==='cancelled')toast('Server extraction stopped','ok');
+    else toast(job.error||'Server extraction failed','err');
+  }catch(e){
+    EXTRACT_JOB_ID=null;
+    setExtractJobUi(false,e.message||'Server extraction failed',0);
+    toast(e.message||'Server extraction failed','err');
+  }finally{
+    agentBusy(false);
+  }
+}
+async function cancelExtractJob(){
+  if(!EXTRACT_JOB_ID){toast('No extraction job is running','err');return;}
+  try{
+    await BK.api('POST','/api/jobs/'+EXTRACT_JOB_ID+'/cancel',{},15000);
+    setExtractJobUi(true,'Stop requested. Waiting for the current article to finish...',50);
+  }catch(e){toast(e.message||'Could not stop extraction','err');}
+}
+async function extractOne(id){
+  const r=ST.refs.find(x=>x.id===id);if(!r)return;
+  const fields=getFields();
+  if(window.BK&&BK.isServer&&BK.isServer()&&serverAIReady()&&ST.id){
+    if(typeof _srvTimer!=='undefined'&&_srvTimer)await serverSaveNow();
+    const started=Date.now();
+    const model=serverModelFor(ST.agent.advModel||ST.agent.model);
+    const res=await BK.api('POST','/api/projects/'+ST.id+'/ai/extract',{refId:id,fields,model},180000);
+    syncAICredits(res);
+    r.extract=res.extraction||{};
+    r.extractEvidence=res.evidence||{};
+    r.extractWarnings=res.warnings||[];
+    r.extractEffectCandidates=res.effectCandidates||[];
+    r.extractMeta={server:true,model:res.model||model,creditsUsed:res.creditsUsed||0,chunksUsed:res.chunksUsed||[],overallConfidence:res.overallConfidence||0,reviewedAt:new Date().toISOString(),ms:Date.now()-started};
+    save();return r;
+  }
+  const ctx=r.ft&&r.ft.pdfText?r.ft.pdfText.slice(0,11000):r.abstract;
+  const res=parseJSON(await LLM(`You are an expert data extractor for a systematic review. Extract these fields from the study. Use the study's own numbers; write "NR" (not reported) if absent. Be precise and concise.
+STUDY: ${r.title}
+SOURCE: ${ctx}
+Return ONLY JSON with exactly these keys: ${JSON.stringify(fields.map(f=>f.k))}
+Each value a short string. For "effect", give the headline result with CI if present.`,900,ST.agent.advModel));
+  r.extract=res;save();return r;
+}
+function hasFullTextContent(r){const ft=r.ft||{};return !!(ft.pdfText||r.fullText||r.abstract);}
+function extractionRefs(){return ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe')&&r.ft&&r.ft.decision==='include'&&hasFullTextContent(r));}
+function heuristicExtractAll(){
+  const fields = getFields();
+  const list = extractionRefs().filter(r => hasFullTextContent(r));
+  if (!list.length) return toast('No included studies with full text to extract.', 'err');
+  toast('Running Smart Extraction (Heuristic) locally...', 'info');
+  list.forEach(r => {
+    r.extract = r.extract || {};
+    r.extractEvidence = r.extractEvidence || {};
+    r.extractMeta = { model: 'Smart Heuristic (Local)', creditsUsed: 0, overallConfidence: 100 };
+    const text = r.ft.pdfText || r.fullText || r.abstract || '';
+    if (!text) return;
+    const sentences = text.replace(/\n/g, ' ').split(/(?<=[.?!])\s+(?=[A-Z0-9])/);
+    fields.forEach(f => {
+      const fl = f.label.toLowerCase();
+      let matchVal = null, matchQuote = null;
+      if (fl.includes('sample') || fl.includes('size') || fl.match(/\bn\b/)) {
+        for (const s of sentences) {
+          const m = s.match(/\b(?:n|N|sample size)\s*(?:=|of|:)?\s*(\d{1,5})\b/) || s.match(/\b(?:total of)\s+(\d{1,5})\s+(?:patients|participants|subjects)\b/);
+          if (m && parseInt(m[1]) > 5) { matchVal = m[1]; matchQuote = s; break; }
+        }
+      } else if (fl.includes('age') || fl.includes('mean age')) {
+        for (const s of sentences) {
+          const m = s.match(/\b(?:mean)?\s*age\s*(?:of|was|is|=)?\s*(\d{1,2}(?:\.\d{1,2})?)\s*(?:years|yrs)?\b/i);
+          if (m) { matchVal = m[1]; matchQuote = s; break; }
+        }
+      } else if (fl.includes('female') || fl.includes('gender') || fl.includes('sex')) {
+         for (const s of sentences) {
+          const m = s.match(/\b(\d{1,3}(?:\.\d{1,2})?)\s*%\s*(?:female|male)\b/i) || s.match(/\b(\d{1,5})\s*(?:female|male)s?\b/i);
+          if (m) { matchVal = m[0]; matchQuote = s; break; }
+        }
+      } else {
+        const kws = fl.split(' ').filter(w => w.length > 3);
+        if(kws.length === 0) kws.push(fl);
+        for (const s of sentences) {
+          const sl = s.toLowerCase();
+          const hasKeyword = kws.some(kw => sl.includes(kw));
+          const hasNumber = /\d/.test(s);
+          if (hasKeyword && hasNumber && (sl.includes('p=') || sl.includes('p<') || sl.includes('%') || sl.includes('ci') || sl.includes('sd') || sl.includes('or='))) {
+            matchVal = ''; matchQuote = s; break;
+          }
+        }
+      }
+      if (matchVal) { r.extract[f.k] = matchVal; r.extractEvidence[f.k] = { quote: matchQuote, confidence: 80 }; }
+    });
+  });
+  saveSoon();
+  renderExtract();
+  toast('Smart Extraction complete! Review highlighted quotes.', 'ok');
+}
+
+async function extractAll(){
+  const list=extractionRefs();
+  if(!list.length){toast('No included studies with full text available','err');return;}
+  if(window.BK&&BK.isServer&&BK.isServer()&&serverAIReady()&&ST.id){await serverExtractAllJob(list);return;}
+  agentBusy(true);const bar=document.getElementById('ext-bar');let done=0,ok=0,fail=0,lastErr='';
+  for(const r of list){try{await extractOne(r.id);ok++;}catch(e){fail++;lastErr=e.message||'extraction failed';if(e.status===402||/credits|configured|provider/i.test(lastErr))break;}
+    done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';
+    if(done%2===0)renderExtTable();}
+  agentBusy(false);renderExtract();renderSpine();
+  if(fail)toast('Extracted '+ok+' studies. Stopped: '+lastErr,'err');
+  else toast('Extracted '+ok+' studies','ok');
+}
+async function resetExtraction(){
+  if(EXTRACT_JOB_ID){toast('Stop the running extraction job first','err');return;}
+  const list=extractionRefs().filter(r=>r.extract);
+  if(!list.length){toast('No extraction data to reset','err');return;}
+  if(!confirm('Reset extraction data for '+list.length+' studies? This will clear all extracted fields so you can re-run extraction from scratch.'))return;
+  if(window.BK&&BK.isServer&&BK.isServer()&&ST.id){
+    try{
+      const res=await BK.api('POST','/api/projects/'+ST.id+'/reset-extraction',{},30000);
+      toast('Reset extraction for '+(res.reset||0)+' studies','ok');
+      await refreshServerProjectPhase('extract');
+    }catch(e){toast(e.message||'Reset failed','err');}
+    return;
+  }
+  list.forEach(r=>{delete r.extract;delete r.extractEvidence;delete r.extractWarnings;delete r.extractEffectCandidates;delete r.extractMeta;});
+  saveNow();renderExtract();renderSpine();toast('Reset extraction for '+list.length+' studies','ok');
+}
+function renderExtract(){
+  const fields=getFields();
+  const allInc=ST.refs.filter(r=>!r.dup&&r.ta&&(r.ta.final==='include'||r.ta.final==='maybe')&&r.ft&&r.ft.decision==='include');
+  const withText=allInc.filter(r=>hasFullTextContent(r));
+  const noText=allInc.length-withText.length;
+  document.getElementById('pane-extract').innerHTML=`
+  <div class="pane-h"><div class="eyebrow">Phase 08 — capture the data</div>
+    <h1>⊞ Viveka Extractor</h1>
+    <p>Server-side full-text extraction: Viveka reads the article in sections, extracts your fields, keeps evidence quotes, and flags missing or uncertain values. Every cell remains editable before analysis.</p></div>
+  <div class="toolbar">
+    <button class="btn flow sm" onclick="extractAll()">⊹ Extract all with Viveka</button>
+    <button class="btn sm" style="background:#15803d;color:#fff;border-color:#14532d;margin-left:8px" onclick="heuristicExtractAll()">⚡ Smart Extract (Free)</button>
+    <div class="pbar" style="width:160px"><i id="ext-bar"></i></div>
+    <button class="btn gh sm" id="ext-stop-btn" onclick="cancelExtractJob()" disabled>Stop server job</button>
+    <span class="muted" id="ext-job-status" style="font-size:12px">Server jobs keep running outside the browser tab.</span>
+    <button class="btn gh sm" onclick="addField()">+ Add field</button>
+    <button class="btn gh sm" style="color:var(--exc)" onclick="resetExtraction()" title="Clear all extracted data and start fresh">↺ Reset extraction</button>
+    <span class="spacer"></span>
+    <button class="btn gh sm" onclick="exportExtractCSV()">⬇ Export CSV</button>
+  </div>
+  ${noText?`<div class="banner" style="margin-bottom:14px;background:var(--maybe-w);border-color:var(--maybe)"><span class="bi" style="color:var(--maybe)">⚠</span><div><b>${noText} included ${noText===1?'study has':'studies have'} no full text attached.</b> Only ${withText.length} ${withText.length===1?'study':'studies'} with full text (PDF, pasted text, or fetched text) will be extracted. Go to Full Text phase to attach or fetch missing articles.</div></div>`:''}
+  <div class="banner info" style="margin-bottom:14px"><span class="bi">i</span><div>Manual editing is free. <b>\u26a1 Smart Extract</b> uses local browser heuristics for fast baseline matching. For deep contextual extraction and numeric table parsing, use <b>\u229e Viveka AI</b> (uses credits).</div></div>
+  <div class="card" style="overflow-x:auto"><div id="ext-table"></div></div>`;
+  renderExtTable();
+}
+function renderExtTable(){
+  const fields=getFields();
+  const list=extractionRefs();
+  const el=document.getElementById('ext-table');if(!el)return;
+  if(!list.length){el.innerHTML='<div class="empty"><div class="ico">⊞</div><h3>No included studies with full text</h3><div>Include studies at full-text screening and attach or fetch their full text first.</div></div>';return;}
+  el.innerHTML=`<table class="tbl tbl-resp"><thead><tr><th style="min-width:180px">Study</th>
+    ${fields.map(f=>`<th style="min-width:150px">${esc(f.label)} <button class="vbtn exc" style="width:18px;height:18px;font-size:11px;border:none" onclick="rmField('${f.k}')">×</button></th>`).join('')}</tr></thead><tbody>
+    ${list.map(r=>{const e=r.extract||{};const ft=r.ft||{};const textSrc=ft.pdfText?'PDF/text ('+Math.round(ft.pdfText.length/1000)+'k chars)':r.fullText?'full text':'abstract only';
+      return`<tr><td data-label="Study"><b>${esc((r.authors||'').split(';')[0]||r.title.slice(0,30))} ${esc(r.year||'')}</b><div class="muted">${esc(r.title.slice(0,60))}</div><div style="font-size:11px;margin-top:4px;color:${ft.pdfText?'var(--flow)':'var(--maybe)'}">${esc(textSrc)}</div><button class="btn gh sm" style="margin-top:8px" onclick="extractOne('${r.id}').then(()=>renderExtract()).catch(e=>toast(e.message,'err'))">Extract this</button>${r.extractMeta?`<div class="muted" style="font-size:11px;margin-top:6px">${esc(r.extractMeta.model||'Viveka')} · ${r.extractMeta.creditsUsed||0} credits · ${r.extractMeta.overallConfidence||0}% confidence</div>`:''}</td>
+      ${fields.map(f=>{const ev=(r.extractEvidence||{})[f.k]||{};return`<td data-label="${esc(f.label)}"><textarea oninput="setCell('${r.id}','${f.k}',this.value)" style="width:100%;min-height:36px;font-size:11.5px;box-sizing:border-box;border:1px solid var(--line);border-radius:4px;padding:6px">${esc(e[f.k]||'')}</textarea>${ev.quote?`<details style="margin-top:6px"><summary class="muted" style="cursor:pointer;font-size:11px">evidence ${ev.confidence?`· ${Number(ev.confidence).toFixed(0)}%`:''}</summary><div class="muted" style="font-size:11px;line-height:1.45;margin-top:4px">${esc(ev.quote)}</div></details>`:''}</td>`}).join('')}</tr>${((r.extractWarnings&&r.extractWarnings.length)||(r.extractEffectCandidates&&r.extractEffectCandidates.length))?`<tr><td data-label="Warnings / Candidates" colspan="${fields.length+1}"><div class="muted" style="font-size:11.5px">${r.extractWarnings&&r.extractWarnings.length?`<b>Warnings:</b> ${esc(r.extractWarnings.join('; '))}`:''}${r.extractEffectCandidates&&r.extractEffectCandidates.length?`<br><b>Effect candidates:</b> ${esc(r.extractEffectCandidates.map(x=>[x.outcome,x.value].filter(Boolean).join(': ')).join(' | '))}`:''}</div></td></tr>`:''}`;}).join('')}
+    </tbody></table>`;
+}
+function setCell(id,k,v){const r=ST.refs.find(x=>x.id===id);if(r){r.extract=r.extract||{};r.extract[k]=v;save();}}
+function addField(){const label=prompt('New field name (e.g. "Effect size — SMD"):');if(!label)return;
+  const k='f_'+uid().slice(0,5);ST.project.extractFields=getFields().concat([{k,label}]);save();renderExtract();}
+function rmField(k){ST.project.extractFields=getFields().filter(f=>f.k!==k);save();renderExtract();}
+function exportExtractCSV(){
+  const fields=getFields();const list=extractionRefs();
+  const head=['Study','Year','DOI'].concat(fields.map(f=>f.label));
+  const rows=list.map(r=>{const e=r.extract||{};
+    return[(r.authors||'').split(';')[0],r.year,r.doi].concat(fields.map(f=>e[f.k]||''));});
+  downloadCSV([head].concat(rows),'extraction.csv');
+}
+function exportRobCSV(){
+  const tool=getTool();const doms=ROB_TOOLS[tool];
+  const list=extractionRefs();
+  const head=['Study'].concat(doms).concat(['Overall Bias']);
+  const rows=list.map(r=>{
+    const q=r.quality||{domains:{}};
+    return [(r.authors||'').split(';')[0]+' '+(r.year||'')].concat(doms.map(d=>(q.domains[d]||{}).j||'')).concat([q.overall||'']);
+  });
+  downloadCSV([head].concat(rows),'risk_of_bias.csv');
+}
+function exportGradeCSV(){
+  const head=['Outcome','Start','Risk of bias','Inconsistency','Indirectness','Imprecision','Publication bias','Large effect','Dose response','Confounding','Certainty'];
+  const rows=ST.grade.map(g=>[g.outcome||'',g.start||'',g.rob||'0',g.incons||'0',g.indirect||'0',g.imprec||'0',g.pubbias||'0',g.large||'0',g.doseresp||'0',g.confound||'0',gradeLevel(g)]);
+  downloadCSV([head].concat(rows),'grade_certainty.csv');
+}
+window.extractAll=extractAll;window.cancelExtractJob=cancelExtractJob;window.setCell=setCell;window.addField=addField;window.rmField=rmField;window.exportExtractCSV=exportExtractCSV;window.resetExtraction=resetExtraction;
+window.exportRobCSV=exportRobCSV;window.exportGradeCSV=exportGradeCSV;
+function downloadCSV(rows,name){
+  const csv=rows.map(r=>r.map(c=>'"'+String(c==null?'':c).replace(/"/g,'""')+'"').join(',')).join('\n');
+  const b=new Blob([csv],{type:'text/csv'});const a=document.createElement('a');
+  a.href=URL.createObjectURL(b);a.download=name;a.click();
+}
+
+
+/* ===================== QUALITY / RISK OF BIAS ===================== */
+const ROB_TOOLS={
+  'RoB 2':['Randomisation process','Deviations from intended interventions','Missing outcome data','Measurement of the outcome','Selection of the reported result'],
+  'ROBINS-I':['Confounding','Selection of participants','Classification of interventions','Deviations','Missing data','Measurement of outcomes','Selection of reported result'],
+  'Newcastle-Ottawa':['Selection','Comparability','Outcome'],
+  'JBI checklist':['Inclusion criteria','Condition measurement','Exposure measurement','Confounders','Outcomes','Statistical analysis']
+};
+const JUDGE=['low','some','high'];
+function getTool(){return ST.project.robTool||'RoB 2';}
+const ROB_KEYWORDS = {
+  'Randomisation process': { pos: ['randomly assigned', 'randomized', 'randomised', 'allocation concealment', 'computer-generated', 'envelope'], neg: ['not randomized', 'non-random', 'quasi'] },
+  'Deviations': { pos: ['double-blind', 'double blind', 'masking', 'placebo', 'sham'], neg: ['open-label', 'unblinded', 'not blinded'] },
+  'Missing data': { pos: ['intention-to-treat', 'itt', 'attrition', 'imputation', 'drop out', 'loss to follow-up'], neg: ['per-protocol', 'excluded from analysis'] },
+  'Measurement': { pos: ['blinded assessor', 'objective measure', 'independent evaluator'], neg: ['self-reported', 'unblinded assessor'] },
+  'Selection of the reported result': { pos: ['trial registry', 'pre-registered', 'clinicaltrials.gov', 'protocol published'], neg: ['post-hoc', 'data dredging'] },
+  'Confounding': { pos: ['matched', 'adjusted for', 'multivariate', 'propensity'], neg: ['unadjusted', 'crude'] },
+  'Selection': { pos: ['random', 'consecutive', 'representative'], neg: ['convenience', 'volunteer'] },
+  'Comparability': { pos: ['matched', 'adjusted for', 'multivariate', 'propensity'], neg: ['unadjusted', 'crude'] }
+};
+
+function heuristicRob(text, tool, domains) {
+  text = (text || '').toLowerCase();
+  const res = { domains: {}, overall: 'low' };
+  let highCount = 0, someCount = 0;
+  
+  const checkNegation = (idx) => {
+    const window = text.substring(Math.max(0, idx - 45), idx);
+    return /\b(not|no|without|lack|failed to|unable to|non)\b/.test(window);
+  };
+  
+  domains.forEach(d => {
+    let kMatch = Object.keys(ROB_KEYWORDS).find(k => d.toLowerCase().includes(k.toLowerCase()));
+    const rules = ROB_KEYWORDS[kMatch] || {pos:[], neg:[]};
+    
+    let j = 'some', why = 'No explicit methodology keywords found in text.';
+    
+    for(const word of rules.neg) {
+      const idx = text.indexOf(word);
+      if(idx !== -1 && !checkNegation(idx)) {
+        j = 'high'; why = 'Found concerning methodology keyword: "' + word + '"'; break;
+      }
+    }
+    
+    if(j !== 'high' && rules.pos.length) {
+      let foundPos = false;
+      for(const word of rules.pos) {
+        const idx = text.indexOf(word);
+        if(idx !== -1) {
+          if (!checkNegation(idx)) {
+            j = 'low'; why = 'Found robust methodology keyword: "' + word + '"'; foundPos = true; break;
+          } else {
+            j = 'high'; why = 'Found negated methodology keyword: "...not ' + word + '"'; break;
+          }
+        }
+      }
+      if(!foundPos && j === 'some') why = 'Information on this domain was unclear or absent.';
+    }
+    
+    res.domains[d] = { j, why };
+    if(j === 'high') highCount++;
+    else if(j === 'some') someCount++;
+  });
+  
+  if (highCount > 0) res.overall = 'high';
+  else if (someCount > 1) res.overall = 'some';
+  else res.overall = 'low';
+  
+  return res;
+}
+
+async function robOne(id, mode){
+  const r=ST.refs.find(x=>x.id===id);if(!r)return;
+  const tool=getTool();const doms=ROB_TOOLS[tool];
+  if(mode === 'ai'){
+    const ctx=r.ft&&r.ft.pdfText?r.ft.pdfText.slice(0,9000):r.abstract;
+    const res=parseJSON(await LLM('Assess risk of bias using '+tool+' for this study. For each domain give a judgement (low/some/high) and a one-clause justification.\nSTUDY: '+r.title+'\nTEXT: '+ctx+'\nDomains: '+JSON.stringify(doms)+'\nReturn ONLY JSON: {"domains":{'+doms.map(d=>'"'+d+'":{"j":"low|some|high","why":"..."}').join(',')+'},"overall":"low|some|high"}',900,ST.agent.advModel));
+    r.quality={tool,domains:res.domains||{},overall:res.overall||'some',by:'agent'};
+  } else {
+    const ctx=r.ft&&r.ft.pdfText?r.ft.pdfText.slice(0,30000):r.abstract;
+    const res = heuristicRob(ctx, tool, doms);
+    r.quality={tool,domains:res.domains||{},overall:res.overall||'some',by:'algorithm'};
+  }
+  save();return r;
+}
+async function robAll(mode){
+  const list=extractionRefs();
+  if(!list.length){toast('No included studies from extraction yet','err');return;}
+  agentBusy(true);let done=0;const bar=document.getElementById('rob-bar');
+  for(const r of list){try{await robOne(r.id, mode);}catch(e){}done++;if(bar)bar.style.width=Math.round(done/list.length*100)+'%';if(done%2===0)renderQuality();}
+  agentBusy(false);renderQuality();renderSpine();toast('Assessed '+done+' studies','ok');
+}
+
+function renderRobSummaryChart(list, doms) {
+  if (!list.length) return '';
+  const counts = {overall: {low:0, some:0, high:0}};
+  doms.forEach(d => counts[d] = {low:0, some:0, high:0});
+  list.forEach(r => {
+    const q = r.quality || {domains:{}};
+    const ov = q.overall || 'some';
+    counts.overall[ov] = (counts.overall[ov]||0) + 1;
+    doms.forEach(d => {
+      const j = (q.domains[d]||{}).j || 'some';
+      counts[d][j] = (counts[d][j]||0) + 1;
+    });
+  });
+  const t = list.length;
+  const barW = 450, labelW = 220, rowH = 26, H = (doms.length + 1) * rowH + 60, W = labelW + barW + 50;
+  
+  let svg = '<svg id="rob-summary-svg" width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'" xmlns="http://www.w3.org/2000/svg" style="font-family:sans-serif;font-size:11px;background:#ffffff">';
+  const pct = (v) => v/t;
+  const cLow = '#16a34a', cSome = '#d97706', cHigh = '#dc2626', cBg = '#eef2f9';
+  
+  const drawBar = (d, label, isOverall, y) => {
+    const pL = pct(counts[d].low), pS = pct(counts[d].some), pH = pct(counts[d].high);
+    const wL = pL*barW, wS = pS*barW, wH = pH*barW;
+    let out = '<text x="'+(labelW-10)+'" y="'+(y+16)+'" text-anchor="end" fill="#0f1729" font-weight="'+(isOverall?'bold':'normal')+'">'+esc(label)+'</text>';
+    out += '<rect x="'+labelW+'" y="'+(y+4)+'" width="'+barW+'" height="'+(rowH-8)+'" fill="'+cBg+'" rx="2" />';
+    let curX = labelW;
+    if(wL>0){ out+='<rect x="'+curX+'" y="'+(y+4)+'" width="'+wL+'" height="'+(rowH-8)+'" fill="'+cLow+'" />'; curX+=wL; }
+    if(wS>0){ out+='<rect x="'+curX+'" y="'+(y+4)+'" width="'+wS+'" height="'+(rowH-8)+'" fill="'+cSome+'" />'; curX+=wS; }
+    if(wH>0){ out+='<rect x="'+curX+'" y="'+(y+4)+'" width="'+wH+'" height="'+(rowH-8)+'" fill="'+cHigh+'" />'; curX+=wH; }
+    out += '<text x="'+(labelW+barW+10)+'" y="'+(y+16)+'" fill="#8a97ad">100%</text>';
+    return out;
+  };
+  
+  let y = 10;
+  doms.forEach(d => { svg += drawBar(d, d, false, y); y += rowH; });
+  y += 5;
+  svg += '<line x1="20" y1="'+y+'" x2="'+(W-20)+'" y2="'+y+'" stroke="#cbd5e6" stroke-width="1"/>';
+  y += 5;
+  svg += drawBar('overall', 'Overall Bias', true, y);
+  y += rowH + 15;
+  
+  const legX = W/2 - 120;
+  svg += '<rect x="'+legX+'" y="'+(y-8)+'" width="10" height="10" fill="'+cLow+'" rx="2"/><text x="'+(legX+14)+'" y="'+(y+1)+'" fill="#54627a" font-size="10">Low risk</text>';
+  svg += '<rect x="'+(legX+70)+'" y="'+(y-8)+'" width="10" height="10" fill="'+cSome+'" rx="2"/><text x="'+(legX+84)+'" y="'+(y+1)+'" fill="#54627a" font-size="10">Some concerns</text>';
+  svg += '<rect x="'+(legX+170)+'" y="'+(y-8)+'" width="10" height="10" fill="'+cHigh+'" rx="2"/><text x="'+(legX+184)+'" y="'+(y+1)+'" fill="#54627a" font-size="10">High risk</text>';
+  
+  svg += '</svg>';
+  
+  return '<div class="card" style="padding:16px;margin-bottom:16px;background:#f8fafc"><div style="margin-bottom:12px;font-weight:700;font-size:12px;color:var(--t2)">Traffic Light Summary (Intention-to-treat)</div><div style="overflow-x:auto;display:flex;justify-content:center">' + svg + '</div>'+
+    '<div class="row" style="margin-top:10px;gap:8px;justify-content:center">'+
+      '<button class="btn gh sm" onclick="downloadSVG(\'rob-summary-svg\',\'rob_summary.svg\')">\u2b07 SVG</button>'+
+      '<button class="btn gh sm" onclick="downloadSVGasPNG(\'rob-summary-svg\',\'rob_summary.png\')">\u2b07 PNG Image</button>'+
+    '</div></div>';
+}
+function renderQuality(){
+  const tool=getTool();const doms=ROB_TOOLS[tool];
+  const list=extractionRefs();
+  const cols={low:'var(--inc)',some:'var(--maybe)',high:'var(--exc)'};
+  const dot=j=>'<span style="display:inline-block;width:18px;height:18px;border-radius:50%;background:'+(cols[j]||'var(--wash2)')+';color:#fff;font-size:10px;line-height:18px;text-align:center" title="'+(j||'?')+'">'+(j==='low'?'+':j==='high'?'\u2212':j==='some'?'?':'')+'</span>';
+  document.getElementById('pane-quality').innerHTML=
+  '<div class="pane-h"><div class="eyebrow">Phase 09 \u2014 appraise</div>'+
+    '<h1>\u2696 Risk of bias</h1>'+
+    '<p>Assess the risk of bias for each study using automated heuristics or Viveka AI. You can always override any cell manually.</p></div>'+
+  '<div class="toolbar">'+
+    '<select class="inp" style="width:auto" onchange="ST.project.robTool=this.value;save();renderQuality()">'+
+      Object.keys(ROB_TOOLS).map(t=>'<option '+(getTool()===t?'selected':'')+'>'+t+'</option>').join('')+'</select>'+
+    '<button class="btn flow sm" onclick="robAll(\'ai\')">\u2728 Auto-Assess (Viveka AI - uses credits)</button>'+
+    '<button class="btn gh sm" style="margin-left:8px" onclick="robAll(\'heuristic\')">\u2699 Auto-Assess (Local Heuristic - free)</button>'+
+    '<div class="pbar" style="width:160px"><i id="rob-bar"></i></div>'+
+  '</div>'+
+  (!list.length?'<div class="empty"><div class="ico">\u2696</div><h3>No included studies</h3><div>Confirm includes at full text first.</div></div>':
+  renderRobSummaryChart(list, doms)+
+  '<div class="card" style="overflow-x:auto"><div class="card-h">'+tool+' traffic-light matrix</div>'+
+  '<table class="tbl"><thead><tr><th style="min-width:170px">Study</th>'+doms.map(d=>'<th title="'+esc(d)+'">'+esc(d.split(' ')[0])+'</th>').join('')+'<th>Overall</th></tr></thead><tbody>'+
+  list.map(r=>{const q=r.quality||{domains:{}};
+    return '<tr><td><b>'+esc((r.authors||'').split(';')[0]||r.title.slice(0,24))+' '+esc(r.year||'')+'</b></td>'+
+    doms.map(d=>{const j=(q.domains[d]||{}).j;
+      return '<td style="text-align:center;cursor:pointer" title="'+esc((q.domains[d]||{}).why||'click to cycle')+'" onclick="cycleRob(\''+r.id+'\',\''+esc(d).replace(/'/g,'')+'\')">'+dot(j)+'</td>';}).join('')+
+    '<td style="text-align:center">'+dot(q.overall)+'</td></tr>';}).join('')+
+  '</tbody></table>'+
+  '<div class="row" style="margin-top:12px;align-items:center"><span class="pill" style="background:var(--inc-w);color:#15803d">+ low</span>'+
+    '<span class="pill" style="background:var(--maybe-w);color:#b45309">? some concerns</span>'+
+    '<span class="pill" style="background:var(--exc-w);color:#b91c1c">\u2212 high risk</span>'+
+    '<span class="spacer"></span>'+
+    '<button class="btn gh sm" onclick="exportRobCSV()">\u2b07 Export Excel (.csv)</button>'+
+    '<button class="btn sm" style="margin-left:8px" onclick="ASRMA.go(\'synth\')">Meta-analysis \u2192</button></div></div>');
+}
+function cycleRob(id,dom){const r=ST.refs.find(x=>x.id===id);if(!r)return;
+  const tool=getTool();const realDom=ROB_TOOLS[tool].find(d=>d.replace(/'/g,'')===dom)||dom;
+  r.quality=r.quality||{tool,domains:{},overall:'some'};
+  const cur=(r.quality.domains[realDom]||{}).j;const next=JUDGE[(JUDGE.indexOf(cur)+1)%3];
+  r.quality.domains[realDom]={j:next,why:(r.quality.domains[realDom]||{}).why||'manual judgement'};
+  const js=Object.values(r.quality.domains).map(d=>d.j);
+  r.quality.overall=js.includes('high')?'high':js.includes('some')?'some':'low';
+  save();renderQuality();}
+window.robAll=robAll;window.cycleRob=cycleRob;
+
+/* ===================== META-ANALYSIS ===================== */
+function renderSynth(){
+  const inc=extractionRefs();
+  if(ST.project.showCI==null)ST.project.showCI=true;
+  document.getElementById('pane-synth').innerHTML=
+  '<div class="pane-h"><div class="eyebrow">Phase 10 \u2014 synthesise</div>'+
+    '<h1>\u27ff Meta-analysis</h1>'+
+    '<p>Calculate effect sizes from raw study data, or enter them directly. Random-effects (DerSimonian\u2013Laird) and fixed-effect pooling with I\u00b2, \u03c4\u00b2, a prediction interval, forest &amp; funnel plots.</p></div>'+
+  '<div class="card"><div class="card-h">\u2462 Effect-size calculator <span class="tag">raw data \u2192 effect + SE</span></div>'+
+    '<div class="banner info" style="margin-bottom:12px"><span class="bi">\u24d8</span><div>Enter a study\u2019s raw numbers and Pram\u0101\u1e47a computes the effect size and its standard error for you \u2014 then adds it as a row below. Pick the input type that matches your data.</div></div>'+
+    '<div class="row" style="margin-bottom:12px">'+
+      '<select class="inp" id="calc-type" style="width:auto" onchange="renderCalcFields()">'+
+        '<option value="cont">Continuous: means, SDs, Ns (\u2192 MD / SMD)</option>'+
+        '<option value="bin">Binary: 2\u00d72 events (\u2192 OR / RR)</option>'+
+        '<option value="generic">Generic: estimate + 95% CI</option>'+
+      '</select></div>'+
+    '<div id="calc-fields"></div>'+
+    '<div class="row" style="margin-top:10px"><button class="btn flow sm" onclick="calcEffect()">Calculate &amp; add row</button>'+
+      '<span id="calc-out" class="muted"></span></div>'+
+  '</div>'+
+  '<div class="card"><div class="card-h">Studies &amp; pooling</div>'+
+    '<div class="row" style="margin-bottom:14px">'+
+      '<select class="inp" style="width:auto" id="ma-measure" onchange="ST.project.measure=this.value;save()">'+
+        [['md','Mean difference (MD)'],['smd','Std. mean difference (SMD)'],['or','Odds ratio (OR)'],['rr','Risk ratio (RR)'],['hr','Hazard ratio (HR)']].map(a=>'<option value="'+a[0]+'" '+(ST.project.measure===a[0]?'selected':'')+'>'+a[1]+'</option>').join('')+'</select>'+
+      '<select class="inp" style="width:auto" id="ma-model"><option value="random">Random effects</option><option value="fixed">Fixed effect</option></select>'+
+      '<label class="row" style="gap:6px"><input type="checkbox" id="ma-ci" '+(ST.project.showCI?'checked':'')+' onchange="ST.project.showCI=this.checked;save();ASRMA.runMeta()"> Show 95% CI on plot</label>'+
+      '<label class="row" style="gap:6px"><input type="checkbox" id="ma-sub" '+(ST.project.useSub?'checked':'')+' onchange="ST.project.useSub=this.checked;save();ASRMA.runMeta()"> Subgroups</label>'+
+      '<button class="btn gh sm" onclick="autofillEffects()">Auto-fill from included ('+inc.length+')</button>'+
+      '<span class="spacer"></span><button class="btn flow sm" onclick="ASRMA.runMeta()">\u27ff Pool &amp; plot</button>'+
+    '</div>'+
+    '<table class="tbl"><thead><tr><th>Study</th><th style="width:120px">Effect</th><th style="width:100px">SE</th><th style="width:70px">N</th><th style="width:120px">Subgroup</th><th></th></tr></thead><tbody id="ma-rows"></tbody></table>'+
+    '<button class="btn gh sm" style="margin-top:10px" onclick="ASRMA.addEffect()">+ Add empty row</button>'+
+    '<span class="muted" style="margin-left:10px">Effect is on the analysis scale (log for ratio measures). Use the calculator above to avoid manual log/SE math.</span>'+
+  '</div><div id="ma-result"></div>';
+  renderEffectRows();renderCalcFields();
+}
+function renderCalcFields(){
+  const t=(document.getElementById('calc-type')||{}).value||'cont';
+  const fld=(id,ph)=>'<input class="inp" id="'+id+'" type="number" step="any" placeholder="'+ph+'" style="width:90px">';
+  let h='';
+  if(t==='cont')h='<div class="row"><input class="inp" id="c-label" placeholder="Study label" style="width:160px">'+
+    '<span class="muted">Intervention:</span>'+fld('c-m1','mean')+fld('c-sd1','SD')+fld('c-n1','n')+
+    '<span class="muted">Control:</span>'+fld('c-m2','mean')+fld('c-sd2','SD')+fld('c-n2','n')+
+    '<select class="inp" id="c-out" style="width:auto"><option value="smd">SMD (Hedges g)</option><option value="md">MD</option></select></div>';
+  else if(t==='bin')h='<div class="row"><input class="inp" id="b-label" placeholder="Study label" style="width:160px">'+
+    '<span class="muted">Intervention:</span>'+fld('b-e1','events')+fld('b-n1','total')+
+    '<span class="muted">Control:</span>'+fld('b-e2','events')+fld('b-n2','total')+
+    '<select class="inp" id="b-out" style="width:auto"><option value="or">Odds ratio</option><option value="rr">Risk ratio</option></select></div>';
+  else h='<div class="row"><input class="inp" id="g-label" placeholder="Study label" style="width:160px">'+
+    fld('g-est','estimate')+fld('g-lo','95% low')+fld('g-hi','95% high')+
+    '<label class="row" style="gap:6px"><input type="checkbox" id="g-log"> values are a ratio (OR/RR/HR)</label></div>';
+  const el=document.getElementById('calc-fields');if(el)el.innerHTML=h;
+}
+function calcEffect(){
+  const t=document.getElementById('calc-type').value;const g=id=>parseFloat((document.getElementById(id)||{}).value);
+  let row=null,note='';
+  if(t==='cont'){
+    const m1=g('c-m1'),sd1=g('c-sd1'),n1=g('c-n1'),m2=g('c-m2'),sd2=g('c-sd2'),n2=g('c-n2'),out=document.getElementById('c-out').value;
+    if([m1,sd1,n1,m2,sd2,n2].some(x=>!isFinite(x))||n1<2||n2<2){toast('Fill all continuous fields (n\u22652)','err');return;}
+    const sp=Math.sqrt(((n1-1)*sd1*sd1+(n2-1)*sd2*sd2)/(n1+n2-2));
+    if(out==='md'){const es=m1-m2;const se=Math.sqrt(sd1*sd1/n1+sd2*sd2/n2);
+      row={es,se,n:n1+n2};note='MD = '+es.toFixed(2)+', SE = '+se.toFixed(3);ST.project.measure='md';}
+    else{let d=(m1-m2)/sp;const J=1-3/(4*(n1+n2)-9);const g_=d*J; // Hedges g
+      const se=Math.sqrt((n1+n2)/(n1*n2)+g_*g_/(2*(n1+n2)));
+      row={es:g_,se,n:n1+n2};note='Hedges g = '+g_.toFixed(3)+', SE = '+se.toFixed(3);ST.project.measure='smd';}
+    row.label=(document.getElementById('c-label').value||'Study '+(ST.effects.length+1));
+  }else if(t==='bin'){
+    let e1=g('b-e1'),n1=g('b-n1'),e2=g('b-e2'),n2=g('b-n2'),out=document.getElementById('b-out').value;
+    if([e1,n1,e2,n2].some(x=>!isFinite(x))){toast('Fill all 2\u00d72 fields','err');return;}
+    // Haldane\u2013Anscombe 0.5 correction if any zero cell
+    if(e1===0||e2===0||e1===n1||e2===n2){e1+=.5;e2+=.5;n1+=1;n2+=1;note='(0.5 continuity correction applied) ';}
+    if(out==='or'){const a=e1,b=n1-e1,c=e2,d=n2-e2;const lnor=Math.log((a*d)/(b*c));
+      const se=Math.sqrt(1/a+1/b+1/c+1/d);row={es:lnor,se,n:n1+n2};note+='lnOR = '+lnor.toFixed(3)+' (OR '+Math.exp(lnor).toFixed(2)+'), SE = '+se.toFixed(3);ST.project.measure='or';}
+    else{const r1=e1/n1,r2=e2/n2;const lnrr=Math.log(r1/r2);
+      const se=Math.sqrt((1-r1)/e1+(1-r2)/e2);row={es:lnrr,se,n:n1+n2};note+='lnRR = '+lnrr.toFixed(3)+' (RR '+Math.exp(lnrr).toFixed(2)+'), SE = '+se.toFixed(3);ST.project.measure='rr';}
+    row.label=(document.getElementById('b-label').value||'Study '+(ST.effects.length+1));
+  }else{
+    const est=g('g-est'),lo=g('g-lo'),hi=g('g-hi'),isLog=document.getElementById('g-log').checked;
+    if([est,lo,hi].some(x=>!isFinite(x))||hi<=lo){toast('Enter estimate and a valid 95% CI','err');return;}
+    if(isLog){const es=Math.log(est);const se=(Math.log(hi)-Math.log(lo))/3.92;row={es,se,n:null};note='ln = '+es.toFixed(3)+', SE = '+se.toFixed(3);}
+    else{const es=est;const se=(hi-lo)/3.92;row={es,se,n:null};note='effect = '+es.toFixed(3)+', SE = '+se.toFixed(3);}
+    row.label=(document.getElementById('g-label').value||'Study '+(ST.effects.length+1));
+  }
+  ST.effects.push(row);save();renderEffectRows();
+  const out=document.getElementById('calc-out');if(out)out.textContent='Added: '+note;
+  toast('Row added \u2014 '+note,'ok');
+}
+window.renderCalcFields=renderCalcFields;window.calcEffect=calcEffect;
+function renderEffectRows(){
+  const el=document.getElementById('ma-rows');if(!el)return;
+  el.innerHTML=ST.effects.map((e,i)=>'<tr>'+
+    '<td><input value="'+esc(e.label||'')+'" oninput="ST.effects['+i+'].label=this.value;saveSoon()">'+(e.hint?'<div class="muted" style="font-size:10px">'+esc(e.hint.slice(0,40))+'</div>':'')+'</td>'+
+    '<td><input type="number" step="any" value="'+(e.es==null?'':e.es)+'" oninput="ST.effects['+i+'].es=parseFloat(this.value);saveSoon()"></td>'+
+    '<td><input type="number" step="any" value="'+(e.se==null?'':e.se)+'" oninput="ST.effects['+i+'].se=parseFloat(this.value);saveSoon()"></td>'+
+    '<td><input type="number" value="'+(e.n==null?'':e.n)+'" oninput="ST.effects['+i+'].n=parseInt(this.value);saveSoon()"></td>'+
+    '<td><input value="'+esc(e.sub||'')+'" placeholder="\u2014" oninput="ST.effects['+i+'].sub=this.value;saveSoon()"></td>'+
+    '<td><button class="vbtn exc" onclick="ASRMA.removeEffect('+i+')">\u00d7</button></td></tr>').join('');
+}
+function addEffect(){ST.effects.push({label:'Study '+(ST.effects.length+1),es:null,se:null,n:null,sub:''});save();renderEffectRows();}
+function removeEffect(i){ST.effects.splice(i,1);save();renderEffectRows();}
+function autofillEffects(){
+  const inc=extractionRefs();
+  if(!inc.length){toast('No included studies from extraction yet','err');return;}
+  const measure = ST.project.measure || 'or';
+  function tryParse(txt) {
+    if (!txt) return null;
+    const m = txt.replace(/−/g, '-').match(/(-?\d+\.?\d*)\s*(?:\(|\[)(?:95%\s*CI\s*)?:?\s*(-?\d+\.?\d*)\s*(?:-|to|,)\s*(-?\d+\.?\d*)(?:\)|\])/i);
+    if (!m) return null;
+    const es_raw = parseFloat(m[1]), lo = parseFloat(m[2]), hi = parseFloat(m[3]);
+    if (isNaN(es_raw) || isNaN(lo) || isNaN(hi)) return null;
+    if (measure === 'or' || measure === 'rr' || measure === 'hr') {
+      if (es_raw <= 0 || lo <= 0 || hi <= 0) return null;
+      return { es: Math.log(es_raw), se: Math.abs(Math.log(hi) - Math.log(lo)) / 3.92 };
+    } else {
+      return { es: es_raw, se: Math.abs(hi - lo) / 3.92 };
+    }
+  }
+  let filled = 0;
+  ST.effects=inc.map(r=>{
+    const e = r.extract || {};
+    let es = null, se = null, hint = e.effect || '';
+    if (r.extractEffectCandidates && r.extractEffectCandidates.length) {
+      for (const cand of r.extractEffectCandidates) {
+        const candStr = [cand.outcome, cand.value, cand.quote].filter(Boolean).join(' ');
+        const p = tryParse(candStr);
+        if (p) { es = p.es; se = p.se; hint = candStr; break; }
+      }
+    }
+    if (es === null) {
+      const p = tryParse(hint);
+      if (p) { es = p.es; se = p.se; }
+    }
+    if (es !== null) filled++;
+    return {
+      label: ((r.authors||'').split(';')[0]||r.title.slice(0,20))+' '+(r.year||''),
+      es, se,
+      n: parseInt(e.n) || null,
+      hint,
+      sub: ''
+    };
+  });
+  save();renderEffectRows();toast('Loaded '+inc.length+' rows — auto-filled '+filled+' effects where 95% CIs were found','ok');
+}
+/* ---- pooling (one subgroup or overall) ---- */
+function poolGroup(rows,model){
+  const sumW=rows.reduce((s,d)=>s+d.w,0);
+  const fixed=rows.reduce((s,d)=>s+d.w*d.y,0)/sumW;
+  const Q=rows.reduce((s,d)=>s+d.w*(d.y-fixed)*(d.y-fixed),0);
+  const df=rows.length-1;
+  const C=sumW-rows.reduce((s,d)=>s+d.w*d.w,0)/sumW;
+  const tau2=df>0?Math.max(0,(Q-df)/C):0;
+  const I2=Q>0&&df>0?Math.max(0,(Q-df)/Q)*100:0;
+  rows.forEach(d=>d.wr=1/(d.se*d.se+tau2));
+  const sumWr=rows.reduce((s,d)=>s+d.wr,0);
+  const rand=rows.reduce((s,d)=>s+d.wr*d.y,0)/sumWr;
+  const seR=Math.sqrt(1/sumWr),seF=Math.sqrt(1/sumW);
+  const pooled=model==='random'?rand:fixed,sePool=model==='random'?seR:seF;
+  // prediction interval (random effects, t with df)
+  const tcrit=df>0?tQuant(0.975,df):1.96;
+  const piSE=Math.sqrt(sePool*sePool+tau2);
+  return{pooled,sePool,lo:pooled-1.96*sePool,hi:pooled+1.96*sePool,
+    piLo:pooled-tcrit*piSE,piHi:pooled+tcrit*piSE,Q,df,tau2,I2,sumW,sumWr,model,n:rows.length,
+    z:pooled/sePool,p:2*(1-normCdf(Math.abs(pooled/sePool)))};
+}
+function tQuant(p,df){ // crude two-step approx of Student-t quantile
+  const z=1.959964;const g1=(z*z*z+z)/4,g2=(5*z*z*z*z*z+16*z*z*z+3*z)/96;
+  return z+g1/df+g2/(df*df);
+}
+function runMeta(){
+  const measure=document.getElementById('ma-measure').value;
+  const model=document.getElementById('ma-model').value;
+  const useSub=document.getElementById('ma-sub')?document.getElementById('ma-sub').checked:!!ST.project.useSub;
+  const showCI=document.getElementById('ma-ci')?document.getElementById('ma-ci').checked:!!ST.project.showCI;
+  const log=['or','rr','hr'].includes(measure);
+  const data=ST.effects.filter(e=>isFinite(e.es)&&isFinite(e.se)&&e.se>0)
+    .map(e=>({label:e.label,y:e.es,se:e.se,w:1/(e.se*e.se),n:e.n,sub:(e.sub||'').trim()}));
+  if(data.length<2){toast('Need \u22652 studies with effect & SE \u2014 use the calculator','err');return;}
+  const overall=poolGroup(data.slice(),model);
+  data.forEach(d=>{d.lo=d.y-1.96*d.se;d.hi=d.y+1.96*d.se;d.wpct=(model==='random'?(1/(d.se*d.se+overall.tau2)):d.w)/(model==='random'?overall.sumWr:overall.sumW)*100;});
+  const xf=v=>log?Math.exp(v):v;const fmt=v=>xf(v).toFixed(2);
+  // subgroups
+  let subResults=null,subTest=null;
+  if(useSub){
+    const groups={};data.forEach(d=>{const k=d.sub||'(unspecified)';(groups[k]=groups[k]||[]).push(d);});
+    subResults=Object.entries(groups).filter(g=>g[1].length>=1).map(([k,rows])=>({name:k,res:poolGroup(rows.slice(),model),rows}));
+    // Q between groups
+    if(subResults.length>1){const Qb=subResults.reduce((s,g)=>{const w=1/(g.res.sePool*g.res.sePool);return s+w*Math.pow(g.res.pooled-overall.pooled,2);},0);
+      const dfb=subResults.length-1;subTest={Qb,dfb,p:1-chiSqCdf(Qb,dfb)};}
+  }
+  ST.project._lastMeta={measure,model,log,showCI,overall,data:data.map(d=>({label:d.label,y:d.y,se:d.se})),sub:subResults?subResults.map(s=>s.name):null};save();
+  document.getElementById('ma-result').innerHTML=
+  '<div class="tiles">'+
+    '<div class="tile syn"><div class="v">'+fmt(overall.pooled)+'</div><div class="k">pooled '+measure.toUpperCase()+' ('+model+')</div></div>'+
+    '<div class="tile"><div class="v" style="font-size:18px">'+fmt(overall.lo)+'\u2013'+fmt(overall.hi)+'</div><div class="k">95% CI</div></div>'+
+    '<div class="tile"><div class="v" style="font-size:15px">'+fmt(overall.piLo)+'\u2013'+fmt(overall.piHi)+'</div><div class="k">95% prediction interval</div></div>'+
+    '<div class="tile '+(overall.I2>75?'exc':overall.I2>50?'maybe':'flow')+'"><div class="v">'+overall.I2.toFixed(0)+'%</div><div class="k">I\u00b2</div></div>'+
+    '<div class="tile"><div class="v" style="font-size:18px">'+overall.tau2.toFixed(3)+'</div><div class="k">\u03c4\u00b2</div></div>'+
+    '<div class="tile"><div class="v" style="font-size:18px">'+(overall.p<0.001?'<0.001':overall.p.toFixed(3))+'</div><div class="k">p (overall)</div></div>'+
+  '</div>'+
+  '<div class="banner '+(overall.I2>75?'warn':'info')+'"><span class="bi">'+(overall.I2>75?'\u26a0':'\u24d8')+'</span><div>'+
+    'Q='+overall.Q.toFixed(2)+', df='+overall.df+'. '+(overall.I2>75?'Substantial heterogeneity \u2014 interpret cautiously; explore subgroups / sensitivity.':overall.I2>50?'Moderate heterogeneity.':'Low heterogeneity \u2014 pooling is reasonable.')+
+    (log?' Estimates shown on the ratio scale; analysis on the log scale.':'')+
+    (subTest?' Subgroup difference: Q\u1d47='+subTest.Qb.toFixed(2)+', df='+subTest.dfb+', p='+(subTest.p<0.001?'<0.001':subTest.p.toFixed(3))+'.':'')+'</div></div>'+
+  '<div class="card"><div class="card-h">Forest plot</div><div style="overflow-x:auto">'+forestSVG(data,overall,log,measure,showCI,subResults,subTest)+'</div>'+
+    '<div class="row" style="margin-top:10px;gap:8px">'+
+      '<button class="btn gh sm" onclick="downloadSVG(\'forest-svg\',\'forest_plot.svg\')">\u2b07 SVG</button>'+
+      '<button class="btn gh sm" onclick="downloadSVGasPNG(\'forest-svg\',\'forest_plot.png\')">\u2b07 PNG Image</button>'+
+    '</div></div>'+
+  '<div class="card"><div class="card-h">Funnel plot <span class="tag">small-study / publication-bias check</span></div>'+funnelSVG(data,overall.pooled)+
+    '<div class="muted" style="margin-top:8px">Visual asymmetry can suggest small-study effects; with \u226510 studies consider Egger\u2019s test (not automated here).</div>'+
+    '<div class="row" style="margin-top:10px;gap:8px">'+
+      '<button class="btn gh sm" onclick="downloadSVG(\'funnel-svg\',\'funnel_plot.svg\')">\u2b07 SVG</button>'+
+      '<button class="btn gh sm" onclick="downloadSVGasPNG(\'funnel-svg\',\'funnel_plot.png\')">\u2b07 PNG Image</button>'+
+    '</div></div>';
+}
+function normCdf(x){return .5*(1+erf(x/Math.SQRT2));}
+function erf(x){const t=1/(1+.3275911*Math.abs(x));
+  const y=1-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*Math.exp(-x*x);
+  return x>=0?y:-y;}
+function chiSqCdf(x,k){if(x<=0)return 0;// regularized lower incomplete gamma via series (k/2,x/2)
+  const a=k/2,xx=x/2;let sum=1/a,term=1/a;for(let n=1;n<200;n++){term*=xx/(a+n);sum+=term;if(term<1e-10)break;}
+  return sum*Math.exp(-xx+a*Math.log(xx)-lgamma(a));}
+function lgamma(z){const c=[76.18009172947146,-86.50532032941677,24.01409824083091,-1.231739572450155,0.1208650973866179e-2,-0.5395239384953e-5];
+  let x=z,y=z,tmp=x+5.5;tmp-=(x+0.5)*Math.log(tmp);let ser=1.000000000190015;for(let j=0;j<6;j++){y++;ser+=c[j]/y;}
+  return -tmp+Math.log(2.5066282746310005*ser/x);}
+function forestSVG(data,ov,log,measure,showCI,subs,subTest){
+  const rows=[];let groups;
+  if(subs&&subs.length>1){groups=subs.map(s=>({name:s.name,res:s.res,items:s.rows}));}
+  else groups=[{name:null,res:ov,items:data}];
+  const nLines=data.length+groups.length*(subs&&subs.length>1?2:1)+1;
+  const W=760,rowH=24,padL=200,padR=130,top=48;const plotW=W-padL-padR;
+  const H=top+nLines*rowH+(subTest?78:58);
+  const all=data.flatMap(d=>[d.lo,d.hi]).concat([ov.lo,ov.hi,ov.piLo,ov.piHi]);
+  let mn=Math.min.apply(null,all),mx=Math.max.apply(null,all);const pad=(mx-mn)*.12||1;mn-=pad;mx+=pad;
+  const X=v=>padL+(Math.max(mn,Math.min(mx,v))-mn)/(mx-mn)*plotW;
+  const xf=v=>log?Math.exp(v):v;const nullV=0;
+  let body='',y=top;
+  // header
+  body+='<text x="14" y="'+(top-16)+'" font-size="10" font-weight="700" fill="var(--t2)">Study</text>'+
+        '<text x="'+(W-8)+'" y="'+(top-16)+'" font-size="10" font-weight="700" fill="var(--t2)" text-anchor="end">'+measure.toUpperCase()+' [95% CI]   Wt%</text>';
+  groups.forEach(gp=>{
+    if(gp.name!==null){body+='<text x="14" y="'+(y+4)+'" font-size="11" font-weight="700" fill="var(--syn)">'+esc(gp.name)+'</text>';y+=rowH;}
+    gp.items.forEach(d=>{const cy=y+rowH/2-4;const sz=Math.max(3,Math.sqrt(d.wpct||4)*1.3);
+      if(showCI)body+='<line x1="'+X(d.lo)+'" y1="'+cy+'" x2="'+X(d.hi)+'" y2="'+cy+'" stroke="var(--t3)" stroke-width="1.4"/>';
+      body+='<rect x="'+(X(d.y)-sz)+'" y="'+(cy-sz)+'" width="'+(sz*2)+'" height="'+(sz*2)+'" fill="var(--syn)"/>'+
+        '<text x="14" y="'+(cy+4)+'" font-size="10.5" fill="var(--t1)">'+esc((d.label||'').slice(0,32))+'</text>'+
+        '<text x="'+(W-8)+'" y="'+(cy+4)+'" font-size="10" fill="var(--t2)" text-anchor="end">'+xf(d.y).toFixed(2)+(showCI?' ['+xf(d.lo).toFixed(2)+', '+xf(d.hi).toFixed(2)+']':'')+'   '+(d.wpct?d.wpct.toFixed(1):'')+'</text>';
+      y+=rowH;});
+    // subtotal diamond
+    const r=gp.res,cy=y+rowH/2-4;
+    const dia=X(r.lo)+','+cy+' '+X(r.pooled)+','+(cy-8)+' '+X(r.hi)+','+cy+' '+X(r.pooled)+','+(cy+8);
+    body+='<polygon points="'+dia+'" fill="'+(gp.name===null?'var(--flow)':'var(--syn)')+'"/>'+
+      '<text x="14" y="'+(cy+4)+'" font-size="10.5" font-weight="700" fill="var(--ink)">'+(gp.name===null?'Overall ('+r.model+')':'Subtotal')+'</text>'+
+      '<text x="'+(W-8)+'" y="'+(cy+4)+'" font-size="10" font-weight="700" fill="var(--ink)" text-anchor="end">'+xf(r.pooled).toFixed(2)+' ['+xf(r.lo).toFixed(2)+', '+xf(r.hi).toFixed(2)+']</text>';
+    y+=rowH;
+  });
+  // prediction interval bar (overall, random)
+  if(ov.model==='random'){const cy=y+rowH/2-4;
+    body+='<line x1="'+X(ov.piLo)+'" y1="'+cy+'" x2="'+X(ov.piHi)+'" y2="'+cy+'" stroke="var(--maybe)" stroke-width="3" stroke-linecap="round"/>'+
+      '<text x="14" y="'+(cy+4)+'" font-size="10" fill="var(--maybe)">95% prediction interval</text>'+
+      '<text x="'+(W-8)+'" y="'+(cy+4)+'" font-size="10" fill="var(--maybe)" text-anchor="end">['+xf(ov.piLo).toFixed(2)+', '+xf(ov.piHi).toFixed(2)+']</text>';y+=rowH;}
+  return '<svg id="forest-svg" width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'" xmlns="http://www.w3.org/2000/svg" style="background:#fff;max-width:100%">'+
+    '<line x1="'+X(nullV)+'" y1="'+(top-6)+'" x2="'+X(nullV)+'" y2="'+(y-rowH+18)+'" stroke="var(--line2)" stroke-dasharray="4 3"/>'+
+    body+
+    '<text x="'+X(nullV)+'" y="'+(H-(subTest?40:20))+'" font-size="10" fill="var(--t3)" text-anchor="middle">'+(log?'1':'0')+'</text>'+
+    '<text x="'+padL+'" y="'+(H-(subTest?25:5))+'" font-size="9.5" fill="var(--t3)">\u2190 favours '+(log?'intervention':'treatment')+'</text>'+
+    '<text x="'+(W-padR)+'" y="'+(H-(subTest?25:5))+'" font-size="9.5" fill="var(--t3)" text-anchor="end">favours '+(log?'control':'control')+' \u2192</text>'+
+    (subTest?'<text x="14" y="'+(H-8)+'" font-size="10.5" font-weight="700" fill="var(--ink)">Test for subgroup differences: Q = '+subTest.Qb.toFixed(2)+', df = '+subTest.dfb+', p = '+(subTest.p<0.001?'<0.001':subTest.p.toFixed(3))+'.</text>':'')+
+  '</svg>';
+}
+function funnelSVG(data,pooled){
+  const W=520,H=300,padL=60,padB=44,top=20;const plotW=W-padL-30,plotH=H-top-padB;
+  const ses=data.map(d=>d.se);const maxSE=Math.max.apply(null,ses)*1.1||1;
+  const es=data.map(d=>d.y);let mn=Math.min.apply(null,es.concat([pooled])),mx=Math.max.apply(null,es.concat([pooled]));const pd=(mx-mn)*.5||1;mn-=pd;mx+=pd;
+  const X=v=>padL+(v-mn)/(mx-mn)*plotW;const Y=se=>top+se/maxSE*plotH;
+  let pts='';data.forEach(d=>{pts+='<circle cx="'+X(d.y)+'" cy="'+Y(d.se)+'" r="4.5" fill="var(--syn)" opacity=".75"/>';});
+  const tri=X(pooled)+','+top+' '+X(pooled-1.96*maxSE)+','+(top+plotH)+' '+X(pooled+1.96*maxSE)+','+(top+plotH);
+  return '<svg width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'" style="background:#fff;max-width:100%">'+
+    '<polygon points="'+tri+'" fill="rgba(13,148,136,.06)" stroke="var(--line2)" stroke-dasharray="3 3"/>'+
+    '<line x1="'+X(pooled)+'" y1="'+top+'" x2="'+X(pooled)+'" y2="'+(top+plotH)+'" stroke="var(--flow)" stroke-dasharray="4 3"/>'+
+    pts+
+    '<line x1="'+padL+'" y1="'+top+'" x2="'+padL+'" y2="'+(top+plotH)+'" stroke="var(--t3)"/>'+
+    '<line x1="'+padL+'" y1="'+(top+plotH)+'" x2="'+(W-30)+'" y2="'+(top+plotH)+'" stroke="var(--t3)"/>'+
+    '<text x="'+(padL-8)+'" y="'+(top+6)+'" font-size="10" fill="var(--t3)" text-anchor="end">0</text>'+
+    '<text x="'+(padL-8)+'" y="'+(top+plotH)+'" font-size="10" fill="var(--t3)" text-anchor="end">'+maxSE.toFixed(2)+'</text>'+
+    '<text x="14" y="'+(top+plotH/2)+'" font-size="10" fill="var(--t2)" transform="rotate(-90 14 '+(top+plotH/2)+')" text-anchor="middle">standard error</text>'+
+    '<text x="'+(W/2)+'" y="'+(H-6)+'" font-size="10" fill="var(--t2)" text-anchor="middle">effect estimate</text></svg>';
+}
+function downloadSVG(id,name){const svg=document.getElementById(id);if(!svg)return;
+  const s=new XMLSerializer().serializeToString(svg);const b=new Blob([s],{type:'image/svg+xml'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=name;a.click();}
+function downloadSVGasPNG(id, name) {
+  const svg = document.getElementById(id); if(!svg)return;
+  const svgData = new XMLSerializer().serializeToString(svg);
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  const img = new Image();
+  img.onload = function() {
+    canvas.width = img.width;
+    canvas.height = img.height;
+    ctx.fillStyle = "white";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0);
+    const a = document.createElement("a");
+    a.download = name;
+    a.href = canvas.toDataURL("image/png");
+    a.click();
+  };
+  img.src = "data:image/svg+xml;base64," + btoa(unescape(encodeURIComponent(svgData)));
+}
+window.runMeta=runMeta;window.autofillEffects=autofillEffects;window.downloadSVG=downloadSVG;window.downloadSVGasPNG=downloadSVGasPNG;
+ASRMA.runMeta=runMeta;ASRMA.addEffect=addEffect;ASRMA.removeEffect=removeEffect;
+
+/* ===================== REPORT / PRISMA / EXPORT ===================== */
+function prismaCounts(){
+  const total=ST.refs.length;
+  const sources={}; ST.refs.forEach(r => { sources[r.db || 'Unknown'] = (sources[r.db || 'Unknown'] || 0) + 1; });
+  const dups=ST.refs.filter(r=>r.dup).length;
+  const uniq=ST.refs.filter(r=>!r.dup);
+  const screened=uniq.filter(r=>r.ta).length;
+  const taExcl=uniq.filter(r=>r.ta&&r.ta.final==='exclude').length;
+  const sought=uniq.filter(r=>r.ta&&(r.ta.final==='include'||r.ta.final==='maybe'));
+  const ftExcl=sought.filter(r=>r.ft&&r.ft.decision==='exclude');
+  const included=sought.filter(r=>r.ft&&r.ft.decision==='include').length;
+  const reasons={};ftExcl.forEach(r=>{const c=r.ft.exclCat||'other';reasons[c]=(reasons[c]||0)+1;});
+  return{total,dups,uniqN:uniq.length,screened,taExcl,sought:sought.length,ftExclN:ftExcl.length,included,reasons,sources};
+}
+function renderReport(){
+  const c=prismaCounts();
+  document.getElementById('pane-report').innerHTML=
+  '<div class="pane-h"><div class="eyebrow">Phase 11 \u2014 report & share</div>'+
+    '<h1>\u2399 PRISMA & export</h1>'+
+    '<p>The flow diagram updates live from every decision above. Export your project file for collaborators, the included-studies table, or a citation file.</p></div>'+
+  '<div class="card"><div class="card-h">PRISMA 2020 flow <span class="tag">live</span></div>'+prismaSVG(c)+
+    '<div class="row" style="margin-top:10px"><button class="btn gh sm" onclick="downloadSVG(\'prisma-svg\',\'prisma_flow.svg\')">\u2b07 PRISMA SVG</button></div></div>'+
+  '<div class="grid2">'+
+    '<div class="card"><div class="card-h">Export</div>'+
+      '<div class="row" style="flex-direction:column;align-items:stretch;gap:9px">'+
+        '<button class="btn" onclick="exportProject()">\u2b07 Project file (.json) \u2014 share with collaborators</button>'+
+        '<button class="btn gh" onclick="exportExtractCSV()">\u2b07 Extraction table (.csv)</button>'+
+        '<button class="btn gh" onclick="exportIncludedRIS()">\u2b07 Included studies (.ris)</button>'+
+        '<button class="btn gh" onclick="exportIncludedCSV()">\u2b07 Included studies (.csv)</button>'+
+      '</div></div>'+
+    '<div class="card"><div class="card-h">Team & reproducibility</div>'+
+      (ST.team.length?ST.team.map(m=>'<div class="kv"><b style="font-family:var(--ff)">'+esc(m.name)+'</b><span class="pill s">'+esc(m.role)+'</span></div>').join(''):'<div class="muted">No collaborators yet. Invite reviewers from the header (+).</div>')+
+      '<div class="divider"></div>'+
+      '<div class="kv"><span>Agent model</span><b>'+MODELS[ST.agent.model].label+'</b></div>'+
+      '<div class="kv"><span>Calibration</span><b>'+(ST.agent.calibration?ST.agent.calibration.acc+'%':'\u2014')+'</b></div>'+
+      '<div class="kv"><span>Screening strictness</span><b>'+ST.settings.strictness+'</b></div>'+
+      '<div class="kv"><span>Studies included</span><b>'+c.included+'</b></div>'+
+    '</div></div>';
+}
+function prismaSVG(c){
+  const box=(x,y,w,h,lines,fill)=>{
+    const ls=lines.map((t,i)=>'<text x="'+(x+w/2)+'" y="'+(y+18+i*14)+'" font-size="10.5" fill="var(--t1)" text-anchor="middle">'+esc(t)+'</text>').join('');
+    return '<rect x="'+x+'" y="'+y+'" width="'+w+'" height="'+h+'" rx="7" fill="'+(fill||'#fff')+'" stroke="var(--line2)"/>'+ls;};
+  const arrow=(x1,y1,x2,y2)=>'<line x1="'+x1+'" y1="'+y1+'" x2="'+x2+'" y2="'+y2+'" stroke="var(--t3)" stroke-width="1.5" marker-end="url(#ah)"/>';
+  const W=640,H=560;const cx=170,bw=250,bh=52;
+  const reasons=Object.entries(c.reasons).map(a=>a[0]+': '+a[1]);
+  const exH=Math.max(bh,30+reasons.length*13);
+  const sourceArr=Object.entries(c.sources||{}).map(a=>a[0]+' (n='+a[1]+')');
+  const dbH=Math.max(bh,30+sourceArr.length*14);
+  const dy = dbH - bh;
+  return '<svg id="prisma-svg" width="'+W+'" height="'+(H+dy)+'" viewBox="0 0 '+W+' '+(H+dy)+'" style="background:#fff;max-width:100%" xmlns="http://www.w3.org/2000/svg">'+
+  '<defs><marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6" fill="var(--t3)"/></marker></defs>'+
+  box(cx,20,bw,dbH,['Databases (n = '+c.total+')'].concat(sourceArr),'rgba(13,148,136,.07)')+
+  arrow(cx+bw/2,72+dy,cx+bw/2,108+dy)+
+  box(cx,108+dy,bw,bh,['Records after duplicates removed','n = '+c.uniqN],'#fff')+
+  box(cx+bw+40,108+dy,170,bh,['Duplicates removed','n = '+c.dups],'var(--exc-w)')+
+  arrow(cx+bw,134+dy,cx+bw+40,134+dy)+
+  arrow(cx+bw/2,160+dy,cx+bw/2,196+dy)+
+  box(cx,196+dy,bw,bh,['Records screened (title/abstract)','n = '+c.screened],'#fff')+
+  box(cx+bw+40,196+dy,170,bh,['Excluded at screening','n = '+c.taExcl],'var(--exc-w)')+
+  arrow(cx+bw,222+dy,cx+bw+40,222+dy)+
+  arrow(cx+bw/2,248+dy,cx+bw/2,284+dy)+
+  box(cx,284+dy,bw,bh,['Full-text assessed for eligibility','n = '+c.sought],'#fff')+
+  box(cx+bw+40,284+dy,170,exH,['Excluded at full text','n = '+c.ftExclN].concat(reasons),'var(--exc-w)')+
+  arrow(cx+bw,310+dy,cx+bw+40,310+dy)+
+  arrow(cx+bw/2,336+dy,cx+bw/2,372+dy)+
+  box(cx,372+dy,bw,bh,['Studies included in review','n = '+c.included],'rgba(79,70,229,.1)')+
+  arrow(cx+bw/2,424+dy,cx+bw/2,460+dy)+
+  box(cx,460+dy,bw,bh,['Studies in meta-analysis','n = '+ST.effects.filter(e=>isFinite(e.es)&&isFinite(e.se)).length],'rgba(13,148,136,.1)')+
+  '</svg>';
+}
+function exportProject(){const b=new Blob([JSON.stringify(Object.assign({},ST,{_app:'asrma',_v:1}),null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=(ST.project.title||'asrma-project').replace(/\W+/g,'_')+'.json';a.click();toast('Project exported','ok');}
+function exportIncludedRIS(){
+  const inc=extractionRefs();
+  if(!inc.length){toast('No included studies','err');return;}
+  const ris=inc.map(r=>{
+    const au=(r.authors||'').split(';').map(a=>'AU  - '+a.trim()).join('\n');
+    return 'TY  - JOUR\n'+(au?au+'\n':'')+'TI  - '+r.title+'\nPY  - '+(r.year||'')+'\nJO  - '+(r.journal||'')+(r.doi?'\nDO  - '+r.doi:'')+(r.abstract?'\nAB  - '+r.abstract:'')+'\nER  - ';
+  }).join('\n');
+  const b=new Blob([ris],{type:'application/x-research-info-systems'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download='included_studies.ris';a.click();toast('RIS exported','ok');
+}
+function exportIncludedCSV(){
+  const inc=extractionRefs();
+  const head=['Authors','Year','Title','Journal','DOI','RoB overall'];
+  const rows=inc.map(r=>[r.authors,r.year,r.title,r.journal,r.doi,(r.quality||{}).overall||'']);
+  downloadCSV([head].concat(rows),'included_studies.csv');
+}
+window.exportProject=exportProject;window.exportIncludedRIS=exportIncludedRIS;window.exportIncludedCSV=exportIncludedCSV;
+ASRMA.exportData=exportProject;
+
+/* ===================== SAMPLE DATA + BOOT ===================== */
+const SAMPLE_RIS=['TY  - JOUR','AU  - Sharma R','AU  - Patel K','TI  - A smartphone app for blood pressure self-management in rural India: a randomised controlled trial','PY  - 2022','JO  - Journal of Hypertension','DO  - 10.1000/sample.001','AB  - We randomised 240 adults with hypertension to an mHealth app versus usual care. At 6 months, systolic BP fell by 8.4 mmHg more in the intervention arm (95% CI 4.1 to 12.7).','ER  - ','TY  - JOUR','AU  - Okafor C','TI  - Text-message reminders and medication adherence among hypertensive patients in Nigeria','PY  - 2021','JO  - BMC Public Health','DO  - 10.1000/sample.002','AB  - A quasi-experimental study of SMS reminders. Adherence improved and mean systolic BP was lower at follow-up.','ER  - ','TY  - JOUR','AU  - Lee J','TI  - Coffee consumption and cardiovascular outcomes: a cohort study','PY  - 2020','JO  - Nutrition Reviews','AB  - This cohort examined coffee intake and incident cardiovascular disease in a high-income setting. No mobile health component.','ER  - '].join('\n');
+
+/* ===================== SETTINGS MODAL (keys live here now) ===================== */
+function settingsModal(){
+  const keyRows=Object.entries(MODELS).map(([id,m])=>
+    '<div class="fg"><label class="fl">'+m.label+(m.free?' <span class="pill f">free</span>':'')+
+      ' <span class="hint">'+m.hint+'</span></label>'+
+      '<input class="inp" id="k-'+m.keyId+'" type="password" placeholder="paste key…" value="'+esc(getKey(id))+'"></div>').join('');
+  modal('<div class="modal-h">⚙ Settings<button class="x" onclick="closeModal()">×</button></div>'+
+  '<div class="modal-b">'+
+    '<div class="card-h" style="margin-bottom:10px">Project</div>'+
+    '<div class="fg"><label class="fl">Project name</label><input class="inp" id="set-title" value="'+esc(ST.project.title||'')+'" placeholder="My systematic review"></div>'+
+    '<div class="divider"></div>'+
+    '<div class="card-h" style="margin-bottom:10px">AI reviewer</div>'+
+    '<div class="grid2">'+
+      '<div class="fg"><label class="fl">Screening model <span class="hint">Viveka</span></label>'+
+        '<select class="inp" id="k-model">'+Object.entries(MODELS).map(a=>'<option value="'+a[0]+'" '+(ST.agent.model===a[0]?'selected':'')+'>'+a[1].label+'</option>').join('')+'</select></div>'+
+      '<div class="fg"><label class="fl">Advanced model <span class="hint">full-text, extraction, RoB</span></label>'+
+        '<select class="inp" id="k-adv">'+Object.entries(MODELS).map(a=>'<option value="'+a[0]+'" '+(ST.agent.advModel===a[0]?'selected':'')+'>'+a[1].label+'</option>').join('')+'</select></div>'+
+    '</div>'+
+    '<div class="fg"><label class="fl">Screening strictness</label>'+
+      '<select class="inp" id="set-strict">'+['lenient','balanced','strict'].map(s=>'<option value="'+s+'" '+(ST.settings.strictness===s?'selected':'')+'>'+s+'</option>').join('')+'</select></div>'+
+    '<div class="divider"></div>'+
+    '<div class="card-h" style="margin-bottom:10px">API keys</div>'+
+    '<div class="banner info" style="margin-bottom:14px"><span class="bi">🔒</span><div>Keys are stored only in <b>this browser</b> and sent directly to each provider — never to us. Add at least one. <b>Gemini Flash</b> is free and works well for screening.</div></div>'+
+    keyRows+
+    '<div class="divider"></div>'+
+    '<button class="btn danger gh sm" onclick="if(confirm(\'Reset everything? This clears the current project from this browser.\')){localStorage.removeItem(LS);location.reload()}">↺ Reset project</button>'+
+  '</div>'+
+  '<div class="modal-f"><button class="btn gh" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveSettings()">Save</button></div>');
+}
+function saveSettings(){
+  Object.values(MODELS).forEach(m=>{const el=document.getElementById('k-'+m.keyId);if(el){const v=el.value.trim();if(v)localStorage.setItem('asrma_key_'+m.keyId,v);}});
+  ST.agent.model=document.getElementById('k-model').value;
+  ST.agent.advModel=document.getElementById('k-adv').value;
+  ST.settings.strictness=document.getElementById('set-strict').value;
+  ST.project.title=document.getElementById('set-title').value;
+  save();updateAgentChip();updatePill();renderSpine();closeModal();toast('Settings saved','ok');
+}
+window.settingsModal=settingsModal;window.saveSettings=saveSettings;
+settingsModal=function(){
+  const serverMode=!!(window.BK&&BK.isServer&&BK.isServer());
+  const keyBlock=serverMode
+    ? '<div class="banner info" style="margin-bottom:14px"><span class="bi">✓</span><div><b>'+(serverAIReady()?'Server AI is active.':'Server AI is configured only in Railway.')+'</b> Browser key fields are disabled on the hosted app. Add or rotate provider keys only in Railway variables.</div></div>'
+    : '<div class="banner warn" style="margin-bottom:14px"><span class="bi">!</span><div>Server AI is not configured. Add keys in Railway for production. Browser key fields are shown only for local/offline fallback.</div></div>'+
+      Object.entries(MODELS).map(([id,m])=>'<div class="fg"><label class="fl">'+m.label+(m.free?' <span class="pill f">free</span>':'')+' <span class="hint">'+m.hint+'</span></label><input class="inp" id="k-'+m.keyId+'" type="password" placeholder="paste key..." value="'+esc(getKey(id))+'"></div>').join('');
+  modal('<div class="modal-h">Settings<button class="x" onclick="closeModal()">x</button></div>'+
+  '<div class="modal-b">'+
+    '<div class="card-h" style="margin-bottom:10px">Project</div>'+
+    '<div class="fg"><label class="fl">Project name</label><input class="inp" id="set-title" value="'+esc(ST.project.title||'')+'" placeholder="My systematic review"></div>'+
+    '<div class="divider"></div>'+
+    '<div class="card-h" style="margin-bottom:10px">AI reviewer</div>'+
+    '<div class="grid2">'+
+      '<div class="fg"><label class="fl">Screening model <span class="hint">Viveka</span></label><select class="inp" id="k-model">'+serverModelOptions(ST.agent.model)+'</select></div>'+
+      '<div class="fg"><label class="fl">Advanced model <span class="hint">full-text, extraction, RoB</span></label><select class="inp" id="k-adv">'+serverModelOptions(ST.agent.advModel)+'</select></div>'+
+    '</div>'+
+    '<div class="fg"><label class="fl">Screening strictness</label><select class="inp" id="set-strict">'+['lenient','balanced','strict'].map(s=>'<option value="'+s+'" '+(ST.settings.strictness===s?'selected':'')+'>'+s+'</option>').join('')+'</select></div>'+
+    '<div class="divider"></div>'+
+    '<div class="card-h" style="margin-bottom:10px">API keys</div>'+
+    keyBlock+
+    '<div class="divider"></div>'+
+    '<button class="btn danger gh sm" onclick="resetLocalProjectFromSettings()">Reset project</button>'+
+  '</div>'+
+  '<div class="modal-f"><button class="btn gh" onclick="closeModal()">Cancel</button><button class="btn" onclick="saveSettings()">Save</button></div>');
+};
+saveSettings=function(){
+  if(browserAIKeysAllowed()){
+    Object.values(MODELS).forEach(m=>{const el=document.getElementById('k-'+m.keyId);if(el){const v=el.value.trim();if(v)localStorage.setItem('asrma_key_'+m.keyId,v);}});
+  }else{
+    purgeBrowserAIKeys();
+  }
+  ST.agent.model=document.getElementById('k-model').value;
+  ST.agent.advModel=document.getElementById('k-adv').value;
+  ST.settings.strictness=document.getElementById('set-strict').value;
+  ST.project.title=document.getElementById('set-title').value;
+  save();updateAgentChip();updatePill();renderSpine();updateKeyBtn();closeModal();toast('Settings saved','ok');
+};
+window.settingsModal=settingsModal;window.saveSettings=saveSettings;
+function resetLocalProjectFromSettings(){
+  if(confirm('Reset everything? This clears the current project from this browser.')){
+    localStorage.removeItem(LS);
+    location.reload();
+  }
+}
+window.resetLocalProjectFromSettings=resetLocalProjectFromSettings;
+
+/* ===================== ABOUT / HOW TO USE ===================== */
+function aboutModal(){
+  modal('<div class="modal-h">About Pramāṇa<button class="x" onclick="closeModal()">×</button></div>'+
+  '<div class="modal-b" style="line-height:1.6">'+
+    '<p style="margin-top:0"><b>Pramāṇa</b> (Sanskrit: <i>a valid means of knowledge</i>) is a free, browser-based workspace that takes a systematic review and meta-analysis from protocol to PRISMA — with an AI reviewer that is specialised on <i>your</i> question, not a generic classifier. The goal is to make rigorous evidence synthesis affordable for everyone, including those without institutional software.</p>'+
+
+    '<div class="card-h" style="margin:18px 0 8px">Two ways to screen — pick by cost</div>'+
+    '<p><b>Viveka (LLM)</b> reads every abstract on a language model — most accurate, especially for small reviews, but uses ~1 API call per paper. <b>Local engine</b> learns from a small labelled seed (TF-IDF + logistic regression), then scores all remaining papers <b>free in your browser</b> — no tokens. Pramāṇa recommends Viveka for reviews up to ~250 papers (cheap and most accurate there) and the local engine above that, where free screening of thousands matters. You can switch modes anytime.</p>'+
+    '<div class="banner warn" style="margin:10px 0"><span class="bi">⚠</span><div>The local engine needs <i>some</i> labels to learn from — either you click a seed (zero tokens) or one small LLM batch labels it (tiny one-time cost). It ranks and suggests; it can\'t learn your review from literally nothing. Data <i>extraction</i> of numbers still needs an LLM or manual entry — a local model can\'t do that reliably.</div></div>'+
+
+    '<div class="card-h" style="margin:18px 0 8px">What is "Viveka", and is it really an AI agent?</div>'+
+    '<p>Viveka is your screening reviewer. She runs on a <b>large language model</b> (e.g. Gemini, GPT, Claude, DeepSeek, GLM) — that is why a key is needed; the reasoning happens on that provider, called directly from your browser.</p>'+
+    '<p>"Training" Viveka does <b>not</b> retrain the model\'s weights. It is <b>in-context specialisation</b>: from your title + PICO + criteria, Pramāṇa builds the model a domain glossary, an expert-reviewer persona and a decision rubric, then runs a calibration self-test on synthetic cases so you get a measured accuracy <i>before</i> screening real studies. So Viveka behaves like a reviewer briefed on your exact protocol, but the underlying model is unchanged.</p>'+
+    '<div class="banner warn" style="margin:10px 0"><span class="bi">⚠</span><div>The calibration score uses model-generated cases, so it measures internal consistency, not external validity. For publication, still do dual human screening on a sample and report agreement (e.g. Cohen\'s κ).</div></div>'+
+
+    '<div class="card-h" style="margin:18px 0 8px">How to use it — the pipeline (left spine)</div>'+
+    '<div class="kv"><b>1 · Protocol &amp; PICO</b><span class="muted" style="max-width:62%;text-align:right">Define the question, PICO, inclusion/exclusion.</span></div>'+
+    '<div class="kv"><b>2 · Train Viveka</b><span class="muted" style="max-width:62%;text-align:right">Specialise the reviewer; see a calibration score.</span></div>'+
+    '<div class="kv"><b>3 · Search sources</b><span class="muted" style="max-width:62%;text-align:right">Draft a Boolean strategy; run it in each database.</span></div>'+
+    '<div class="kv"><b>4 · Import studies</b><span class="muted" style="max-width:62%;text-align:right">RIS, BibTeX, EndNote XML, PubMed .nbib, Zotero/Mendeley CSV.</span></div>'+
+    '<div class="kv"><b>5 · De-duplicate</b><span class="muted" style="max-width:62%;text-align:right">By DOI, then title + year.</span></div>'+
+    '<div class="kv"><b>6 · Title/Abstract</b><span class="muted" style="max-width:62%;text-align:right">Viveka labels; you confirm or override.</span></div>'+
+    '<div class="kv"><b>7 · Full text</b><span class="muted" style="max-width:62%;text-align:right">Fetch open-access text (Europe PMC, Unpaywall); assess eligibility.</span></div>'+
+    '<div class="kv"><b>8 · Extract data</b><span class="muted" style="max-width:62%;text-align:right">Schema-driven extraction into an editable table.</span></div>'+
+    '<div class="kv"><b>9 · Risk of bias</b><span class="muted" style="max-width:62%;text-align:right">RoB 2 / ROBINS-I / NOS / JBI traffic-light matrix.</span></div>'+
+    '<div class="kv"><b>10 · Meta-analysis</b><span class="muted" style="max-width:62%;text-align:right">Random/fixed effects, I², τ², forest &amp; funnel plots.</span></div>'+
+    '<div class="kv"><b>11 · PRISMA &amp; export</b><span class="muted" style="max-width:62%;text-align:right">Live flow diagram; export project, tables, citations.</span></div>'+
+
+    '<div class="card-h" style="margin:18px 0 8px">New here?</div>'+
+    '<p>Click <b>▶ Demo</b> in the header to load a complete worked review (14 studies, fully screened, extracted, appraised and meta-analysed) so you can walk every phase end-to-end with no API key. Then <b>↺ Reset project</b> in Settings to start your own.</p>'+
+    '<p>Keys, models and strictness all live in <b>⚙ Settings</b>. Invite collaborators with <b>+</b>; share the exported project file so everyone works from the same protocol and studies.</p>'+
+
+    '<div class="divider"></div>'+
+    '<div class="fg"><label class="fl">About me <span class="hint">shown on this page; editable</span></label>'+
+      '<textarea class="inp" id="about-author" placeholder="Built by … — your name, affiliation, contact">'+esc(ST.settings.author||'')+'</textarea></div>'+
+  '</div>'+
+  '<div class="modal-f"><button class="btn gh" onclick="closeModal()">Close</button><button class="btn" onclick="ST.settings.author=document.getElementById(\'about-author\').value;save();closeModal();toast(\'Saved\',\'ok\')">Save note</button></div>');
+}
+window.aboutModal=aboutModal;
+
+/* ===================== FULL WORKED DEMO (no key needed) ===================== */
+function loadDemo(){
+  if(ST.refs.length && !confirm('Load the demo project? This replaces the current project in this browser.'))return;
+  const R=(o)=>Object.assign({id:uid(),source:'Demo',dup:false,ta:null,ft:null,extract:null,quality:null},o);
+  ST.project={title:'mHealth interventions for blood-pressure control in LMICs',
+    type:'Intervention review',
+    question:'In adults with hypertension in low- and middle-income countries, do mobile-health interventions compared with usual care improve blood-pressure control?',
+    p:'Adults (≥18) with diagnosed hypertension in low- or middle-income countries',
+    i:'Mobile health / smartphone app / SMS-based self-management interventions',
+    c:'Usual care, standard follow-up, or no mHealth component',
+    o:'Systolic & diastolic BP (mmHg), BP control rate, medication adherence',
+    inc:'Randomised or quasi-experimental design\nAdults with hypertension\nDelivered in an LMIC\nReports a BP or adherence outcome',
+    exc:'Protocols or conference abstracts only\nNon-hypertensive populations\nHigh-income-country settings\nNo usable quantitative outcome',
+    measure:'smd', robTool:'RoB 2'};
+  ST.agent={trained:true,model:'gemini-flash',advModel:'gemini-flash',trainedAt:new Date().toISOString(),
+    persona:'You are a senior systematic reviewer with expertise in digital health and cardiovascular epidemiology in low- and middle-income settings. You judge eligibility strictly against the PICO: hypertensive adults in LMICs, a mobile-health self-management component, and a quantitative blood-pressure or adherence outcome. You are alert to high-income-country studies, non-hypertensive populations, and publications without usable outcome data. When the abstract is ambiguous, you mark MAYBE and defer to full text rather than guessing.',
+    glossary:[{term:'mHealth',meaning:'health services/self-management delivered via mobile phones or apps'},
+      {term:'LMIC',meaning:'low- and middle-income country (World Bank classification)'},
+      {term:'SBP/DBP',meaning:'systolic / diastolic blood pressure (mmHg)'},
+      {term:'BP control',meaning:'proportion achieving target BP (e.g. <140/90)'},
+      {term:'Quasi-experimental',meaning:'non-randomised comparative design (e.g. controlled before-after)'},
+      {term:'Adherence',meaning:'extent to which patients take medication as prescribed'}],
+    synonyms:['mHealth','mobile health','smartphone app','SMS','text message','telemonitoring','hypertension','high blood pressure','blood pressure','antihypertensive','self-management','LMIC'],
+    calibration:{acc:88,n:8,correct:7,domain:'digital health for hypertension in LMICs',
+      tricky:['App studies in high-income countries that look topical but fail the LMIC criterion','Diabetes/CVD apps that mention BP only as a secondary, non-reported measure'],
+      details:[
+        {title:'App-based BP self-management in rural India (RCT)',gold:'include',pred:'include',ok:true},
+        {title:'SMS reminders and adherence, Nigeria (quasi-exp)',gold:'include',pred:'include',ok:true},
+        {title:'Smartphone diabetes coaching, USA',gold:'exclude',pred:'exclude',ok:true},
+        {title:'Coffee intake and cardiovascular disease, cohort',gold:'exclude',pred:'exclude',ok:true},
+        {title:'Telemonitoring for hypertension, Bangladesh (RCT)',gold:'include',pred:'include',ok:true},
+        {title:'Protocol for a future mHealth BP trial',gold:'exclude',pred:'exclude',ok:true},
+        {title:'Wearable step-counter and general wellness, Kenya',gold:'exclude',pred:'include',ok:false},
+        {title:'Mobile coaching for hypertension, South Africa (RCT)',gold:'include',pred:'include',ok:true}]},
+    rubric:['INCLUDE if adults with hypertension in an LMIC receive an mHealth self-management component and a BP or adherence outcome is reported.',
+      'EXCLUDE if the setting is a high-income country.',
+      'EXCLUDE if the population is not hypertensive (e.g. diabetes-only, general wellness).',
+      'EXCLUDE if there is no mobile/app/SMS component (usual care vs usual care).',
+      'EXCLUDE if it is a protocol, abstract-only, or review with no primary data.',
+      'MAYBE if the design or outcome is unclear from the abstract — defer to full text.']};
+
+  const inc=(ta,ft,extract,quality)=>({ta,ft,extract,quality});
+  const aiTA=(d,conf,reason)=>({a:d,final:d,conf,reason,by:'agent',model:'gemini-flash',pico:{p:true,i:true,o:true}});
+  const studies=[
+    // 6 included → extracted, RoB, effects
+    R({title:'A smartphone app for blood-pressure self-management in rural India: a randomised controlled trial',authors:'Sharma R; Patel K; Rao S',year:'2022',journal:'Journal of Hypertension',doi:'10.1000/demo.001',
+      abstract:'We randomised 240 adults with hypertension in rural Karnataka to an mHealth app supporting home BP monitoring and medication reminders versus usual care. At 6 months, systolic BP fell by 8.4 mmHg more in the intervention arm (95% CI 4.1 to 12.7) and BP control improved.',
+      ta:aiTA('include',94,'Hypertensive adults in an LMIC; app self-management; SBP outcome reported.'),
+      ft:{decision:'include',oa:true,reason:'Full text confirms RCT with usable SBP data.',by:'agent'},
+      extract:{design:'RCT',country:'India',n:'240',population:'Adults with hypertension, rural',intervention:'Smartphone app: home BP monitoring + reminders',comparator:'Usual care',followup:'6 months',outcome:'Change in SBP (mmHg)',effect:'−8.4 mmHg (95% CI −12.7 to −4.1)'},
+      quality:{tool:'RoB 2',overall:'low',by:'agent',domains:{'Randomisation process':{j:'low',why:'computer-generated sequence'},'Deviations from intended interventions':{j:'low',why:'ITT analysis'},'Missing outcome data':{j:'some',why:'12% attrition'},'Measurement of the outcome':{j:'low',why:'validated device'},'Selection of the reported result':{j:'low',why:'pre-registered'}}}}),
+    R({title:'Text-message reminders and medication adherence among hypertensive patients in Nigeria',authors:'Okafor C; Adeyemi T',year:'2021',journal:'BMC Public Health',doi:'10.1000/demo.002',
+      abstract:'A quasi-experimental study of SMS reminders in 180 hypertensive adults attending clinics in Lagos. Adherence improved and mean systolic BP was lower at 12-week follow-up versus the comparison group.',
+      ta:aiTA('include',88,'LMIC hypertensives; SMS self-management; BP & adherence outcomes.'),
+      ft:{decision:'include',oa:true,reason:'Quasi-experimental with usable SBP outcome.',by:'agent'},
+      extract:{design:'Quasi-experimental',country:'Nigeria',n:'180',population:'Adults with hypertension, urban clinics',intervention:'SMS medication reminders',comparator:'Standard follow-up',followup:'12 weeks',outcome:'SBP; adherence',effect:'−5.9 mmHg (95% CI −10.3 to −1.5)'},
+      quality:{tool:'RoB 2',overall:'some',by:'agent',domains:{'Randomisation process':{j:'high',why:'non-randomised allocation'},'Deviations from intended interventions':{j:'some',why:''},'Missing outcome data':{j:'low',why:''},'Measurement of the outcome':{j:'low',why:''},'Selection of the reported result':{j:'some',why:''}}}}),
+    R({title:'App plus home monitor for hypertension control in urban China: a randomised trial',authors:'Chen L; Wang H',year:'2023',journal:'Hypertension Research',doi:'10.1000/demo.003',
+      abstract:'320 adults with uncontrolled hypertension in Chengdu were randomised to an app integrated with a Bluetooth BP monitor or usual care. The intervention reduced systolic BP and increased the proportion achieving control at 6 months.',
+      ta:aiTA('include',95,'LMIC; app + monitor; SBP and control outcomes.'),
+      ft:{decision:'include',oa:true,reason:'RCT, large sample, usable effect.',by:'agent'},
+      extract:{design:'RCT',country:'China',n:'320',population:'Adults, uncontrolled hypertension',intervention:'App + Bluetooth BP monitor',comparator:'Usual care',followup:'6 months',outcome:'SBP; control rate',effect:'−10.2 mmHg (95% CI −14.0 to −6.4)'},
+      quality:{tool:'RoB 2',overall:'low',by:'agent',domains:{'Randomisation process':{j:'low',why:''},'Deviations from intended interventions':{j:'low',why:''},'Missing outcome data':{j:'low',why:''},'Measurement of the outcome':{j:'low',why:''},'Selection of the reported result':{j:'low',why:''}}}}),
+    R({title:'Mobile coaching for blood-pressure reduction in South Africa (RCT)',authors:'Mbeki N; Dlamini P',year:'2020',journal:'BMC Cardiovascular Disorders',doi:'10.1000/demo.004',
+      abstract:'150 hypertensive adults in Cape Town were randomised to nurse-led mobile coaching via app versus usual care. A modest reduction in systolic BP was observed at 3 months.',
+      ta:aiTA('include',85,'LMIC; app-based coaching; SBP outcome.'),
+      ft:{decision:'include',oa:false,reason:'RCT with reported SBP change.',by:'agent'},
+      extract:{design:'RCT',country:'South Africa',n:'150',population:'Adults with hypertension',intervention:'Nurse-led mobile coaching (app)',comparator:'Usual care',followup:'3 months',outcome:'Change in SBP',effect:'−4.8 mmHg (95% CI −9.4 to −0.2)'},
+      quality:{tool:'RoB 2',overall:'some',by:'agent',domains:{'Randomisation process':{j:'low',why:''},'Deviations from intended interventions':{j:'some',why:'open-label'},'Missing outcome data':{j:'some',why:''},'Measurement of the outcome':{j:'low',why:''},'Selection of the reported result':{j:'low',why:''}}}}),
+    R({title:'App-delivered reminders for hypertension self-care in Bangladesh: a randomised controlled trial',authors:'Rahman M; Hossain A',year:'2022',journal:'Global Heart',doi:'10.1000/demo.005',
+      abstract:'A randomised trial of 210 adults with hypertension in Dhaka comparing an app delivering reminders and education with usual care. Systolic BP and adherence improved at 6 months.',
+      ta:aiTA('include',90,'LMIC; app reminders; SBP and adherence.'),
+      ft:{decision:'include',oa:true,reason:'RCT with usable SBP effect.',by:'agent'},
+      extract:{design:'RCT',country:'Bangladesh',n:'210',population:'Adults with hypertension',intervention:'App reminders + education',comparator:'Usual care',followup:'6 months',outcome:'SBP; adherence',effect:'−6.7 mmHg (95% CI −11.0 to −2.4)'},
+      quality:{tool:'RoB 2',overall:'low',by:'agent',domains:{'Randomisation process':{j:'low',why:''},'Deviations from intended interventions':{j:'low',why:''},'Missing outcome data':{j:'some',why:''},'Measurement of the outcome':{j:'low',why:''},'Selection of the reported result':{j:'low',why:''}}}}),
+    R({title:'Cluster-randomised telemonitoring for hypertension in primary care, India',authors:'Gupta A; Nair V',year:'2021',journal:'The Lancet Global Health',doi:'10.1000/demo.006',
+      abstract:'In a cluster-randomised trial across 12 primary-health centres in India (400 patients), app-based telemonitoring of home BP readings improved control versus usual care over 9 months.',
+      ta:aiTA('include',92,'LMIC; telemonitoring app; control outcome.'),
+      ft:{decision:'include',oa:true,reason:'Cluster-RCT with usable effect.',by:'agent'},
+      extract:{design:'Cluster-RCT',country:'India',n:'400',population:'Primary-care hypertensives',intervention:'App-based home-BP telemonitoring',comparator:'Usual care',followup:'9 months',outcome:'BP control; SBP',effect:'−9.1 mmHg (95% CI −13.2 to −5.0)'},
+      quality:{tool:'RoB 2',overall:'low',by:'agent',domains:{'Randomisation process':{j:'low',why:''},'Deviations from intended interventions':{j:'low',why:''},'Missing outcome data':{j:'low',why:''},'Measurement of the outcome':{j:'low',why:''},'Selection of the reported result':{j:'some',why:''}}}}),
+    // excluded at full text (2, with reasons)
+    R({title:'A mobile lifestyle programme and cardiovascular risk in Kenya',authors:'Kamau J',year:'2022',journal:'PLOS ONE',doi:'10.1000/demo.007',
+      abstract:'A mobile programme promoting diet and activity in adults at cardiovascular risk in Nairobi. Blood pressure was mentioned as a secondary measure.',
+      ta:aiTA('maybe',58,'Topical mHealth in LMIC but BP role unclear — defer to full text.'),
+      ft:{decision:'exclude',oa:true,exclCat:'no usable data',reason:'Full text reports no usable BP outcome (only a narrative mention).',by:'agent'}}),
+    R({title:'Wearable activity tracker and wellness outcomes in Indonesia',authors:'Putra B',year:'2021',journal:'Digital Health',doi:'10.1000/demo.008',
+      abstract:'Adults in Jakarta used a wrist wearable; the study examined general wellness and step counts.',
+      ta:aiTA('maybe',52,'Mobile device in LMIC but not a hypertension self-management app — check full text.'),
+      ft:{decision:'exclude',oa:true,exclCat:'wrong intervention',reason:'Wearable step-tracker, not an mHealth BP self-management intervention.',by:'agent'}}),
+    // excluded at title/abstract (4)
+    R({title:'Coffee consumption and cardiovascular outcomes: a prospective cohort study',authors:'Lee J; Park S',year:'2020',journal:'Nutrition Reviews',doi:'10.1000/demo.009',
+      abstract:'This cohort examined coffee intake and incident cardiovascular disease in a high-income setting. No mobile-health component.',
+      ta:aiTA('exclude',96,'No mHealth component; high-income setting; wrong design.')}),
+    R({title:'A smartphone app for type-2 diabetes self-management in the United States',authors:'Smith A; Johnson R',year:'2019',journal:'Diabetes Care',doi:'10.1000/demo.010',
+      abstract:'Randomised trial of a diabetes app in 300 US adults, measuring HbA1c. Population is diabetic, setting high-income.',
+      ta:aiTA('exclude',93,'Wrong population (diabetes) and high-income country.')}),
+    R({title:'Protocol for a randomised trial of an mHealth hypertension intervention',authors:'Verma P',year:'2018',journal:'Trials',doi:'10.1000/demo.011',
+      abstract:'This paper describes the protocol for a future trial; no outcome data are reported.',
+      ta:aiTA('exclude',97,'Protocol only — no primary outcome data.')}),
+    R({title:'Digital interventions for hypertension: a narrative review',authors:'Brown T',year:'2021',journal:'Current Hypertension Reports',doi:'10.1000/demo.012',
+      abstract:'A narrative review summarising digital approaches to hypertension management.',
+      ta:aiTA('exclude',95,'Review article — no primary data.')}),
+    // duplicates (2)
+    R({title:'A smartphone app for blood-pressure self-management in rural India: a randomised controlled trial',authors:'Sharma R; Patel K',year:'2022',journal:'J Hypertens',doi:'10.1000/demo.001',source:'Embase',dup:true,
+      abstract:'Duplicate record of the Sharma 2022 trial, imported from a second database.'}),
+    R({title:'App plus home monitor for hypertension control in urban China: a randomised trial',authors:'Chen L; Wang H',year:'2023',journal:'Hypertens Res',source:'Scopus',dup:true,
+      abstract:'Duplicate record of the Chen 2023 trial.'})
+  ];
+  ST.refs=studies;
+  // effects for the 6 included (SMD-style on SBP; negative favours intervention)
+  ST.effects=[
+    {label:'Sharma 2022',es:-0.45,se:0.14,n:240},
+    {label:'Okafor 2021',es:-0.31,se:0.18,n:180},
+    {label:'Chen 2023',es:-0.55,se:0.12,n:320},
+    {label:'Mbeki 2020',es:-0.28,se:0.21,n:150},
+    {label:'Rahman 2022',es:-0.38,se:0.16,n:210},
+    {label:'Gupta 2021',es:-0.49,se:0.13,n:400}
+  ];
+  ST.team=[{name:'Lead Reviewer',email:'',role:'Lead'},{name:'Second Reviewer',email:'',role:'Reviewer 2'}];
+  ST.id=uid();save();updatePill();updateAgentChip();renderTeam();renderSpine();
+  openWorkspace('report');
+  toast('Demo loaded — explore every phase from the spine on the left','ok');
+}
+window.loadDemo=loadDemo;
+/* ===================== DEMO CHOOSER + LARGE LOCAL DEMO ===================== */
+function demoChooser(){
+  modal('<div class="modal-h">▶ Load a demo<button class="x" onclick="closeModal()">×</button></div>'+
+  '<div class="modal-b">'+
+    '<div class="banner info"><span class="bi">ⓘ</span><div>Both demos load a complete project you can explore end-to-end with no API key. They replace the current project in this browser.</div></div>'+
+    '<div class="card tight" style="cursor:pointer" onclick="closeModal();loadDemo()">'+
+      '<div class="card-h">⊹ Small review — Viveka (LLM) <span class="tag">14 papers</span></div>'+
+      '<div class="muted">A complete hypertension mHealth review screened by Viveka (LLM): 14 records → 6 included → extraction, risk of bias, meta-analysis & live PRISMA. Shows the cloud reviewer on a typical small review.</div></div>'+
+    '<div class="card tight" style="cursor:pointer;margin-bottom:0" onclick="closeModal();loadDemoLarge()">'+
+      '<div class="card-h">⚙ Large review — Viveka Local <span class="tag">600 papers</span></div>'+
+      '<div class="muted">A 600-paper search where <b>Viveka Local</b> is trained on a labelled seed and screens the rest free, in your browser. Loads with the engine already trained — see its measured recall/precision on the <b>Viveka</b> page (Phase 02).</div></div>'+
+  '</div>'+
+  '<div class="modal-f"><button class="btn gh" onclick="closeModal()">Cancel</button></div>');
+}
+window.demoChooser=demoChooser;
+
+/* deterministic RNG so the demo reproduces the same numbers every time */
+function _lcg(seed){let s=seed>>>0;return ()=>{s=(s*1664525+1013904223)>>>0;return s/4294967296;};}
+
+function loadDemoLarge(){
+  if(ST.refs.length && !confirm('Load the large demo (600 papers)? This replaces the current project.'))return;
+  const rnd=_lcg(20260613);
+  const pick=a=>a[(rnd()*a.length)|0];
+  // INCLUDE templates: mHealth + hypertension + LMIC
+  const incPop=['adults with hypertension','hypertensive patients','adults with high blood pressure','patients with uncontrolled hypertension'];
+  const incInt=['a smartphone app','an mHealth application','SMS text-message reminders','a mobile self-management app','app-based telemonitoring','a mobile coaching programme'];
+  const incSet=['in rural India','in Nigeria','in Bangladesh','in Kenya','in urban China','in South Africa','in Indonesia','in Ghana','in Vietnam','in Brazil'];
+  const incDes=['a randomised controlled trial','a cluster-randomised trial','a quasi-experimental study','a pragmatic randomised trial'];
+  const incOut=['reduced systolic blood pressure','improved blood-pressure control','increased medication adherence','lowered mean SBP and DBP'];
+  // EXCLUDE templates: several distractor classes incl. near-misses
+  const excTmpl=[
+    ()=>`Coffee and cardiovascular risk: ${pick(['a cohort study','a prospective analysis'])} in ${pick(['the United States','Europe','a high-income population'])} with no mobile component.`,
+    ()=>`A smartphone app for type-2 diabetes ${pick(['glycaemic control','HbA1c monitoring'])} in ${pick(['the USA','Canada','Germany'])}; population is diabetic.`,
+    ()=>`Surgical outcomes after ${pick(['laparoscopic cholecystectomy','hip replacement','cardiac bypass'])}: a hospital cohort with complications and length of stay.`,
+    ()=>`Genetic polymorphisms and ${pick(['tumour expression','cancer risk'])}: a sequencing and bioinformatics analysis.`,
+    ()=>`Water, sanitation and ${pick(['diarrhoeal disease','child stunting'])} in rural communities: a cluster intervention.`,
+    ()=>`Protocol for a future trial of an mHealth hypertension intervention; no outcome data are reported yet.`,
+    ()=>`Digital interventions for hypertension: a narrative ${pick(['review','commentary','editorial'])} of the literature.`,
+    ()=>`Telemonitoring for ${pick(['heart failure','COPD','asthma'])} in ${pick(['the UK','Australia','Japan'])}: a high-income mHealth study.`,
+    ()=>`Dietary salt and blood pressure: a ${pick(['meta-analysis','cohort'])} with no mobile-health component.`
+  ];
+  const refs=[];const N=600;let truthInc=0;
+  // hard near-miss EXCLUDES that share include-vocabulary (create realistic confusion)
+  const nearMiss=[
+    ()=>`A smartphone app for blood-pressure monitoring in hypertensive adults in ${pick(['the United States','Germany','Australia'])}: a randomised trial (high-income setting).`,
+    ()=>`Mobile self-management for ${pick(['hypertensive','high blood pressure'])} patients: a narrative review of randomised trials in low- and middle-income countries.`,
+    ()=>`Text-message reminders and medication adherence in adults with diabetes in ${pick(['India','Kenya'])}: a randomised controlled trial.`,
+    ()=>`Protocol for a cluster-randomised trial of an mHealth app for blood-pressure control among hypertensive adults in rural India.`
+  ];
+  for(let i=0;i<N;i++){
+    const roll=rnd();
+    const isInc=roll<0.15;            // ~15% true includes
+    const isNear=!isInc && roll<0.24; // ~9% hard near-miss excludes
+    let title,abs,truth;
+    if(isInc){
+      truth='include';truthInc++;
+      // ~8% of includes are "thin" abstracts (less signal) to add realistic misses
+      const thin=rnd()<0.08;
+      title=`Effect of ${pick(incInt)} on blood pressure among ${pick(incPop)} ${pick(incSet)}: ${pick(incDes)}`;
+      abs=thin?`A study of mobile health for hypertension ${pick(incSet)}.`
+        :`We conducted ${pick(incDes)} of ${pick(incInt)} versus usual care among ${pick(incPop)} ${pick(incSet)}. `+
+         `Over ${pick(['3','6','9','12'])} months the intervention ${pick(incOut)} compared with control. `+
+         `These findings support mobile health for hypertension management in low- and middle-income settings.`;
+    }else if(isNear){
+      truth='exclude';const t=pick(nearMiss)();title=t.replace(/:.*$/,'').slice(0,90);
+      abs=t+' '+pick(['Outcomes were assessed at follow-up.','A comparison group was included.']);
+    }else{
+      truth='exclude';const t=pick(excTmpl)();title=t.replace(/:.*$/,'').slice(0,90);
+      abs=t+' '+pick(['Results were reported for the full sample.','Outcomes were assessed at follow-up.','The study had a comparison group.']);
+    }
+    refs.push({id:uid(),source:pick(['PubMed','Embase','Scopus','CENTRAL']),dup:false,
+      title,abstract:abs,authors:pick(['Sharma','Okafor','Chen','Rahman','Mbeki','Gupta','Lee','Smith','Verma','Putra'])+' '+pick(['R','A','J','M','P','C']),
+      year:String(2018+((rnd()*7)|0)),journal:pick(['J Hypertens','BMC Public Health','Global Heart','PLOS ONE','Lancet Glob Health']),
+      ta:null,ft:null,extract:null,quality:null,_truth:truth});
+  }
+  // protocol
+  ST.project={title:'mHealth interventions for blood-pressure control in LMICs (large search)',
+    type:'Intervention review',
+    question:'In adults with hypertension in low- and middle-income countries, do mobile-health interventions versus usual care improve blood-pressure control?',
+    p:'Adults with hypertension in LMICs',i:'Mobile health / app / SMS self-management',c:'Usual care',
+    o:'Systolic/diastolic BP, BP control, adherence',
+    inc:'Randomised or quasi-experimental\nHypertensive adults\nLMIC setting\nReports BP/adherence outcome',
+    exc:'Protocol/abstract only\nNon-hypertensive\nHigh-income setting\nNo mHealth component',measure:'smd',robTool:'RoB 2'};
+  // LLM Viveka is NOT the focus here; leave untrained so the page highlights Local
+  ST.agent={trained:false,model:'gemini-flash',advModel:'gemini-flash',persona:'',glossary:[],synonyms:['mHealth','mobile health','app','SMS','hypertension','blood pressure','LMIC','adherence','telemonitoring'],rubric:[],calibration:null};
+  ST.refs=refs;ST.effects=[];ST.team=[{name:'Lead Reviewer',role:'Lead'}];
+  ST.settings.screenMode='local';ST.settings.localThr=0.35;ST.settings.localMaybeBand=0.08;
+  // label a seed: 30 includes + 30 excludes (simulating a reviewer's seed set)
+  let si=0,se=0;
+  for(const r of refs){if(r._truth==='include'&&si<30){r.ta={final:'include',by:'human',conf:100,reason:'seed label',seeded:true};si++;}
+    else if(r._truth==='exclude'&&se<30){r.ta={final:'exclude',by:'human',conf:100,reason:'seed label',seeded:true};se++;}}
+  save();
+  // train the engine (computes cross-val + scores the rest)
+  trainLocalEngine();
+  // held-out benchmark vs known truth (papers the engine scored, i.e. not in seed)
+  const test=ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.by==='local');
+  let tp=0,fp=0,fn=0;test.forEach(r=>{const p=r.ta.final,t=r._truth;
+    if(t==='include'&&p==='include')tp++;else if(t==='exclude'&&p==='include')fp++;else if(t==='include'&&p==='exclude')fn++;});
+  const ranked=test.slice().sort((a,b)=>(b.ta.prob)-(a.ta.prob));
+  const top30=ranked.slice(0,Math.ceil(ranked.length*0.3));
+  const incTop=top30.filter(r=>r._truth==='include').length;
+  const totInc=test.filter(r=>r._truth==='include').length||1;
+  if(ST.engine)ST.engine.demoEval={recall:Math.round(tp/(tp+fn||1)*100),prec:Math.round(tp/(tp+fp||1)*100),
+    rankTop:Math.round(incTop/totInc*100),scored:test.length,n:test.length};
+  ST.id=uid();save();updatePill();updateAgentChip();renderTeam();renderSpine();
+  openWorkspace('viveka'); // the Viveka page — shows the training results
+  toast('Large demo loaded — Viveka Local trained on 60 labels. See its results on this page.','ok');
+}
+window.loadDemoLarge=loadDemoLarge;
+
+
+/* ===================== VIVEKA PAGE (about + training results) ===================== */
+function renderViveka(){
+  const a=ST.agent, eng=ST.engine;
+  const cloudReady=a.trained, ev=eng&&eng.demoEval;
+  const scored=ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.by==='local');
+  // build score histogram (10 bins) from local-scored papers
+  const bins=new Array(10).fill(0);scored.forEach(r=>{const b=Math.min(9,Math.max(0,Math.floor((r.ta.prob||0)*10)));bins[b]++;});
+  const maxBin=Math.max(1,...bins);
+  document.getElementById('pane-viveka').innerHTML=`
+  <div class="pane-h"><div class="eyebrow">Your AI reviewer</div>
+    <h1>🧠 Viveka</h1>
+    <p>Viveka is the reviewer that screens your studies. She works in two modes — and both are <i>specialised on your protocol</i>, not generic. Pick by review size and budget; switch anytime in Phase 06.</p></div>
+
+  <div class="grid2">
+    <div class="card">
+      <div class="card-h">⊹ Viveka · Cloud <span class="tag">${cloudReady?'set up':'not set up'}</span></div>
+      <p class="muted" style="margin:0 0 12px">Runs on a large language model (your API key). Reads every abstract with full language understanding — highest accuracy, best for smaller reviews. Uses ~1 API call per paper.</p>
+      <div class="kv"><span>Status</span><b>${cloudReady?'Trained on your protocol':'Not set up'}</b></div>
+      <div class="kv"><span>Model</span><b>${MODELS[a.model]?MODELS[a.model].label:a.model}</b></div>
+      <div class="kv"><span>Calibration (synthetic)</span><b>${a.calibration?a.calibration.acc+'%':'—'}</b></div>
+      <div class="row" style="margin-top:12px">
+        <button class="btn gh sm" onclick="ASRMA.go('agents')">Set up / view →</button>
+        <span class="muted">recommended ≤ ${SCREEN_THRESHOLD} papers</span></div>
+    </div>
+    <div class="card">
+      <div class="card-h">🧠 Viveka · Local <span class="tag">${eng?'trained':'not trained'}</span></div>
+      <p class="muted" style="margin:0 0 12px">An on-device agent: learns your include/exclude pattern from a small labelled seed (TF-IDF + logistic regression), then screens every other paper <b>free in your browser</b> — zero tokens. Best for large searches.</p>
+      <div class="kv"><span>Status</span><b>${eng?'Trained on '+eng.seedN+' seed labels':'Not trained yet'}</b></div>
+      <div class="kv"><span>Vocabulary learned</span><b>${eng?eng.vocab.length+' terms':'—'}</b></div>
+      <div class="kv"><span>Papers scored free</span><b>${scored.length||'—'}</b></div>
+      <div class="row" style="margin-top:12px">
+        <button class="btn gh sm" onclick="ST.settings.screenMode='local';save();ASRMA.go('screen')">Train / view →</button>
+        <span class="muted">recommended &gt; ${SCREEN_THRESHOLD} papers</span></div>
+    </div>
+  </div>
+
+  <div class="banner info"><span class="bi">ⓘ</span><div><b>What "training" means:</b> neither mode retrains the underlying model's weights. Cloud Viveka is briefed with a protocol-specific persona + rubric in every prompt. Local Viveka fits a small classifier in your browser on your seed labels. Both can be re-run anytime your criteria change. Full plain-language detail is in <a href="#" onclick="aboutModal();return false" style="color:inherit;font-weight:700">About</a>.</div></div>
+
+  ${eng?`
+  <div class="card">
+    <div class="card-h">🧠 Viveka · Local — training results ${ev?'<span class="tag">benchmarked</span>':''}</div>
+    ${ev?`<div class="tiles" style="margin-bottom:8px">
+      <div class="tile inc"><div class="v">${ev.recall}%</div><div class="k">recall (includes found)</div></div>
+      <div class="tile syn"><div class="v">${ev.prec}%</div><div class="k">precision</div></div>
+      <div class="tile flow"><div class="v">${f1(ev.recall,ev.prec)}</div><div class="k">F1 score</div></div>
+      <div class="tile"><div class="v">${ev.rankTop}%</div><div class="k">includes in top 30%</div></div>
+      <div class="tile maybe"><div class="v">${Math.round((1-0.3)*100)}%</div><div class="k">screening effort saved*</div></div>
+    </div>
+    <div class="banner ${ev.recall>=95?'info':'warn'}" style="margin:6px 0 14px"><span class="bi">${ev.recall>=95?'✓':'⚠'}</span><div>
+      On this ${ev.n}-paper benchmark, after labelling ${eng.seedN} seed papers Viveka·Local found <b>${ev.recall}% of all relevant studies</b> while screening the rest with zero tokens; reading just the top 30% of her ranked list surfaces <b>${ev.rankTop}%</b> of includes. *Effort-saved is illustrative (ranked-screening to ~95% recall). These are demo numbers on labelled synthetic data — your real recall depends on how separable your criteria are, so always confirm a human-screened sample.</div></div>`:
+      `<div class="banner info" style="margin-bottom:14px"><span class="bi">ⓘ</span><div>Trained on your seed (resubstitution accuracy ${eng.trainAcc}%). Load the <b>▶ Demo → Large review</b> to see a full recall/precision benchmark against known labels.</div></div>`}
+
+    <div class="grid2">
+      <div>
+        <div class="card-h" style="margin-bottom:10px">Score distribution <span class="muted" style="font-weight:500">— ${scored.length} scored papers</span></div>
+        ${histSVG(bins,maxBin)}
+        <div class="muted" style="margin-top:6px">A clean two-hump shape (most papers near 0% or 100%) means Viveka separates includes from excludes confidently. A flat middle means more borderline papers to review by hand.</div>
+      </div>
+      <div>
+        ${ev?`<div class="card-h" style="margin-bottom:10px">Confusion matrix <span class="muted" style="font-weight:500">@ ${Math.round((ST.settings.localThr!=null?ST.settings.localThr:0.35)*100)}% threshold</span></div>
+        ${confusionSVG(ev)}`:'<div class="card-h" style="margin-bottom:10px">Decision split</div>'}
+        <div class="divider"></div>
+        <div class="card-h" style="margin-bottom:8px">What Viveka learned</div>
+        <div class="row" style="margin-bottom:6px"><span class="pill f">favours include: ${(eng.topInc||[]).slice(0,7).join(', ')}</span></div>
+        <div class="row"><span class="pill" style="background:var(--exc-w);color:#b91c1c">favours exclude: ${(eng.topExc||[]).slice(0,7).join(', ')}</span></div>
+      </div>
+    </div>
+    <div class="row" style="margin-top:14px"><button class="btn" onclick="ASRMA.go('screen')">Go to screening →</button>
+      <button class="btn gh sm" onclick="ST.settings.screenMode='local';save();ASRMA.go('screen')">Re-train / active learning</button></div>
+  </div>`:`
+  <div class="empty"><div class="ico">🧠</div><h3>Viveka · Local isn't trained yet</h3>
+    <div>Import a larger set and label a seed in screening, or load the <b>▶ Demo → Large review</b> to see her training results here.</div>
+    <div class="row" style="justify-content:center;margin-top:14px"><button class="btn" onclick="demoChooser()">▶ Load a demo</button></div></div>`}`;
+}
+function f1(r,p){if(!r||!p)return '—';const v=2*r*p/(r+p);return Math.round(v)+'%';}
+function histSVG(bins,maxBin){
+  const W=440,H=170,padL=34,padB=26,top=10,bw=(W-padL-10)/bins.length;
+  let bars='';
+  bins.forEach((v,i)=>{const h=(v/maxBin)*(H-top-padB);const x=padL+i*bw;const y=H-padB-h;
+    const col=i<3?'var(--exc)':i>6?'var(--inc)':'var(--maybe)';
+    bars+=`<rect x="${x+2}" y="${y}" width="${bw-4}" height="${h}" rx="2" fill="${col}" opacity=".85"/>`+
+      (v?`<text x="${x+bw/2}" y="${y-3}" font-size="9" fill="var(--t3)" text-anchor="middle">${v}</text>`:'');});
+  return `<svg width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" style="max-width:100%;background:#fff">
+    <line x1="${padL}" y1="${H-padB}" x2="${W-6}" y2="${H-padB}" stroke="var(--line2)"/>
+    ${bars}
+    <text x="${padL}" y="${H-8}" font-size="9" fill="var(--t3)">0% (exclude)</text>
+    <text x="${W-6}" y="${H-8}" font-size="9" fill="var(--t3)" text-anchor="end">100% (include)</text>
+    <text x="${(padL+W)/2}" y="${H-8}" font-size="9" fill="var(--t3)" text-anchor="middle">Viveka·Local relevance score</text></svg>`;
+}
+function confusionSVG(ev){
+  // reconstruct counts: we stored recall/prec/rankTop/n; derive tp,fp,fn,tn approximately from stored eval
+  const n=ev.n;
+  // we need raw counts; recompute live from refs+_truth if available, else estimate
+  const test=ST.refs.filter(r=>!r.dup&&r.ta&&r.ta.by==='local'&&r._truth);
+  let tp=0,fp=0,fn=0,tn=0;
+  if(test.length){test.forEach(r=>{const p=r.ta.final,t=r._truth;
+    if(t==='include'&&p==='include')tp++;else if(t==='exclude'&&p==='include')fp++;
+    else if(t==='include'&&p==='exclude')fn++;else tn++;});}
+  const cell=(x,y,val,lab,col)=>`<rect x="${x}" y="${y}" width="92" height="46" rx="6" fill="${col}"/>
+    <text x="${x+46}" y="${y+22}" font-size="17" font-weight="800" fill="#fff" text-anchor="middle">${val}</text>
+    <text x="${x+46}" y="${y+38}" font-size="9" fill="#fff" text-anchor="middle" opacity=".9">${lab}</text>`;
+  return `<svg width="240" height="150" viewBox="0 0 240 150" style="background:#fff">
+    <text x="56" y="12" font-size="9" fill="var(--t3)" text-anchor="middle">predicted include</text>
+    <text x="152" y="12" font-size="9" fill="var(--t3)" text-anchor="middle">predicted exclude</text>
+    <text x="10" y="44" font-size="9" fill="var(--t3)" transform="rotate(-90 10 44)" text-anchor="middle">truly incl.</text>
+    <text x="10" y="100" font-size="9" fill="var(--t3)" transform="rotate(-90 10 100)" text-anchor="middle">truly excl.</text>
+    ${cell(20,18,tp,'true +','var(--inc)')}
+    ${cell(120,18,fn,'missed','var(--exc)')}
+    ${cell(20,74,fp,'false +','var(--maybe)')}
+    ${cell(120,74,tn,'true −','var(--flow)')}</svg>`;
+}
+window.renderViveka=renderViveka;
+
+/* ---- home / workspace toggle ---- */
+function goHome(){
+  document.getElementById('main').style.display='none';
+  document.getElementById('home').classList.add('on');
+  document.getElementById('proj-pill').style.display='none';
+  const sb=document.getElementById('share-btn'); if(sb)sb.style.display='none';
+  const ss=document.getElementById('sync-state'); if(ss)ss.textContent='';
+  renderHome();
+}
+function openWorkspace(phase){
+  document.getElementById('home').classList.remove('on');
+  const as=document.getElementById('auth-screen'); if(as)as.style.display='none';
+  document.getElementById('main').style.display='flex';
+  document.getElementById('proj-pill').style.display='';
+  if(window.BK&&BK.isServer()){ const sb=document.getElementById('share-btn'); if(sb)sb.style.display=(BK.role==='reviewer'?'none':''); setSyncState('saved'); }
+  updatePill();updateAgentChip();renderTeam();
+  ASRMA.go(phase||'protocol');
+}
+function renderHome(){
+  if(window.BK&&BK.isServer()){ return renderHomeServer(); }
+  const projs=listProjects();
+  const cards=projs.map(p=>{
+    const c=p.counts||{total:0,incl:0,screened:0};
+    const prog=c.total?Math.round((c.screened/Math.max(1,c.total))*100):0;
+    const when=p.updatedAt?new Date(p.updatedAt).toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'}):'';
+    return `<div class="proj-card" onclick="openProject('${p.id}')">
+      <div class="pc-title">${esc(p.title||'Untitled review')}</div>
+      <div class="pc-q">${esc(p.q||p.question||'No research question yet')}</div>
+      <div class="pc-meta">
+        <span class="pill">${c.total} studies</span>
+        ${c.incl?`<span class="pill f">${c.incl} included</span>`:''}
+        ${p.localTrained?'<span class="pill s">🧠 local</span>':p.trained?'<span class="pill s">⊹ cloud</span>':''}
+      </div>
+      <div class="pc-foot" onclick="event.stopPropagation()">
+        <div class="prog-mini" title="${prog}% screened"><i style="width:${prog}%"></i></div>
+        <span class="pc-date">${when}</span>
+        <button class="pc-act" title="Rename" onclick="renameProject('${p.id}')">✎</button>
+        <button class="pc-act" title="Duplicate" onclick="duplicateProject('${p.id}')">⧉</button>
+        <button class="pc-act" title="Export" onclick="exportProjectById('${p.id}')">⬇</button>
+        <button class="pc-act del" title="Delete" onclick="deleteProject('${p.id}')">🗑</button>
+      </div></div>`;
+  }).join('');
+  document.getElementById('home').innerHTML=`<div class="home-wrap">
+    <div class="home-hero">
+      <div>
+        <h1>Your reviews</h1>
+        <p class="lead">Each project is a full systematic review — protocol, studies, screening, and synthesis — saved in this browser. Create one, or load a worked demo to explore.</p>
+      </div>
+      <div class="spacer"></div>
+      <div class="row">
+        <button class="btn" onclick="newProject()">+ New review</button>
+        <button class="btn gh" onclick="demoChooser()">▶ Load demo</button>
+        <button class="btn gh" onclick="importProjectFile()">⬆ Import file</button>
+        <button class="btn gh" onclick="openBatchToScreen()" title="Reviewers: open the batch file your lead sent you">⊜ Screen a batch (reviewers)</button>
+      </div>
+    </div>
+    <div class="proj-grid">
+      <div class="proj-card new-card" onclick="newProject()"><div class="plus">+</div><div style="margin-top:8px;font-weight:600">Start a new review</div></div>
+      ${cards}
+    </div>
+    ${!projs.length?'<div class="muted" style="text-align:center;margin-top:30px">No saved reviews yet — create your first, or try a demo.</div>':''}
+  </div>`;
+}
+function importProjectFile(){
+  const inp=document.createElement('input');inp.type='file';inp.accept='.json';
+  inp.onchange=e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();
+    r.onload=()=>{try{const blob=JSON.parse(r.result);
+      if(!blob.project){toast('Not a Pramāṇa project file','err');return;}
+      blob.id=uid();localStorage.setItem(PKEY(blob.id),JSON.stringify(blob));
+      let idx=listProjects();idx.unshift({id:blob.id,title:blob.project.title||'Imported review',question:blob.project.question||'',
+        updatedAt:new Date().toISOString(),counts:{total:(blob.refs||[]).length,incl:0,screened:0}});writeIndex(idx);
+      renderHome();toast('Project imported','ok');
+    }catch(err){toast('Could not read file: '+err.message,'err');}};
+    r.readAsText(f);};
+  inp.click();
+}
+window.goHome=goHome;window.openWorkspace=openWorkspace;window.renderHome=renderHome;window.importProjectFile=importProjectFile;
+
+/* ===================== GRADE — certainty of evidence ===================== */
+const GRADE_DOMAINS=[
+  {k:'rob',label:'Risk of bias',dir:'down',help:'Study limitations across included studies'},
+  {k:'incons',label:'Inconsistency',dir:'down',help:'Unexplained heterogeneity / inconsistent results'},
+  {k:'indirect',label:'Indirectness',dir:'down',help:'Differences in population, intervention, comparator, or outcome'},
+  {k:'imprec',label:'Imprecision',dir:'down',help:'Wide CIs / few events / small sample'},
+  {k:'pubbias',label:'Publication bias',dir:'down',help:'Suspected selective publication'}
+];
+const GRADE_UP=[
+  {k:'large',label:'Large effect'},
+  {k:'doseresp',label:'Dose–response gradient'},
+  {k:'confound',label:'Plausible confounding would reduce effect'}
+];
+function startGrade(){return {start:'high',rob:0,incons:0,indirect:0,imprec:0,pubbias:0,large:0,doseresp:0,confound:0,note:''};}
+function gradeLevel(o){
+  const order=['very low','low','moderate','high'];
+  let idx=o.start==='low'?1:3; // RCT=high(3), observational=low(1)
+  idx-=(o.rob+o.incons+o.indirect+o.imprec+o.pubbias);
+  idx+=(o.large+o.doseresp+o.confound);
+  idx=Math.max(0,Math.min(3,idx));
+  return order[idx];
+}
+function ensureGradeRows(){
+  if(!ST.grade)ST.grade=[];
+  // seed one row per distinct outcome already in effects, else a default
+  if(!ST.grade.length){
+    const outs=[...new Set((ST.effects||[]).map(e=>e.sub).filter(Boolean))];
+    (outs.length?outs:['Primary outcome']).forEach(o=>ST.grade.push(Object.assign({outcome:o,nStudies:'',nPart:''},startGrade())));
+  }
+}
+async function autoGradeAll(mode) {
+  const inc = extractionRefs();
+  if(!inc.length || !ST.effects.length) { toast('Need both included extraction studies and meta-analysis effects to Auto-GRADE','err'); return; }
+  
+  if (mode === 'ai') {
+    agentBusy(true);
+    let robSummary = '';
+    let highRob = 0, totalRob = 0;
+    inc.forEach(r => {
+      if(r.quality && r.quality.overall) {
+        totalRob++;
+        if(r.quality.overall === 'high') highRob++;
+      }
+    });
+    robSummary = `RoB Summary: ${totalRob} studies assessed, ${highRob} are high risk overall.`;
+    
+    for(const g of ST.grade) {
+      if(!g.outcome) continue;
+      const matchData = ST.effects.filter(e => isFinite(e.es) && isFinite(e.se) && e.se > 0 && (!e.sub || e.sub.toLowerCase() === g.outcome.toLowerCase() || g.outcome === 'Primary outcome'));
+      let poolStats = null;
+      if (matchData.length >= 2) {
+         const d = matchData.map(e=>({y:e.es,se:e.se,w:1/(e.se*e.se)}));
+         poolStats = poolGroup(d, document.getElementById('ma-model')?document.getElementById('ma-model').value:'random');
+      }
+      const prompt = `Assess GRADE certainty of evidence for outcome "${g.outcome}".\nMeta-analysis: ${poolStats?`I2=${poolStats.I2.toFixed(1)}%, Pooled=${poolStats.pooled.toFixed(2)} [95% CI ${poolStats.lo.toFixed(2)}, ${poolStats.hi.toFixed(2)}], Studies=${poolStats.n}`:'No pooled data'}\nIncluded studies: ${inc.length}\n${robSummary}\nProvide judgments for downgrade/upgrade domains. Return ONLY JSON: {"start":"high|low","rob":0|1|2,"incons":0|1|2,"indirect":0|1|2,"imprec":0|1|2,"pubbias":0|1|2,"large":0|1,"doseresp":0|1,"confound":0|1}`;
+      try {
+        const res = parseJSON(await LLM(prompt, 500, ST.agent.advModel));
+        Object.assign(g, res);
+      } catch(e) {}
+    }
+    agentBusy(false);
+  } else {
+    let highRob = 0, totalRob = 0;
+    inc.forEach(r => {
+      if(r.quality && r.quality.overall) {
+        totalRob++;
+        if(r.quality.overall === 'high') highRob++;
+      }
+    });
+    const robDowngrade = (totalRob > 0 && (highRob / totalRob) > 0.6) ? 2 : (totalRob > 0 && (highRob / totalRob) > 0.3) ? 1 : 0;
+
+    ST.grade.forEach(g => {
+      let poolStats = null;
+      if (g.outcome) {
+        const matchData = ST.effects.filter(e => isFinite(e.es) && isFinite(e.se) && e.se > 0 && (!e.sub || e.sub.toLowerCase() === g.outcome.toLowerCase() || g.outcome === 'Primary outcome'));
+        if (matchData.length >= 2) {
+           const d = matchData.map(e=>({y:e.es,se:e.se,w:1/(e.se*e.se)}));
+           poolStats = poolGroup(d, document.getElementById('ma-model')?document.getElementById('ma-model').value:'random');
+        }
+      }
+      
+      let hasRCTs = false;
+      inc.forEach(r => { if(r.quality && r.quality.tool && (r.quality.tool.includes('RoB 2') || r.quality.tool.includes('JBI'))) hasRCTs = true; });
+      g.start = hasRCTs ? 'high' : 'low';
+      g.rob = robDowngrade;
+      
+      if (poolStats) {
+        if (poolStats.I2 > 75) g.incons = 2; else if (poolStats.I2 > 50) g.incons = 1; else g.incons = 0;
+        const measure = ST.project.measure || 'or';
+        const crossesNull = (poolStats.lo < 0 && poolStats.hi > 0);
+        const wideCI = Math.abs(poolStats.hi - poolStats.lo) > (measure === 'md' ? 5 : 1.0);
+        if (crossesNull && wideCI) g.imprec = 2; else if (crossesNull || wideCI) g.imprec = 1; else g.imprec = 0;
+        g.pubbias = poolStats.n > 10 ? 1 : 0;
+        if (g.start === 'low' && Math.abs(poolStats.pooled) > (measure === 'md' ? 2 : 0.693)) g.large = 1; else g.large = 0;
+      } else {
+        g.incons = 0; g.imprec = 0; g.pubbias = 0; g.large = 0;
+      }
+      g.indirect = 0; g.doseresp = 0; g.confound = 0;
+    });
+  }
+  
+  save(); renderGrade(); toast(`Auto-GRADE calculated using ${mode==='ai'?'Viveka AI':'local heuristics'}! Review manually.`,'ok');
+}
+
+function renderGrade(){
+  ensureGradeRows();
+  const lvlCol={'high':'var(--inc)','moderate':'var(--flow)','low':'var(--maybe)','very low':'var(--exc)'};
+  document.getElementById('pane-grade').innerHTML=
+  '<div class="pane-h"><div class="eyebrow">Phase 11 \u2014 certainty</div>'+
+    '<h1>\u25c6 GRADE</h1>'+
+    '<p>Rate the certainty of evidence for each outcome. Start High (RCTs) or Low (observational), then rate down for the five concerns or up for the three strengthening factors. The level updates automatically.</p></div>'+
+  '<div class="banner info"><span class="bi">\u24d8</span><div>For each downgrade domain choose 0 (no concern), \u22121 (serious) or \u22122 (very serious). Upgrade factors apply mainly to observational evidence. This produces a transparent, editable Summary-of-Findings grade \u2014 you remain the judge.</div></div>'+
+  '<div style="margin-bottom:14px">'+
+    '<button class="btn flow sm" onclick="autoGradeAll(\'ai\')">\u2728 Auto-GRADE (Viveka AI - uses credits)</button> '+
+    '<button class="btn gh sm" onclick="autoGradeAll(\'heuristic\')">\u2699 Auto-GRADE (Local Heuristic - free)</button> '+
+    '<span class="muted" style="font-size:12px;margin-left:8px">Calculates certainty from Meta-analysis results and RoB matrix.</span>'+
+  '</div>'+
+  ST.grade.map((g,i)=>gradeCard(g,i,lvlCol)).join('')+
+  '<div class="row" style="margin-top:16px">'+
+    '<button class="btn gh sm" onclick="addGradeRow()">+ Add outcome</button>'+
+    '<button class="btn gh sm" style="margin-left:8px" onclick="exportGradeCSV()">\u2b07 Export Excel (.csv)</button>'+
+    '<span class="spacer"></span><button class="btn" onclick="ASRMA.go(\'report\')">Continue to report \u2192</button>'+
+  '</div>';
+}
+function gradeCard(g,i,lvlCol){
+  const lvl=gradeLevel(g);
+  const sel=(k,opts)=>'<select class="inp" style="width:auto" onchange="setGrade('+i+',\''+k+'\',this.value)">'+
+    opts.map(o=>'<option value="'+o[0]+'" '+(String(g[k])===String(o[0])?'selected':'')+'>'+o[1]+'</option>').join('')+'</select>';
+  return '<div class="card"><div class="card-h" style="align-items:center">'+
+    '<input class="inp" style="max-width:300px;font-weight:700" value="'+esc(g.outcome||'')+'" onchange="setGrade('+i+',\'outcome\',this.value)" placeholder="Outcome name">'+
+    '<span class="spacer"></span>'+
+    '<span class="pill" style="background:'+lvlCol[lvl]+';color:#fff;font-size:12px;letter-spacing:1px">'+('\u2295'.repeat({'high':4,'moderate':3,'low':2,'very low':1}[lvl])+'\u2296'.repeat(4-{'high':4,'moderate':3,'low':2,'very low':1}[lvl]))+' '+lvl.toUpperCase()+'</span>'+
+    '<button class="vbtn exc" style="margin-left:8px" onclick="rmGradeRow('+i+')">\u00d7</button></div>'+
+    '<div class="grid2" style="margin-bottom:12px">'+
+      '<div class="fg"><label class="fl">No. of studies</label><input class="inp" value="'+esc(g.nStudies||'')+'" onchange="setGrade('+i+',\'nStudies\',this.value)"></div>'+
+      '<div class="fg"><label class="fl">No. of participants</label><input class="inp" value="'+esc(g.nPart||'')+'" onchange="setGrade('+i+',\'nPart\',this.value)"></div>'+
+    '</div>'+
+    '<div class="row" style="margin-bottom:10px"><label class="fl" style="margin:0">Starting certainty</label>'+
+      sel('start',[['high','High (RCTs)'],['low','Low (observational)']])+'</div>'+
+    '<table class="tbl"><thead><tr><th>Downgrade for\u2026</th><th style="width:160px">Rating</th></tr></thead><tbody>'+
+      GRADE_DOMAINS.map(dm=>'<tr><td><b style="font-family:var(--ff)">'+dm.label+'</b><div class="muted">'+dm.help+'</div></td>'+
+        '<td>'+sel(dm.k,[[0,'0 \u2014 no concern'],[1,'\u22121 serious'],[2,'\u22122 very serious']])+'</td></tr>').join('')+
+    '</tbody></table>'+
+    '<div class="card-h" style="margin:14px 0 6px;font-size:12px">Upgrade (observational evidence)</div>'+
+    '<div class="row">'+GRADE_UP.map(u=>'<label class="row" style="gap:6px"><input type="checkbox" '+(g[u.k]?'checked':'')+' onchange="setGrade('+i+',\''+u.k+'\',this.checked?1:0)"> '+u.label+'</label>').join('')+'</div>'+
+    '<div class="fg" style="margin-top:12px"><label class="fl">Notes / explanation</label><textarea class="inp" onchange="setGrade('+i+',\'note\',this.value)" placeholder="Reason for each downgrade/upgrade decision\u2026">'+esc(g.note||'')+'</textarea></div>'+
+  '</div>';
+}
+function setGrade(i,k,v){if(!ST.grade[i])return;
+  if(['rob','incons','indirect','imprec','pubbias','large','doseresp','confound'].includes(k))v=parseInt(v)||0;
+  ST.grade[i][k]=v;save();
+  // re-render just this card's badge cheaply by full re-render (few rows, fine)
+  renderGrade();renderSpine();}
+function addGradeRow(){ensureGradeRows();ST.grade.push(Object.assign({outcome:'New outcome',nStudies:'',nPart:''},startGrade()));save();renderGrade();}
+function rmGradeRow(i){ST.grade.splice(i,1);save();renderGrade();}
+window.renderGrade=renderGrade;window.setGrade=setGrade;window.addGradeRow=addGradeRow;window.rmGradeRow=rmGradeRow;window.gradeLevel=gradeLevel;
+
+/* ===================== PDF / TEXT ATTACHMENT (full text) ===================== */
+let _pdfjsLoading=null;
+function loadPDFJS(){
+  if(window.pdfjsLib)return Promise.resolve(window.pdfjsLib);
+  if(_pdfjsLoading)return _pdfjsLoading;
+  _pdfjsLoading=new Promise((res,rej)=>{
+    const s=document.createElement('script');
+    s.src='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js';
+    s.onload=()=>{try{window.pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';res(window.pdfjsLib);}catch(e){rej(e);}};
+    s.onerror=()=>rej(new Error('Could not load PDF reader (offline or blocked)'));
+    document.head.appendChild(s);
+  });
+  return _pdfjsLoading;
+}
+async function extractPDFText(file){
+  const lib=await loadPDFJS();
+  const buf=await file.arrayBuffer();
+  const pdf=await lib.getDocument({data:buf}).promise;
+  let text='';
+  const max=Math.min(pdf.numPages,60);
+  for(let p=1;p<=max;p++){const page=await pdf.getPage(p);const c=await page.getTextContent();
+    text+=c.items.map(it=>it.str).join(' ')+'\n';}
+  return text.replace(/\s+/g,' ').trim();
+}
+function attachFullText(id){
+  const inp=document.createElement('input');inp.type='file';inp.accept='.pdf,.txt,.text,.png,.jpg,.jpeg,.webp,.tif,.tiff';
+  inp.onchange=async e=>{const f=e.target.files[0];if(!f)return;
+    const r=refById(id);if(!r)return;r.ft=r.ft||{};
+    toast((BK.isServer()?'Uploading to server: ':'Reading ')+f.name+'\u2026','ok');
+    try{
+      if(BK.isServer()&&ST.id){
+        if(typeof _srvTimer!=='undefined'&&_srvTimer)await serverSaveNow();
+        const fd=new FormData();fd.append('file',f);
+        const out=await BK.upload('/api/projects/'+ST.id+'/refs/'+id+'/fulltext/upload',fd,180000);
+        r.ft=Object.assign({},r.ft||{},out.ft||{});
+        if(out.version)BK.version=out.version;
+        renderFulltext();renderSpine();setSyncState('saved');
+        toast('Server extracted '+(out.chars||0).toLocaleString()+' chars from '+f.name,'ok');
+        if(r.ft.fileId)openPdfViewer(id);
+      }else{
+        let text='';
+        if(/\.pdf$/i.test(f.name)){text=await extractPDFText(f);}
+        else{text=await f.text();}
+        if(!text||text.length<40){toast('Could not extract usable text (scanned PDF?). Try pasting text instead.','err');}
+        r.ft.pdfText=text;r.ft.pdfName=f.name;r.ft.retrieved=true;
+        save();renderFulltext();
+        toast('Attached '+f.name+' \u2014 '+text.length.toLocaleString()+' chars of text','ok');
+      }
+    }catch(err){toast('Attach failed: '+err.message,'err');}
+  };
+  inp.click();
+}
+function pasteFullText(id){
+  const r=refById(id);if(!r)return;r.ft=r.ft||{};
+  modal('<div class="modal-h">\ud83d\udcc4 Paste full text<button class="x" onclick="closeModal()">\u00d7</button></div>'+
+  '<div class="modal-b"><div class="banner info" style="margin-bottom:12px"><span class="bi">\u24d8</span><div>Paste the article text (from the PDF or publisher page). It\u2019s used for full-text eligibility and data extraction \u2014 stored only in this browser.</div></div>'+
+    '<textarea class="inp" id="ft-paste" style="min-height:260px" placeholder="Paste the full text here\u2026">'+esc((r.ft&&r.ft.pdfText)||'')+'</textarea></div>'+
+  '<div class="modal-f"><button class="btn gh" onclick="closeModal()">Cancel</button>'+
+    '<button class="btn" onclick="savePastedText(\''+id+'\')">Save text</button></div>');
+}
+function savePastedText(id){const r=refById(id);if(!r)return;r.ft=r.ft||{};
+  r.ft.pdfText=document.getElementById('ft-paste').value.trim();r.ft.pdfName='pasted text';r.ft.retrieved=true;
+  save();closeModal();renderFulltext();toast('Text saved ('+r.ft.pdfText.length.toLocaleString()+' chars)','ok');}
+function pdfFileUrl(r){
+  if(!(window.BK&&BK.isServer&&BK.isServer()&&ST.id&&r&&r.ft&&r.ft.fileId))return '';
+  return '/api/projects/'+encodeURIComponent(ST.id)+'/files/'+encodeURIComponent(r.ft.fileId);
+}
+function closePdfViewer(){
+  const p=document.getElementById('pdf-viewer-panel');
+  if(p)p.remove();
+}
+function pdfViewerDecision(id,dec){
+  ftDecide(id,dec);
+  const badge=document.getElementById('pdf-viewer-decision');
+  if(badge)badge.textContent=dec;
+}
+function openPdfViewer(id){
+  const r=refById(id);
+  const url=pdfFileUrl(r);
+  if(!url){toast('No attached PDF is available for this study yet','err');return;}
+  closePdfViewer();
+  const panel=document.createElement('div');
+  panel.id='pdf-viewer-panel';
+  panel.style.cssText='position:fixed;inset:0;z-index:9999;background:rgba(15,23,42,.38);display:flex;justify-content:flex-end;';
+  panel.innerHTML=`<div style="width:min(980px,88vw);height:100%;background:#0f172a;box-shadow:-24px 0 60px rgba(15,23,42,.35);display:flex;flex-direction:column">
+    <div style="display:flex;align-items:center;gap:10px;padding:12px 16px;background:#111827;color:white;border-bottom:1px solid rgba(255,255,255,.12)">
+      <div style="font-weight:800;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:52vw">${esc((r.ft&&r.ft.pdfName)||r.title||'Attached PDF')}</div>
+      <span id="pdf-viewer-decision" style="border:1px solid rgba(255,255,255,.2);border-radius:999px;padding:4px 9px;color:#c7d2fe;font-size:12px">${esc((r.ft&&r.ft.decision)||'not assessed')}</span>
+      <span style="flex:1"></span>
+      <button class="btn gh sm" onclick="ftScreen('${id}','cloud').then(()=>{renderFulltextList();renderFTStats();})">Viveka Cloud</button>
+      <button class="btn gh sm" onclick="ftScreen('${id}','local').then(()=>{renderFulltextList();renderFTStats();})">Viveka Local</button>
+      <button class="btn flow sm" onclick="pdfViewerDecision('${id}','include')">Include</button>
+      <button class="btn danger gh sm" onclick="pdfViewerDecision('${id}','exclude')">Exclude</button>
+      <a class="btn gh sm" href="${url}" target="_blank" rel="noopener">New tab</a>
+      <button class="btn gh sm" onclick="closePdfViewer()">Close</button>
+    </div>
+    <iframe src="${url}#toolbar=1&navpanes=0" title="Attached PDF" style="border:0;flex:1;width:100%;background:#1f2937"></iframe>
+  </div>`;
+  panel.addEventListener('click',e=>{if(e.target===panel)closePdfViewer();});
+  document.body.appendChild(panel);
+}
+window.attachFullText=attachFullText;window.pasteFullText=pasteFullText;window.savePastedText=savePastedText;window.extractPDFText=extractPDFText;
+window.openPdfViewer=openPdfViewer;window.closePdfViewer=closePdfViewer;window.pdfViewerDecision=pdfViewerDecision;
+
+/* ===================== TEAM BATCHES (file-based collaboration, no server) =====================
+   Split studies into reviewer batches -> export a small file per reviewer ->
+   each reviewer screens in their own browser (batch mode) -> send file back ->
+   lead imports & merges decisions, with conflict detection on overlapping items. */
+
+function teamBatchModal(){
+  if(BK.isServer()) return serverTeamSplitModal();
+  const uniq=ST.refs.filter(r=>!r.dup);
+  const assigned=uniq.filter(r=>r._batch).length;
+  const team=ST.team.length?ST.team:[];
+  modal('<div class="modal-h">👥 Team &amp; batches<button class="x" onclick="closeModal()">×</button></div>'+
+  '<div class="modal-b">'+
+    '<div class="banner info" style="margin-bottom:14px"><span class="bi">🤝</span><div><b>Share screening with your students — no server needed.</b><br>'+
+      '<b>1.</b> Add reviewers &amp; <b>Split</b> the studies below &nbsp;→&nbsp; <b>2.</b> Download each reviewer\u2019s <b>batch file</b> and send it to them &nbsp;→&nbsp; <b>3.</b> They open Pram\u0101\u1e47a \u2192 <b>\u229c Screen a batch</b>, screen, and send the file back &nbsp;→&nbsp; <b>4.</b> You <b>Merge</b> their file here. Overlap lets two reviewers screen the same papers to check agreement.</div></div>'+
+
+    '<div class="card-h" style="margin-bottom:8px">Reviewers</div>'+
+    (team.length?team.map((m,i)=>'<div class="row" style="margin-bottom:6px"><b>'+esc(m.name)+'</b><span class="pill s">'+esc(m.role)+'</span><span class="muted">'+esc(m.email||'')+'</span></div>').join(''):'<div class="muted" style="margin-bottom:8px">No reviewers yet — add them below.</div>')+
+    '<div class="row" style="margin:8px 0 16px"><input class="inp" id="tb-name" placeholder="Reviewer name" style="max-width:200px"><input class="inp" id="tb-email" placeholder="email (optional)" style="max-width:200px"><button class="btn gh sm" onclick="tbAddReviewer()">+ Add reviewer</button></div>'+
+
+    '<div class="divider"></div>'+
+    '<div class="card-h" style="margin-bottom:8px">Split into batches</div>'+
+    '<div class="row" style="margin-bottom:10px">'+
+      '<label class="fl" style="margin:0">Reviewers to split across</label>'+
+      '<input class="inp" id="tb-n" type="number" min="1" value="'+Math.max(1,team.length||2)+'" style="width:70px">'+
+      '<label class="fl" style="margin:0">Double-screen overlap</label>'+
+      '<select class="inp" id="tb-ov" style="width:auto"><option value="0">none (faster)</option><option value="0.2">20% overlap</option><option value="1">100% (every paper twice)</option></select>'+
+      '<button class="btn flow sm" onclick="tbSplit()">Split '+uniq.length+' studies</button>'+
+    '</div>'+
+    '<div id="tb-batches" class="muted">'+(assigned?assigned+' of '+uniq.length+' studies currently assigned to batches.':'Not split yet.')+'</div>'+
+
+    '<div class="divider"></div>'+
+    '<div class="card-h" style="margin-bottom:8px">Merge a completed batch</div>'+
+    '<div class="banner warn" style="margin-bottom:10px"><span class="bi">⬆</span><div>When a reviewer sends back their batch file, import it here. Their decisions are merged in; if two reviewers disagreed on an overlapping paper, it’s flagged as a <b>conflict</b> for you to resolve.</div></div>'+
+    '<button class="btn" onclick="tbImportBatch()">⬆ Import completed batch file</button>'+
+    '<div id="tb-merge" style="margin-top:10px"></div>'+
+    (tbConflicts().length?'<div class="row" style="margin-top:10px"><button class="btn gh sm" onclick="closeModal();SCREEN_FILTER=\'conflict\';renderScreen()">View '+tbConflicts().length+' conflicts →</button></div>':'')+
+  '</div>'+
+  '<div class="modal-f"><button class="btn gh" onclick="closeModal()">Close</button></div>');
+  renderBatchList();
+}
+function tbAddReviewer(){const n=document.getElementById('tb-name').value.trim();if(!n){toast('Enter a name','err');return;}
+  ST.team.push({name:n,email:document.getElementById('tb-email').value.trim(),role:'Reviewer'});save();renderTeam();teamBatchModal();}
+function batchNames(){
+  const t=ST.team.length?ST.team.map(m=>m.name):[];
+  return t;
+}
+function tbSplit(){
+  const uniq=ST.refs.filter(r=>!r.dup);
+  if(!uniq.length){toast('Import studies first','err');return;}
+  const n=Math.max(1,parseInt(document.getElementById('tb-n').value)||2);
+  const ov=parseFloat(document.getElementById('tb-ov').value)||0;
+  const names=[];for(let i=0;i<n;i++)names.push((ST.team[i]&&ST.team[i].name)||('Reviewer '+(i+1)));
+  // primary round-robin assignment
+  uniq.forEach((r,i)=>{r._batch=[names[i%n]];});
+  // overlap: assign a second reviewer to a fraction (or all) of papers
+  if(ov>0&&n>1){
+    uniq.forEach((r,i)=>{
+      const take = ov>=1 ? true : ((i*2654435761>>>0)%1000)/1000 < ov; // deterministic pseudo-random
+      if(take){const second=names[(i+1)%n];if(!r._batch.includes(second))r._batch.push(second);}
+    });
+  }
+  save();renderBatchList();
+  toast('Split into '+n+' batches'+(ov>0?(ov>=1?' with full double-screening':' with ~'+Math.round(ov*100)+'% overlap'):''),'ok');
+}
+function renderBatchList(){
+  const el=document.getElementById('tb-batches');if(!el)return;
+  const uniq=ST.refs.filter(r=>!r.dup);
+  const counts={};uniq.forEach(r=>(r._batch||[]).forEach(b=>counts[b]=(counts[b]||0)+1));
+  const names=Object.keys(counts);
+  if(!names.length){el.innerHTML='<div class="muted">Not split yet.</div>';return;}
+  el.innerHTML='<table class="tbl"><thead><tr><th>Reviewer</th><th>Studies</th><th>Export</th></tr></thead><tbody>'+
+    names.map(nm=>'<tr><td><b>'+esc(nm)+'</b></td><td>'+counts[nm]+'</td>'+
+      '<td><button class="btn gh sm" onclick="tbExportBatch(\''+encodeURIComponent(nm)+'\')">⬇ batch file</button></td></tr>').join('')+
+    '</tbody></table>'+
+    '<div class="muted" style="margin-top:8px">Send each reviewer their batch file. They open the same Pramāṇa link, choose <b>Open a batch to screen</b> on the home screen, screen their studies, then export and send back.</div>';
+}
+function tbExportBatch(encName){
+  const name=decodeURIComponent(encName);
+  const studies=ST.refs.filter(r=>!r.dup&&(r._batch||[]).includes(name))
+    .map(r=>({id:r.id,title:r.title,abstract:r.abstract,authors:r.authors,year:r.year,journal:r.journal,doi:r.doi,source:r.source,ta:null}));
+  const batch={_pramana_batch:true,project:ST.project.title||'Review',projectId:ST.id,
+    reviewer:name,question:ST.project.question,pico:{p:ST.project.p,i:ST.project.i,c:ST.project.c,o:ST.project.o},
+    inc:ST.project.inc,exc:ST.project.exc,createdAt:new Date().toISOString(),studies};
+  const b=new Blob([JSON.stringify(batch,null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);
+  a.download=(ST.project.title||'review').replace(/\W+/g,'_')+'__'+name.replace(/\W+/g,'_')+'_batch.json';a.click();
+  toast('Batch for '+name+' exported','ok');
+}
+function tbImportBatch(){
+  const inp=document.createElement('input');inp.type='file';inp.accept='.json';
+  inp.onchange=e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();
+    r.onload=()=>{try{const b=JSON.parse(r.result);
+      if(!b._pramana_batch){toast('Not a Pramāṇa batch file','err');return;}
+      mergeBatch(b);
+    }catch(err){toast('Could not read file: '+err.message,'err');}};
+    r.readAsText(f);};
+  inp.click();
+}
+function mergeBatch(b){
+  let merged=0,conflicts=0,skipped=0;
+  (b.studies||[]).forEach(s=>{
+    if(!s.ta||!s.ta.final)return; // reviewer didn't decide this one
+    const r=refById(s.id);if(!r){skipped++;return;}
+    r.reviews=r.reviews||{};
+    r.reviews[b.reviewer]={final:s.ta.final,at:b.createdAt};
+    // determine combined state
+    const verdicts=Object.values(r.reviews).map(v=>v.final);
+    const uniqV=[...new Set(verdicts)];
+    if(uniqV.length>1){r._conflict=true;conflicts++;
+      // leave r.ta as-is (lead resolves); mark for review
+      if(!r.ta||r.ta.by!=='human'){r.ta={final:'maybe',by:'team',conf:50,reason:'conflict: '+verdicts.join(' vs '),};}
+    }else{
+      r._conflict=false;
+      r.ta={final:uniqV[0],by:'team',conf:100,reason:'reviewer'+(verdicts.length>1?'s agree':'')+': '+b.reviewer,reviewedBy:Object.keys(r.reviews).join(', ')};
+    }
+    merged++;
+  });
+  save();
+  const el=document.getElementById('tb-merge');
+  if(el)el.innerHTML='<div class="banner '+(conflicts?'warn':'info')+'"><span class="bi">'+(conflicts?'⚠':'✓')+'</span><div>'+
+    'Merged <b>'+merged+'</b> decisions from <b>'+esc(b.reviewer)+'</b>. '+
+    (conflicts?('<b>'+conflicts+'</b> conflict'+(conflicts>1?'s':'')+' with another reviewer — flagged for you to resolve.'):'No conflicts.')+
+    (skipped?(' '+skipped+' studies not in this project were skipped.'):'')+'</div></div>';
+  renderSpine();
+  toast('Merged '+merged+' decisions'+(conflicts?(' — '+conflicts+' conflicts'):''),conflicts?'err':'ok');
+}
+function tbConflicts(){return ST.refs.filter(r=>!r.dup&&r._conflict);}
+function reviewerProgress(stage){
+  const members=(BK.members&&BK.members.length?BK.members:(ensureLiveSplit().ta.members||[])).slice();
+  const refs=ST.refs.filter(r=>!r.dup);
+  return members.map(m=>{
+    const assigned=refs.filter(r=>!taAssignedIds(r).length||taAssignedIds(r).includes(m.id)||taAssignedIds(r).includes(m.email));
+    const reviews=refs.filter(r=>stageReviews(r,stage).some(x=>x.reviewerId===m.id||x.email===m.email));
+    const counts={include:0,maybe:0,exclude:0};
+    reviews.forEach(r=>{const d=stageReviews(r,stage).find(x=>x.reviewerId===m.id||x.email===m.email);if(d&&counts[d.final]!=null)counts[d.final]++;});
+    return {id:m.id,name:m.name||m.email,email:m.email,role:m.role,assigned:assigned.length,reviewed:reviews.length,pending:Math.max(0,assigned.length-reviews.length),counts};
+  });
+}
+function calcIRR(stage){
+  const cats=['include','maybe','exclude'];
+  let pairs=0,agree=0;const marg={include:0,maybe:0,exclude:0};const byPair={};
+  ST.refs.filter(r=>!r.dup).forEach(r=>{
+    const rev=stageReviews(r,stage).filter(x=>cats.includes(x.final));
+    for(let i=0;i<rev.length;i++)for(let j=i+1;j<rev.length;j++){
+      const a=rev[i],b=rev[j];pairs++;if(a.final===b.final)agree++;
+      marg[a.final]++;marg[b.final]++;
+      const key=[a.reviewer||a.email||a.reviewerId,b.reviewer||b.email||b.reviewerId].sort().join(' / ');
+      byPair[key]=byPair[key]||{n:0,agree:0};byPair[key].n++;if(a.final===b.final)byPair[key].agree++;
+    }
+  });
+  const po=pairs?agree/pairs:0;
+  const denom=pairs*2||1;
+  const pe=cats.reduce((s,c)=>s+Math.pow(marg[c]/denom,2),0);
+  const k=pe<1?(po-pe)/(1-pe):0;
+  return {pairs,agreePct:pairs?Math.round(po*100):0,kappa:pairs?Number(k.toFixed(3)):null,byPair};
+}
+function showConsensusModal(stage){
+  stage=stage||'ta';
+  const irr=calcIRR(stage);
+  const conflicts=ST.refs.filter(r=>!r.dup&&r[conflictFlag(stage)]);
+  const progress=reviewerProgress(stage);
+  const progRows=progress.map(p=>`<tr><td><b>${esc(p.name||'')}</b><br><span class="muted">${esc(p.email||'')}</span></td><td>${p.assigned}</td><td>${p.reviewed}</td><td>${p.pending}</td><td>${p.counts.include}/${p.counts.maybe}/${p.counts.exclude}</td><td><div class="prog-mini" style="max-width:130px"><i style="width:${p.assigned?Math.round(p.reviewed/p.assigned*100):0}%"></i></div></td></tr>`).join('');
+  const conflictRows=conflicts.map(r=>`<tr><td><b>${esc(r.title||'')}</b><br><span class="muted">${esc((r.authors||'').split(';')[0]||'')} ${esc(r.year||'')}</span></td><td>${stageReviews(r,stage).map(x=>`<div><b>${esc(x.reviewer||x.email||'reviewer')}</b>: ${esc(x.final)}${x.comment?`<br><span class="muted">${esc(x.comment)}</span>`:''}</div>`).join('')}</td><td><button class="btn gh sm" onclick="resolveConsensus('${stage}','${r.id}','include')">Include</button> <button class="btn gh sm" onclick="resolveConsensus('${stage}','${r.id}','maybe')">Maybe</button> <button class="btn gh sm" onclick="resolveConsensus('${stage}','${r.id}','exclude')">Exclude</button></td></tr>`).join('');
+  const pairRows=Object.keys(irr.byPair).map(k=>`<tr><td>${esc(k)}</td><td>${irr.byPair[k].n}</td><td>${Math.round(irr.byPair[k].agree/irr.byPair[k].n*100)}%</td></tr>`).join('');
+  modal(`<div class="modal-h">Consensus, reviewer progress & IRR<button class="x" onclick="closeModal()">x</button></div>
+  <div class="modal-b" style="max-width:980px">
+    <div class="tiles" style="grid-template-columns:repeat(4,minmax(0,1fr))">
+      <div class="tile"><div class="v">${conflicts.length}</div><div class="k">open conflicts</div></div>
+      <div class="tile flow"><div class="v">${irr.pairs}</div><div class="k">double-screen pairs</div></div>
+      <div class="tile inc"><div class="v">${irr.agreePct}%</div><div class="k">agreement</div></div>
+      <div class="tile syn"><div class="v">${irr.kappa==null?'-':irr.kappa}</div><div class="k">kappa / IRR</div></div>
+    </div>
+    <h3>Reviewer progress</h3>
+    <table class="tbl"><thead><tr><th>Reviewer</th><th>Assigned</th><th>Reviewed</th><th>Pending</th><th>I/M/E</th><th>Progress</th></tr></thead><tbody>${progRows||'<tr><td colspan="6">No reviewers found.</td></tr>'}</tbody></table>
+    <h3 style="margin-top:18px">Conflicts needing consensus</h3>
+    <table class="tbl"><thead><tr><th>Study</th><th>Reviewer decisions</th><th>Resolve</th></tr></thead><tbody>${conflictRows||'<tr><td colspan="3">No open conflicts.</td></tr>'}</tbody></table>
+    <h3 style="margin-top:18px">Pairwise agreement</h3>
+    <table class="tbl"><thead><tr><th>Reviewer pair</th><th>Overlaps</th><th>Agreement</th></tr></thead><tbody>${pairRows||'<tr><td colspan="3">No double-screened studies yet.</td></tr>'}</tbody></table>
+  </div><div class="modal-f"><button class="btn gh" onclick="closeModal()">Close</button></div>`);
+}
+function applyReviewerWorkflowSettings(){
+  const wf=ensureReviewWorkflow().ta;
+  wf.blind=!!(document.getElementById('rw-blind')||{}).checked;
+  wf.requireExcludeReason=!!(document.getElementById('rw-reason')||{}).checked;
+  wf.minReviewers=Math.max(1,Math.min(5,parseInt((document.getElementById('rw-min')||{}).value||2)));
+  saveNow();toast('Reviewer workflow settings saved','ok');serverTeamSplitModal();
+}
+window.teamBatchModal=teamBatchModal;window.tbAddReviewer=tbAddReviewer;window.tbSplit=tbSplit;
+window.tbExportBatch=tbExportBatch;window.tbImportBatch=tbImportBatch;window.renderBatchList=renderBatchList;window.tbConflicts=tbConflicts;
+window.showConsensusModal=showConsensusModal;window.resolveConsensus=resolveConsensus;window.applyReviewerWorkflowSettings=applyReviewerWorkflowSettings;
+
+async function fetchProjectMembers(){
+  if(!BK.isServer()||!ST.id) return [];
+  const r=await BK.api('GET','/api/projects/'+ST.id+'/members');
+  BK.members=(r.members||[]).slice();
+  return BK.members;
+}
+async function serverTeamSplitModal(){
+  modal('<div class="modal-h">👥 Team allocation<button class="x" onclick="closeModal()">×</button></div><div class="modal-b"><div class="muted">Loading team members…</div></div>');
+  const members=await fetchProjectMembers();
+  const active=loadLiveSplitDefaults(members);
+  const editable=BK.role==='owner'||BK.role==='editor';
+  const uniq=ST.refs.filter(r=>!r.dup);
+  const pending=uniq;
+  const overlap=ensureLiveSplit().ta.overlap||0;
+  const wf=ensureReviewWorkflow().ta;
+  const irr=calcIRR('ta');
+  const progress=reviewerProgress('ta');
+  const progressRows=progress.map(p=>'<tr><td><b>'+esc(p.name||'')+'</b><div class="muted">'+esc(p.email||'')+'</div></td><td>'+p.assigned+'</td><td>'+p.reviewed+'</td><td>'+p.pending+'</td><td>'+p.counts.include+'/'+p.counts.maybe+'/'+p.counts.exclude+'</td></tr>').join('');
+  const conflictCount=uniq.filter(r=>r._conflict).length;
+  modal('<div class="modal-h">👥 Team allocation<button class="x" onclick="closeModal()">×</button></div>'+
+  '<div class="modal-b">'+
+    '<div class="banner info" style="margin-bottom:14px"><span class="bi">🤝</span><div><b>Live shared allocation for this project.</b><br>Set what percentage of the screening queue each current project member should review. The assignment is saved inside the shared project, syncs to everyone, and each reviewer can switch to <b>My assigned only</b>.</div></div>'+
+    '<div class="row" style="margin-bottom:12px"><span class="pill f">Members in project: '+members.length+'</span><span class="pill s">Queue being allocated: '+pending.length+'</span><span class="pill">Allocated in queue: '+pending.filter(r=>taAssignedIds(r).length).length+'</span></div>'+
+    '<div class="card-h" style="margin-bottom:8px">Percentage split</div>'+
+    (!active.length?'<div class="muted">No project members found yet.</div>':
+      '<table class="tbl"><thead><tr><th>Member</th><th>Role</th><th style="width:120px">Percent</th><th style="width:110px">Current count</th></tr></thead><tbody>'+
+      active.map(m=>'<tr><td><b>'+esc(m.name||m.email)+'</b><div class="muted">'+esc(m.email||'')+'</div></td><td><span class="pill s">'+esc(m.role)+'</span></td>'+
+        '<td><input class="inp" id="alloc-pct-'+m.id+'" type="number" min="0" max="100" step="1" value="'+(m.pct||0)+'" '+(editable?'':'disabled')+'></td>'+
+        '<td>'+uniq.filter(r=>taAssignedIds(r).includes(m.id)).length+'</td></tr>').join('')+'</tbody></table>')+
+    '<div class="row" style="margin-top:12px">'+
+      '<label class="fl" style="margin:0">Double-screen overlap</label>'+
+      '<select class="inp" id="alloc-overlap" style="width:auto" '+(editable?'':'disabled')+'><option value="0" '+(overlap===0?'selected':'')+'>none</option><option value="0.2" '+(overlap===0.2?'selected':'')+'>20%</option><option value="0.5" '+(overlap===0.5?'selected':'')+'>50%</option><option value="1" '+(overlap===1?'selected':'')+'>100%</option></select>'+
+      '<span class="muted">Overlap adds a second reviewer to a portion of studies.</span></div>'+
+    '<div class="divider"></div>'+
+    '<div class="card-h" style="margin-bottom:8px">Reviewer workflow</div>'+
+    '<div class="row" style="gap:12px;align-items:center;margin-bottom:10px">'+
+      '<label class="check"><input id="rw-blind" type="checkbox" '+(wf.blind?'checked':'')+' '+(editable?'':'disabled')+'> Blind screening</label>'+
+      '<label class="check"><input id="rw-reason" type="checkbox" '+(wf.requireExcludeReason?'checked':'')+' '+(editable?'':'disabled')+'> Exclusion reason required</label>'+
+      '<label class="fl" style="margin:0">Minimum reviewers</label><input class="inp" id="rw-min" type="number" min="1" max="5" value="'+(wf.minReviewers||2)+'" style="width:82px" '+(editable?'':'disabled')+'>'+
+      (editable?'<button class="btn gh sm" onclick="applyReviewerWorkflowSettings()">Save workflow settings</button>':'')+
+      '<button class="btn gh sm" onclick="showConsensusModal(&quot;ta&quot;)">Open consensus & IRR</button>'+
+    '</div>'+
+    '<div class="row" style="margin-bottom:10px"><span class="pill '+(conflictCount?'x':'')+'">Conflicts: '+conflictCount+'</span><span class="pill s">Agreement: '+irr.agreePct+'%</span><span class="pill">Kappa: '+(irr.kappa==null?'-':irr.kappa)+'</span><span class="pill">Pairs: '+irr.pairs+'</span></div>'+
+    '<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>Reviewer</th><th>Assigned</th><th>Reviewed</th><th>Pending</th><th>I/M/E</th></tr></thead><tbody>'+(progressRows||'<tr><td colspan="5">No reviewer progress yet.</td></tr>')+'</tbody></table></div>'+
+    '<div id="alloc-msg" style="margin-top:12px">'+renderServerAllocationSummary(active)+'</div>'+
+  '</div>'+
+  '<div class="modal-f">'+
+    (editable?'<button class="btn gh" onclick="serverAutoBalance()">Auto-balance</button><button class="btn" onclick="applyServerSplit()">Apply live split</button>':'<span class="muted">Only owners and editors can change allocation.</span>')+
+    '<button class="btn gh" onclick="closeModal()">Close</button></div>');
+}
+function renderServerAllocationSummary(active){
+  const plan=ensureLiveSplit().ta;
+  if(!(plan.members||[]).length)return '<div class="muted">No live percentage plan saved yet.</div>';
+  return '<div class="banner info"><span class="bi">✓</span><div>Saved by <b>'+esc(plan.updatedBy||'a collaborator')+'</b> on '+esc(plan.updatedAt?new Date(plan.updatedAt).toLocaleString():'')+'. '+
+    (plan.members||[]).map(m=>esc(m.name)+': '+m.pct+'%').join(' · ')+'</div></div>';
+}
+function serverAutoBalance(){
+  const members=(BK.members||[]).slice();
+  if(!members.length)return;
+  const even=Math.floor(100/members.length);
+  members.forEach((m,idx)=>{const el=document.getElementById('alloc-pct-'+m.id); if(el)el.value=(idx===members.length-1?100-even*(members.length-1):even);});
+}
+function applyServerSplit(){
+  const members=(BK.members||[]).slice();
+  if(!members.length){toast('No team members to allocate across','err');return;}
+  const pending=ST.refs.filter(r=>!r.dup);
+  if(!pending.length){toast('No pending studies to allocate','err');return;}
+  const rows=members.map(m=>({id:m.id,name:m.name||m.email,email:m.email,role:m.role,pct:Math.max(0,parseFloat((document.getElementById('alloc-pct-'+m.id)||{}).value)||0)}))
+    .filter(m=>m.pct>0);
+  const totalPct=rows.reduce((s,m)=>s+m.pct,0);
+  if(!totalPct){toast('Enter at least one non-zero percentage','err');return;}
+  rows.forEach(m=>m.share=m.pct/totalPct);
+  const total=pending.length;
+  rows.forEach(m=>{const raw=m.share*total;m.count=Math.floor(raw);m.frac=raw-m.count;});
+  let left=total-rows.reduce((s,m)=>s+m.count,0);
+  rows.slice().sort((a,b)=>b.frac-a.frac).forEach(m=>{if(left>0){m.count++;left--;}})
+  pending.forEach(r=>{r._assign=r._assign||{};r._assign.ta=[];});
+  let idx=0;
+  rows.forEach(m=>{for(let i=0;i<m.count&&idx<pending.length;i++,idx++)pending[idx]._assign.ta=[m.id];});
+  while(idx<pending.length){pending[idx]._assign.ta=[rows[idx%rows.length].id];idx++;}
+  const overlap=parseFloat(document.getElementById('alloc-overlap').value)||0;
+  if(overlap>0&&rows.length>1){
+    pending.forEach((r,i)=>{
+      const take=overlap>=1?true:(((i*2654435761>>>0)%1000)/1000<overlap);
+      if(!take)return;
+      const primary=r._assign.ta[0];
+      const pIdx=Math.max(0,rows.findIndex(m=>m.id===primary));
+      const secondary=rows[(pIdx+1)%rows.length].id;
+      if(!r._assign.ta.includes(secondary))r._assign.ta.push(secondary);
+    });
+  }
+  const plan=ensureLiveSplit().ta;
+  plan.members=rows.map(m=>({id:m.id,name:m.name,email:m.email,role:m.role,pct:m.pct,count:pending.filter(r=>taAssignedIds(r).includes(m.id)).length}));
+  plan.overlap=overlap; plan.updatedAt=new Date().toISOString(); plan.updatedBy=currentReviewerName();
+  BK.myAssignmentsOnly=true;
+  saveNow();
+  toast('Live allocation saved and synced','ok');
+  serverTeamSplitModal();
+  renderScreen();
+}
+
+/* ===================== BATCH MODE (what a student reviewer uses) ===================== */
+let BATCH=null; // loaded batch a reviewer is screening
+function openBatchToScreen(){
+  // Don't dump a file picker on people — explain what this is first.
+  modal('<div class="modal-h">⊜ Screen a batch<button class="x" onclick="closeModal()">×</button></div>'+
+  '<div class="modal-b" style="line-height:1.6">'+
+    '<div class="banner info" style="margin-bottom:14px"><span class="bi">ⓘ</span><div>This screen is <b>for reviewers / students</b>. It lets you screen a set of studies your lead assigned you — without needing an account.</div></div>'+
+    '<div class="card-h" style="margin-bottom:8px">How it works</div>'+
+    '<div class="kv"><span><b>1.</b> Your lead splits the studies and sends you a <b>batch file</b> (a .json the lead exported).</span></div>'+
+    '<div class="kv"><span><b>2.</b> You open it here, screen each study (include / maybe / exclude).</span></div>'+
+    '<div class="kv"><span><b>3.</b> You export the finished file and send it back. The lead merges everyone\u2019s work.</span></div>'+
+    '<div style="margin-top:16px" class="row">'+
+      '<button class="btn" onclick="pickBatchFile()">📂 I have a batch file — open it</button>'+
+      '<button class="btn gh" onclick="tryDemoBatch()">▶ Try it (sample batch)</button>'+
+    '</div>'+
+    '<div class="divider"></div>'+
+    '<div class="muted">Are you the <b>lead</b> instead? You don\u2019t use this — open a project, go to <b>👥 Team &amp; batches</b> in the screening step, and create the batches to hand out.</div>'+
+  '</div>'+
+  '<div class="modal-f"><button class="btn gh" onclick="closeModal()">Close</button></div>');
+}
+function pickBatchFile(){
+  const inp=document.createElement('input');inp.type='file';inp.accept='.json';
+  inp.onchange=e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();
+    r.onload=()=>{try{const b=JSON.parse(r.result);
+      if(!b._pramana_batch){toast('That file isn’t a batch file — ask your lead for the correct .json','err');return;}
+      closeModal();BATCH=b;renderBatchMode();
+    }catch(err){toast('Could not read file: '+err.message,'err');}};
+    r.readAsText(f);};
+  inp.click();
+}
+function tryDemoBatch(){
+  closeModal();
+  const samples=[
+    ['A smartphone app for blood-pressure self-management in rural India: an RCT','We randomised 240 adults with hypertension to an mHealth app vs usual care; systolic BP fell 8.4 mmHg more in the app arm.','Sharma R; Patel K','2022','Journal of Hypertension'],
+    ['Text-message reminders and adherence among hypertensive patients in Nigeria','Quasi-experimental SMS-reminder study in 180 adults; adherence and systolic BP improved at 12 weeks.','Okafor C','2021','BMC Public Health'],
+    ['Coffee consumption and cardiovascular outcomes: a cohort study','High-income cohort on coffee intake and incident CVD; no mobile-health component.','Lee J','2020','Nutrition Reviews'],
+    ['A smartphone app for type-2 diabetes self-management in the United States','RCT of a diabetes app measuring HbA1c in US adults; diabetic population, high-income setting.','Smith A','2019','Diabetes Care'],
+    ['Cluster-randomised telemonitoring for hypertension in primary care, India','App-based home-BP telemonitoring across 12 PHCs (400 patients) improved control over 9 months.','Gupta A','2021','Lancet Global Health'],
+    ['Protocol for a future mHealth hypertension trial','Describes the protocol only; no outcome data reported.','Verma P','2018','Trials']
+  ];
+  BATCH={_pramana_batch:true,demo:true,project:'DEMO — mHealth for hypertension in LMICs',reviewer:'You (demo)',
+    question:'In adults with hypertension in LMICs, do mHealth interventions vs usual care improve BP control?',
+    pico:{p:'Adults with hypertension in LMICs',i:'mHealth / app / SMS self-management',c:'Usual care',o:'Blood pressure, adherence'},
+    inc:'Randomised or quasi-experimental\nAdults with hypertension\nLMIC setting\nReports a BP or adherence outcome',
+    exc:'Protocol/abstract only\nNon-hypertensive population\nHigh-income setting\nNo mHealth component',
+    createdAt:new Date().toISOString(),
+    studies:samples.map((s,i)=>({id:'demo'+i,title:s[0],abstract:s[1],authors:s[2],year:s[3],journal:s[4],ta:null}))};
+  renderBatchMode();
+  toast('This is exactly what your students see. Try the ✓/✗ buttons, then Export.','ok');
+}
+window.pickBatchFile=pickBatchFile;window.tryDemoBatch=tryDemoBatch;
+function renderBatchMode(){
+  document.getElementById('home').classList.remove('on');
+  document.getElementById('main').style.display='none';
+  let scr=document.getElementById('batch-screen');
+  if(!scr){scr=document.createElement('div');scr.id='batch-screen';
+    scr.style.cssText='position:fixed;inset:56px 0 0 0;overflow-y:auto;background:var(--wash);z-index:30;padding:26px 30px 80px';
+    document.body.appendChild(scr);}
+  scr.style.display='block';
+  const done=BATCH.studies.filter(s=>s.ta&&s.ta.final).length;
+  scr.innerHTML='<div style="max-width:900px;margin:0 auto">'+
+    '<div class="pane-h"><div class="eyebrow">Reviewer batch · '+esc(BATCH.reviewer||'')+'</div>'+
+      '<h1>⊜ Screen your batch</h1>'+
+      '<p>Project: <b>'+esc(BATCH.project||'')+'</b>. Decide include / maybe / exclude on each study below, then export and send the file back to your lead. Your progress is saved in this browser.</p></div>'+
+    '<div class="card tight" style="position:sticky;top:0;z-index:5"><div class="row">'+
+      '<b id="bm-prog">'+done+' / '+BATCH.studies.length+' decided</b>'+
+      '<div class="pbar" style="flex:1;max-width:260px"><i id="bm-bar" style="width:'+Math.round(done/BATCH.studies.length*100)+'%"></i></div>'+
+      '<span class="spacer"></span>'+
+      '<button class="btn gh sm" onclick="batchShowCriteria()">📋 Criteria</button>'+
+      '<button class="btn flow" onclick="batchExport()">⬇ Export &amp; send back</button>'+
+      '<button class="btn gh sm" onclick="exitBatch()">Exit</button>'+
+    '</div></div>'+
+    '<div id="bm-list"></div></div>';
+  renderBatchCards();
+}
+function batchShowCriteria(){
+  modal('<div class="modal-h">📋 Eligibility criteria<button class="x" onclick="closeModal()">×</button></div>'+
+  '<div class="modal-b" style="line-height:1.6">'+
+    '<p><b>Question:</b> '+esc(BATCH.question||'—')+'</p>'+
+    (BATCH.pico?'<p><b>P:</b> '+esc(BATCH.pico.p||'—')+'<br><b>I:</b> '+esc(BATCH.pico.i||'—')+'<br><b>C:</b> '+esc(BATCH.pico.c||'—')+'<br><b>O:</b> '+esc(BATCH.pico.o||'—')+'</p>':'')+
+    '<p><b>Include if:</b><br>'+esc(BATCH.inc||'—').replace(/\n/g,'<br>')+'</p>'+
+    '<p><b>Exclude if:</b><br>'+esc(BATCH.exc||'—').replace(/\n/g,'<br>')+'</p>'+
+  '</div><div class="modal-f"><button class="btn" onclick="closeModal()">Got it</button></div>');
+}
+let BM_FILTER='all';
+function renderBatchCards(){
+  const el=document.getElementById('bm-list');if(!el)return;
+  let list=BATCH.studies;
+  el.innerHTML='<div class="toolbar"><div class="seg">'+
+    ['all','pending','include','maybe','exclude'].map(f=>'<button class="'+(BM_FILTER===f?'on':'')+'" onclick="bmFilter(\''+f+'\')">'+f[0].toUpperCase()+f.slice(1)+'</button>').join('')+
+    '</div></div>'+
+    list.filter(s=>BM_FILTER==='all'||(BM_FILTER==='pending'?!s.ta:(s.ta&&s.ta.final===BM_FILTER)))
+      .map((s,idx)=>batchCard(s,BATCH.studies.indexOf(s))).join('');
+}
+function bmFilter(f){BM_FILTER=f;renderBatchCards();}
+function batchCard(s,i){
+  const dec=s.ta&&s.ta.final;
+  return '<div class="study '+(dec||'')+'" data-bi="'+i+'">'+
+    '<div class="st-title">'+esc(s.title)+'</div>'+
+    '<div class="st-meta"><span>'+esc((s.authors||'').split(';')[0]||'—')+'</span><span>'+esc(s.year||'')+'</span><span>'+esc(s.journal||'')+'</span>'+
+      (s.doi?'<a href="https://doi.org/'+esc(s.doi)+'" target="_blank">doi ↗</a>':'')+'</div>'+
+    (s.abstract?'<div class="st-abs" onclick="this.classList.toggle(\'open\')">'+esc(s.abstract)+'</div>':'<div class="muted">No abstract</div>')+
+    '<div class="st-foot">'+
+      (dec?'<span class="dchip '+dec+'">'+(dec==='include'?'✓ Include':dec==='exclude'?'✗ Exclude':'? Maybe')+'</span>':'<span class="dchip pend">pending</span>')+
+      '<span class="spacer"></span>'+
+      '<button class="vbtn maybe '+(dec==='maybe'?'act-maybe':'')+'" onclick="bmDecide('+i+',\'maybe\',event)">?</button>'+
+      '<button class="vbtn exc '+(dec==='exclude'?'act-exc':'')+'" onclick="bmDecide('+i+',\'exclude\',event)">✗</button>'+
+      '<button class="vbtn inc '+(dec==='include'?'act-inc':'')+'" onclick="bmDecide('+i+',\'include\',event)">✓</button>'+
+    '</div></div>';
+}
+function bmDecide(i,dec,ev){
+  BATCH.studies[i].ta={final:dec,by:'reviewer',at:new Date().toISOString()};
+  try{localStorage.setItem('asrma_batch_'+(BATCH.projectId||'x')+'_'+(BATCH.reviewer||'r'),JSON.stringify(BATCH));}catch(e){}
+  const card=ev&&ev.target?ev.target.closest('.study'):null;
+  if(card){card.className='study '+dec;
+    const tag=card.querySelector('.dchip');if(tag){tag.className='dchip '+dec;tag.textContent=dec==='include'?'✓ Include':dec==='exclude'?'✗ Exclude':'? Maybe';}
+    card.querySelectorAll('.vbtn').forEach(bn=>bn.classList.remove('act-inc','act-exc','act-maybe'));
+    const m={include:'inc',exclude:'exc',maybe:'maybe'}[dec];const b=card.querySelector('.vbtn.'+m);if(b)b.classList.add('act-'+m);}
+  const done=BATCH.studies.filter(s=>s.ta&&s.ta.final).length;
+  const p=document.getElementById('bm-prog'),bar=document.getElementById('bm-bar');
+  if(p)p.textContent=done+' / '+BATCH.studies.length+' decided';
+  if(bar)bar.style.width=Math.round(done/BATCH.studies.length*100)+'%';
+}
+function batchExport(){
+  const done=BATCH.studies.filter(s=>s.ta&&s.ta.final).length;
+  if(done<BATCH.studies.length && !confirm((BATCH.studies.length-done)+' studies still undecided. Export anyway?'))return;
+  const b=new Blob([JSON.stringify(BATCH,null,2)],{type:'application/json'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(b);
+  a.download=(BATCH.project||'review').replace(/\W+/g,'_')+'__'+(BATCH.reviewer||'reviewer').replace(/\W+/g,'_')+'_DONE.json';a.click();
+  toast('Exported — send this file back to your lead','ok');
+}
+function exitBatch(){const scr=document.getElementById('batch-screen');if(scr)scr.style.display='none';
+  document.getElementById('main').style.display='none';goHome();}
+window.openBatchToScreen=openBatchToScreen;window.batchShowCriteria=batchShowCriteria;
+window.bmFilter=bmFilter;window.bmDecide=bmDecide;window.batchExport=batchExport;window.exitBatch=exitBatch;
+
+/* ===================== BACKEND INTEGRATION (server mode) =====================
+   The app runs in two modes:
+   - LOCAL  : opened as a file. localStorage, solo. (unchanged behaviour)
+   - SERVER : served by the Pramana backend. Accounts + live shared projects.
+   Mode is auto-detected at boot by probing /api/config. */
+const BK = {
+  mode:'local', user:null, config:{}, version:null, role:null, _pendingInvite:null, members:null, myAssignmentsOnly:false,
+  async api(method, path, body, timeoutMs){
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 20000);
+    let r;
+    try{
+      r = await fetch(path, {method, headers:{'Content-Type':'application/json'},
+        credentials:'same-origin', body: body?JSON.stringify(body):undefined, signal: ctrl.signal});
+    }catch(e){
+      clearTimeout(timer);
+      if(e && e.name==='AbortError') throw new Error('The server took too long to respond. Please try again.');
+      throw e;
+    }
+    clearTimeout(timer);
+    let j={}; try{ j = await r.json(); }catch(e){}
+    if(j&&j.aiCredits!=null)syncAICredits(j);
+    if(!r.ok){ const err=new Error(j.error||('HTTP '+r.status)); err.status=r.status; err.body=j; throw err; }
+    return j;
+  },
+  async upload(path, formData, timeoutMs){
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 120000);
+    let r;
+    try{
+      r = await fetch(path, {method:'POST', credentials:'same-origin', body:formData, signal:ctrl.signal});
+    }catch(e){
+      clearTimeout(timer);
+      if(e && e.name==='AbortError') throw new Error('The server took too long to process the file. Try a smaller file.');
+      throw e;
+    }
+    clearTimeout(timer);
+    let j={}; try{ j=await r.json(); }catch(e){}
+    if(!r.ok){ const err=new Error(j.error||('HTTP '+r.status)); err.status=r.status; err.body=j; throw err; }
+    return j;
+  },
+  async detect(){
+    try{
+      const c = await Promise.race([
+        fetch('/api/config',{credentials:'same-origin'}).then(r=>r.ok?r.json():null),
+        new Promise(res=>setTimeout(()=>res(null),2500))
+      ]);
+      if(c && typeof c.googleClientId!=='undefined'){ this.mode='server'; this.config=c; return true; }
+    }catch(e){}
+    this.mode='local'; return false;
+  },
+  isServer(){ return this.mode==='server'; }
+};
+window.BK = BK;
+
+/* ---------- AUTH SCREEN ---------- */
+function showAuthScreen(){
+  document.getElementById('home').classList.remove('on');
+  document.getElementById('main').style.display='none';
+  let el=document.getElementById('auth-screen');
+  if(!el){ el=document.createElement('div'); el.id='auth-screen';
+    el.style.cssText='position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;background:linear-gradient(160deg,var(--wash),var(--wash2));overflow:auto;padding:30px';
+    document.body.appendChild(el); }
+  el.style.display='flex';
+  const g = BK.config.googleClientId;
+  el.innerHTML=`<div style="width:100%;max-width:400px">
+    <div style="text-align:center;margin-bottom:24px">
+      <div class="mk" style="width:46px;height:46px;font-size:24px;margin:0 auto 12px">⊹</div>
+      <h1 style="font-size:24px;font-weight:800;letter-spacing:-.02em;margin:0">Pramāṇa</h1>
+      <div class="muted">Evidence synthesis, together</div>
+    </div>
+    <div class="card" style="margin:0">
+      <div class="seg" style="width:100%;margin-bottom:16px"><button id="au-tl" class="on" style="flex:1" onclick="authTab('login')">Log in</button><button id="au-tr" style="flex:1" onclick="authTab('reg')">Create account</button></div>
+      <div id="au-err" class="banner warn" style="display:none;margin-bottom:12px"><span class="bi">⚠</span><div id="au-err-t"></div></div>
+      <div class="fg" id="au-name-fg" style="display:none"><label class="fl">Name</label><input class="inp" id="au-name" placeholder="Dr. A. Researcher"></div>
+      <div class="fg"><label class="fl">Email</label><input class="inp" id="au-email" type="email" placeholder="you@university.edu"></div>
+      <div class="fg"><label class="fl">Password</label><input class="inp" id="au-pass" type="password" placeholder="••••••••" onkeydown="if(event.key==='Enter')authSubmit()"></div>
+      <div id="au-forgot" style="text-align:right;margin:-6px 0 10px"><a href="#" onclick="showForgot();return false" style="font-size:11.5px;color:var(--syn);text-decoration:none">Forgot password?</a></div>
+      <button class="btn" style="width:100%;justify-content:center" id="au-submit" onclick="authSubmit()">Log in</button>
+      ${g?`<div style="text-align:center;margin:14px 0;color:var(--t3);font-size:12px">or</div>
+        <div id="gbtn"></div>`:''}
+    </div>
+    <div class="muted" style="text-align:center;margin-top:14px;font-size:11.5px">${BK._pendingInvite?'You were invited to a review — log in or sign up to join it.':'Your reviews are saved to your account and shared with collaborators you invite.'}</div>
+  </div>`;
+  el.innerHTML = renderAuthMarkup(g);
+  if(g) initGoogle();
+}
+const PRAMANA_CREDIT='Developed by Dr G. Hari Prakash';
+const PRAMANA_CREDIT_SHORT='Developed by Dr G. Hari Prakash';
+const PRAMANA_CONTACT='pramana.ai.srma@gmail.com';
+function pramanaFooter(){
+  return `<footer style="width:100%;border-top:1px solid rgba(161,177,205,.42);padding:18px 0 0;margin-top:24px;color:#526881;font-size:12px">
+    <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start;justify-content:space-between">
+      <div><b style="color:#10213a">Pramāṇa — Evidence Synthesis</b><br>${PRAMANA_CREDIT}<br><span style="color:#0f8b8d;font-weight:800">🇮🇳 Proudly Made in India</span></div>
+      <div style="display:flex;gap:12px;flex-wrap:wrap;font-weight:700">
+        <a href="#" onclick="showPramanaPage('about');return false" style="color:#3657d6;text-decoration:none">About</a>
+        <a href="#" onclick="showPramanaPage('workflow');return false" style="color:#3657d6;text-decoration:none">How It Works</a>
+        <a href="#" onclick="showPramanaPage('terms');return false" style="color:#3657d6;text-decoration:none">Terms of Use</a>
+        <a href="#" onclick="showPramanaPage('privacy');return false" style="color:#3657d6;text-decoration:none">Privacy Policy</a>
+        <a href="#" onclick="showPramanaPage('contact');return false" style="color:#3657d6;text-decoration:none">Contact (${PRAMANA_CONTACT})</a>
+      </div>
+    </div>
+    <div style="margin-top:12px;color:#7c8da6">© 2026 Dr G. Hari Prakash. All rights reserved.</div>
+  </footer>`;
+}
+function pagePara(s){return '<p style="margin:0 0 14px;line-height:1.7;color:#32445b">'+s+'</p>';}
+function showPramanaPage(kind){
+  if(kind==='workflow'){
+    const step=(n,t,d)=>`<div style="display:grid;grid-template-columns:38px 1fr;gap:12px;align-items:flex-start;padding:14px;border:1px solid #dbe4f2;border-radius:14px;background:rgba(255,255,255,.78)"><div style="width:32px;height:32px;border-radius:12px;background:#eef4ff;color:#3657d6;font-weight:900;display:grid;place-items:center">${n}</div><div><div style="font-weight:900;color:#10213a;margin-bottom:4px">${t}</div><div style="color:#40566f;line-height:1.55;font-size:13px">${d}</div></div></div>`;
+    modal('<div class="modal-h">How Pramana Works<button class="x" onclick="closeModal()">&times;</button></div>'+
+      `<div class="modal-b" style="max-width:900px">
+        ${pagePara('Pramana is built as a complete evidence-synthesis workflow. A user can start with a research question, move through screening and extraction, run analysis, and export a PRISMA-ready report while the project stays shared with invited collaborators.')}
+        <h3 style="margin:18px 0 10px;color:#10213a">Full Working Flow</h3>
+        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:12px">
+          ${step('1','Set up the review','Choose the review type and framework, enter the research question, define PICO, PCC, PEO, or other fields, and write inclusion and exclusion criteria.')}
+          ${step('2','Train Viveka','Label a small balanced seed of included and excluded studies. Viveka Local learns from those expert decisions; Viveka Cloud can also screen with a server-side AI provider.')}
+          ${step('3','Search and import','Build database-ready search suggestions from the review question, then import records from RIS, BibTeX, PubMed or DOI sources, or CSV.')}
+          ${step('4','De-duplicate','Detect likely duplicate records before screening so the team works on a clean review set.')}
+          ${step('5','Assign team workload','Invite reviewers, split records by percentage, and let each reviewer use the assigned-only queue while the lead monitors progress.')}
+          ${step('6','Title and abstract screening','Screen manually, with Viveka Local, or with Viveka Cloud. Decisions, comments, reasons, and reviewer names stay logged in the shared project.')}
+          ${step('7','Full-text screening','Fetch open-access full text where available, attach or paste PDFs/text when needed, then screen full text with manual review or Viveka assistance.')}
+          ${step('8','Synthesis and report','Extract outcome data, assess risk of bias, calculate meta-analysis outputs, inspect forest/funnel plots, prepare GRADE, and update the PRISMA flow.')}
+        </div>
+        <h3 style="margin:22px 0 8px;color:#10213a">Accuracy and Viveka Local</h3>
+        ${pagePara('<b>Viveka Local</b> uses a high-recall TF-IDF phrase model with active learning. It does not promise a universal fixed accuracy percentage because performance depends on the review topic, abstract quality, eligibility criteria, and the quality of the labelled training seed.')}
+        ${pagePara('The model is tuned for systematic-review safety: it prioritises <b>recall/sensitivity</b>, meaning it tries to avoid missing potentially eligible studies. Borderline papers should be sent to <b>Maybe</b> or human review rather than silently excluded. This is why a high-recall setup can feel conservative, but it is safer for evidence synthesis.')}
+        ${pagePara('Recommended practice: label at least 5 clear includes and 5 clear excludes, ideally 20-40 mixed examples, then train. Review uncertain or discrepant papers, correct the decisions, and retrain. As expert decisions accumulate, active learning improves the project-specific classifier.')}
+        ${pagePara('The app reports training diagnostics such as recall, precision, and F1 where available. These are internal validation signals, not a substitute for human confirmation. Final inclusion and exclusion decisions remain the responsibility of the review team.')}
+        <h3 style="margin:22px 0 8px;color:#10213a">Viveka Cloud vs Viveka Local</h3>
+        ${pagePara('<b>Viveka Cloud</b> uses AI-provider calls through the server for stronger language reasoning, especially on small or complex reviews. <b>Viveka Local</b> runs in the browser with zero AI tokens after training and is best for large search sets where cost control matters.')}
+        ${pagePara('For best accuracy and cost balance, use cloud AI on difficult or borderline records and use Viveka Local for high-volume screening after a good seed has been labelled.')}
+        ${pramanaFooter()}
+      </div>`);
+    const pageModal=document.getElementById('modal');
+    if(pageModal)pageModal.style.maxWidth='920px';
+    return;
+  }
+  const common='<div class="modal-h">'+(kind==='about'?'About Pramāṇa':kind==='terms'?'Terms of Use — Pramāṇa':kind==='privacy'?'Privacy Policy — Pramāṇa':'Contact')+'<button class="x" onclick="closeModal()">×</button></div>';
+  let body='';
+  if(kind==='about'){
+    body=`<div class="modal-b" style="max-width:780px">
+      ${pagePara('<i>Pramāṇa</i> (प्रमाण) is a Sanskrit word for a valid means of knowledge — a fitting name for a tool built to make trustworthy evidence easier to produce.')}
+      ${pagePara('Pramāṇa is an end-to-end platform for evidence synthesis. It carries a review team through the full systematic-review journey in one shared workspace: defining the protocol and PICO, searching and importing studies, de-duplicating, title/abstract and full-text screening, risk-of-bias assessment, data extraction, meta-analysis with forest and funnel plots, GRADE certainty ratings, and a PRISMA-ready flow — without juggling spreadsheets, email chains, or expensive licences.')}
+      ${pagePara('It is designed first for the people who do this work in India: medical postgraduates, MPH students, biostatisticians, and institutional research teams who need a rigorous, affordable, and accessible way to synthesise evidence.')}
+      <h3 style="margin:18px 0 8px;color:#10213a">Our mission</h3>
+      ${pagePara("To make evidence-based synthesis affordable and accessible across India — and beyond — so that good methodology isn't gated behind costly software. Built by a team of public-health researchers and biostatisticians, Pramāṇa puts a complete, transparent review workflow within reach of every department, every student, and every small research group.")}
+      <h3 style="margin:18px 0 8px;color:#10213a">Who builds it</h3>
+      ${pagePara('Pramāṇa is developed by <b>Dr G. Hari Prakash</b>. The work brings together public-health research and biostatistics with a simple goal: rigorous methods, made usable.')}
+      ${pagePara('🇮🇳 <b>Proudly Made in India.</b>')}
+      ${pagePara('<b>Contact:</b> '+PRAMANA_CONTACT)}
+      ${pramanaFooter()}
+    </div>`;
+  }else if(kind==='terms'){
+    body=`<div class="modal-b" style="max-width:820px"><div class="muted" style="margin-bottom:14px">This is a strong plain-language draft — have a qualified professional review before relying on it. It is not legal advice.</div>
+      ${pagePara('<b>Last updated: 16 June 2026</b>')}
+      ${pagePara('<b>1. Who we are.</b> Pramāṇa ("the Service") is an evidence-synthesis platform developed by Dr G. Hari Prakash ("we", "us", "our"). By creating an account or using the Service, you agree to these Terms. If you do not agree, please do not use the Service.')}
+      ${pagePara('<b>2. Accounts.</b> You must provide a valid email address and keep your login credentials confidential. You are responsible for activity under your account. You must be capable of entering into a binding agreement to use the Service; if you are using it as part of an institution, you confirm you are authorised to do so.')}
+      ${pagePara("<b>3. Acceptable use.</b> You agree to use Pramāṇa only for lawful, legitimate research and academic purposes. You will not: upload unlawful, infringing, or harmful content; attempt to breach security or access other users' data without authorisation; misuse invitations or collaboration features; or use the Service to violate any applicable law or third-party right.")}
+      ${pagePara('<b>4. Your content and data.</b> You retain ownership of the review content, study records, and data you create or upload ("Your Content"). You grant us only the limited permission needed to store, process, and display Your Content so the Service can function and so that collaborators you invite can access shared projects. You are responsible for ensuring you have the right to upload and process any data you put into the Service, including any data governed by your institution\'s ethics or data-sharing rules.')}
+      ${pagePara('<b>5. Collaboration.</b> When you invite collaborators to a project, they can view and edit the shared project according to the role you assign. You are responsible for whom you invite and for the appropriateness of sharing data with them.')}
+      ${pagePara('<b>6. Research-tool disclaimer.</b> Pramāṇa assists with evidence synthesis but does not replace methodological expertise or professional judgement. Automated and AI-assisted features (such as screening suggestions and effect-size calculations) are aids, not authorities. You are responsible for verifying results, statistics, and conclusions. The Service must not be used as the sole basis for any clinical, diagnostic, or treatment decision.')}
+      ${pagePara('<b>7. Availability.</b> We aim to keep the Service available and your data safe, but we provide it "as is" and "as available", without warranties of uninterrupted or error-free operation. We may update, suspend, or discontinue features. We strongly recommend you export and keep your own backups of important reviews.')}
+      ${pagePara('<b>8. Limitation of liability.</b> To the extent permitted by law, we are not liable for indirect, incidental, or consequential damages, or for loss of data, arising from your use of the Service. Nothing in these Terms excludes liability that cannot be excluded by law.')}
+      ${pagePara('<b>9. Termination.</b> You may stop using the Service and request deletion of your account at any time. We may suspend or terminate accounts that breach these Terms.')}
+      ${pagePara('<b>10. Changes.</b> We may update these Terms; material changes will be reflected by the "Last updated" date. Continued use after changes means you accept them.')}
+      ${pagePara('<b>11. Governing law.</b> These Terms are governed by the laws of India, and disputes are subject to the courts of competent jurisdiction in India.')}
+      ${pagePara('<b>12. Contact.</b> Questions about these Terms: <b>'+PRAMANA_CONTACT+'</b>')}
+      ${pramanaFooter()}
+    </div>`;
+  }else if(kind==='privacy'){
+    body=`<div class="modal-b" style="max-width:820px"><div class="muted" style="margin-bottom:14px">Strong plain-language draft — have a qualified professional review it against the Indian Digital Personal Data Protection Act, 2023 and any institutional requirements before relying on it. Not legal advice.</div>
+      ${pagePara('<b>Last updated: 16 June 2026</b>')}
+      ${pagePara('<b>1. Scope.</b> This policy explains what information Pramāṇa (developed by Dr G. Hari Prakash) collects, why, and your choices.')}
+      ${pagePara('<b>2. What we collect.</b>')}
+      <ul style="margin:0 0 14px 18px;line-height:1.7;color:#32445b">
+        <li><b>Account information:</b> your name, email address, and a securely hashed password (we never store passwords in plain text). If you sign in with Google, we receive your basic Google profile (name, email) to create your account.</li>
+        <li><b>Project data:</b> the reviews, study records, screening decisions, extractions, and analyses you create or upload.</li>
+        <li><b>Collaboration data:</b> invitations you send, and the membership and roles of projects you belong to.</li>
+        <li><b>Basic technical data:</b> standard information needed to operate and secure the Service (for example, session cookies for keeping you logged in, and limited request data used to prevent abuse such as repeated failed logins).</li>
+      </ul>
+      ${pagePara('<b>3. How we use it.</b> To provide the Service, authenticate you, enable collaboration on shared projects, send transactional emails (such as invitations and password-reset links), and keep the Service secure and working.')}
+      ${pagePara('<b>4. Cookies.</b> We use a single secure, http-only session cookie to keep you logged in. We do not use advertising or third-party tracking cookies.')}
+      ${pagePara('<b>5. Email.</b> Transactional emails (invites, password resets) may be sent via a third-party email provider (Brevo) acting on our behalf. We do not send marketing email unless you opt in.')}
+      ${pagePara('<b>6. Sharing.</b> We do not sell your data or use it for advertising. Project data is visible only to you and the collaborators you invite. We use service providers (hosting and email) solely to operate the Service, under their respective terms.')}
+      ${pagePara('<b>7. Storage and security.</b> Your data is stored in our hosted database. Passwords are hashed with bcrypt; sessions use signed tokens; password resets use single-use, time-limited links; and we apply rate-limiting to reduce abuse. No system is perfectly secure, but we take reasonable measures to protect your information.')}
+      ${pagePara('<b>8. Your data, your control.</b> You own your project content. You can export your reviews from within the app, and you can request correction or deletion of your account and associated data by contacting us.')}
+      ${pagePara("<b>9. Your rights.</b> Subject to applicable law (including India's Digital Personal Data Protection Act, 2023), you may have rights to access, correct, or delete your personal data and to withdraw consent. To exercise these, contact us at the address below.")}
+      ${pagePara('<b>10. Research data responsibility.</b> Pramāṇa is a tool for research teams. You are responsible for ensuring that any personal or sensitive data you enter complies with your institution\'s ethics approvals and applicable data-protection rules. Where possible, avoid entering identifiable patient data into review records.')}
+      ${pagePara('<b>11. Children.</b> The Service is intended for researchers and students and is not directed at children under the age at which consent is required under applicable law.')}
+      ${pagePara('<b>12. Changes.</b> We may update this policy; the "Last updated" date will reflect changes.')}
+      ${pagePara('<b>13. Contact / Grievances.</b> For privacy questions or requests, contact <b>'+PRAMANA_CONTACT+'</b>.')}
+      ${pramanaFooter()}
+    </div>`;
+  }else{
+    body=`<div class="modal-b" style="max-width:680px">
+      ${pagePara('<b>Email:</b> <a href="mailto:'+PRAMANA_CONTACT+'" style="color:#3657d6">'+PRAMANA_CONTACT+'</a>')}
+      ${pagePara(PRAMANA_CREDIT)}
+      ${pagePara('Developed by Dr G. Hari Prakash with a mission to make evidence-based synthesis affordable and accessible across India. Rigorous methods, made usable. 🇮🇳 Proudly Made in India.')}
+      ${pramanaFooter()}
+    </div>`;
+  }
+  modal(common+body);
+  const pageModal=document.getElementById('modal');
+  if(pageModal)pageModal.style.maxWidth=kind==='contact'?'720px':'920px';
+}
+function renderAuthMarkup(g){
+  return `<div style="width:100%;max-width:1180px;margin:auto">
+    <style>
+      @keyframes prFlow{0%{transform:translateX(-10%);opacity:.45}50%{opacity:1}100%{transform:translateX(10%);opacity:.45}}
+      @keyframes prFloat{0%,100%{transform:translateY(0)}50%{transform:translateY(-7px)}}
+      .pr-auth-shell{display:grid;grid-template-columns:minmax(0,1.15fr) minmax(360px,430px);gap:36px;align-items:center}
+      .pr-info-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;max-width:720px;margin:22px 0 20px}
+      .pr-info-card{background:rgba(255,255,255,.82);border:1px solid #dbe4f2;border-radius:14px;padding:18px;box-shadow:0 12px 32px rgba(33,48,77,.06)}
+      .pr-nav{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+      .pr-nav a,.pr-badge{display:inline-flex;align-items:center;gap:8px;padding:8px 13px;border-radius:999px;background:rgba(255,255,255,.78);border:1px solid #dbe4f2;text-decoration:none;color:#3657d6;font-size:11px;font-weight:800;letter-spacing:.05em;text-transform:uppercase}
+      .pr-flow{overflow:hidden;border:1px solid #dbe4f2;background:rgba(255,255,255,.66);border-radius:999px;max-width:700px;padding:10px 12px;margin:12px 0 18px;color:#526881;font-size:12px;font-weight:800;white-space:nowrap}
+      .pr-flow span{display:inline-block;animation:prFlow 7s ease-in-out infinite}
+      .pr-workflow-mini{max-width:720px;display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:0 0 18px}
+      .pr-workflow-mini div{background:rgba(255,255,255,.7);border:1px solid #dbe4f2;border-radius:12px;padding:12px;min-height:78px}
+      .pr-workflow-mini b{display:block;color:#3657d6;font-size:12px;margin-bottom:5px}
+      .pr-workflow-mini span{display:block;color:#24384f;font-size:12px;line-height:1.35;font-weight:800}
+      @media(max-width:900px){.pr-auth-shell{grid-template-columns:1fr}.pr-info-grid{grid-template-columns:1fr}.pr-workflow-mini{grid-template-columns:repeat(2,minmax(0,1fr))}#auth-screen{align-items:flex-start!important}.pr-hero h1{font-size:38px!important}}
+      @media(max-width:520px){.pr-workflow-mini{grid-template-columns:1fr}.pr-hero h1{font-size:32px!important}}
+    </style>
+    <div class="pr-auth-shell">
+      <section class="pr-hero" style="padding-right:8px">
+        <div class="pr-nav">
+          <span class="pr-badge">PRAMĀṆA · EVIDENCE SYNTHESIS</span>
+          <a href="#" onclick="showPramanaPage('about');return false">About</a>
+          <a href="#" onclick="showPramanaPage('workflow');return false">How it works</a>
+          <a href="#" onclick="showPramanaPage('privacy');return false">Privacy</a>
+          <a href="#" onclick="showPramanaPage('contact');return false">Contact</a>
+        </div>
+        <div class="pr-badge" style="color:#0f8b8d;margin-bottom:4px;animation:prFloat 4.8s ease-in-out infinite">🇮🇳 Proudly Made in India</div>
+        <h1 style="font-size:54px;line-height:1.02;letter-spacing:-.04em;margin:18px 0 14px;color:#10213a;max-width:680px">Systematic reviews, screening, extraction, and meta-analysis in one shared workspace.</h1>
+        <p style="font-size:18px;line-height:1.65;color:#4d627c;max-width:690px;margin:0 0 16px">Built for review teams who need a practical workflow from protocol to PRISMA. Create a review, invite collaborators, screen studies live, extract data, run the synthesis, and keep one current version of the evidence — together, in your browser.</p>
+        <div class="pr-flow"><span>Protocol → Search → Import → De-duplicate → Screen → Extract → Meta-analysis → GRADE → PRISMA → Shared report</span></div>
+        <div class="pr-info-grid">
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">How to use</div><div style="font-size:14px;line-height:1.6;color:#24384f">Create an account, open a review, import studies, screen records, extract outcomes, run the synthesis, and share the same project with your team. Everything stays in one place, always up to date.</div></div>
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">How it works</div><div style="font-size:14px;line-height:1.6;color:#24384f">Follow one guided flow: set protocol, train Viveka, search and import, de-duplicate, assign reviewers, screen titles/abstracts, screen full text, extract data, and export PRISMA-ready outputs.</div></div>
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Accuracy approach</div><div style="font-size:14px;line-height:1.6;color:#24384f">Viveka Local uses a high-recall TF-IDF phrase model with active learning. It is designed to reduce missed eligible studies by sending uncertain papers to human review.</div></div>
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Privacy</div><div style="font-size:14px;line-height:1.6;color:#24384f">Your project data stays inside your hosted workspace. Team access is controlled by invites, and password resets use secure one-time links. We don't sell data or run ads.</div></div>
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Developed by</div><div style="font-size:16px;font-weight:800;color:#10213a">Dr G. Hari Prakash</div></div>
+          <div class="pr-info-card"><div style="font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase;color:#0f8b8d;margin-bottom:8px">Contact</div><div style="font-size:16px;font-weight:800;color:#10213a">pramana.ai.srma@gmail.com</div></div>
+        </div>
+        <div class="pr-workflow-mini" aria-label="Pramana workflow">
+          <div><b>01</b><span>Protocol and review framework</span></div>
+          <div><b>02</b><span>Search, import, and de-duplicate</span></div>
+          <div><b>03</b><span>Team split and live screening</span></div>
+          <div><b>04</b><span>Extraction, meta-analysis, GRADE, PRISMA</span></div>
+        </div>
+        <div style="max-width:720px;border:1px solid #b8dedf;background:#eefafa;border-radius:14px;padding:14px 16px;color:#075e63;line-height:1.55;margin-bottom:14px"><b>High-recall TF-IDF accuracy:</b> Viveka Local learns from your labelled seed and favours recall/sensitivity, so potentially eligible or uncertain studies are kept for human review instead of being silently excluded. Accuracy improves when reviewers correct decisions and retrain.</div>
+        <div style="max-width:720px;border:1px solid #dbe4f2;background:rgba(255,255,255,.58);border-radius:14px;padding:14px 16px;color:#40566f;line-height:1.55">Developed by Dr G. Hari Prakash with a mission to make evidence-based synthesis affordable and accessible across India. Rigorous methods, made usable. 🇮🇳 Proudly Made in India.</div>
+      </section>
+      <section>
+        <div style="text-align:center;margin-bottom:18px">
+          <img src="/pramana-logo.png" alt="Pramana logo" style="width:min(100%,320px);height:auto;display:block;margin:0 auto 6px;filter:drop-shadow(0 16px 38px rgba(16,33,58,.12))">
+          <div class="muted" style="font-size:14px">Secure account access for live review collaboration</div>
+        </div>
+        <div class="card" style="margin:0;padding:26px;border-radius:20px">
+          <div class="seg" style="width:100%;margin-bottom:16px"><button id="au-tl" class="on" style="flex:1" onclick="authTab('login')">Log in</button><button id="au-tr" style="flex:1" onclick="authTab('reg')">Create account</button></div>
+          <div id="au-err" class="banner warn" style="display:none;margin-bottom:12px"><span class="bi">!</span><div id="au-err-t"></div></div>
+          <div class="fg" id="au-name-fg" style="display:none"><label class="fl">Name</label><input class="inp" id="au-name" placeholder="Dr G Hari Prakash"></div>
+          <div class="fg"><label class="fl">Email</label><input class="inp" id="au-email" type="email" placeholder="you@institution.edu"></div>
+          <div class="fg"><label class="fl">Password</label><input class="inp" id="au-pass" type="password" placeholder="At least 6 characters" onkeydown="if(event.key==='Enter')authSubmit()"></div>
+          <div id="au-forgot" style="text-align:right;margin:-6px 0 10px"><a href="#" onclick="showForgot();return false" style="font-size:11.5px;color:var(--syn);text-decoration:none">Forgot password?</a></div>
+          <button class="btn" style="width:100%;justify-content:center" id="au-submit" onclick="authSubmit()">Log in</button>
+          ${g?`<div style="text-align:center;margin:14px 0;color:var(--t3);font-size:12px">or</div><div id="gbtn"></div>`:''}
+        </div>
+        <div class="muted" style="text-align:center;margin-top:14px;font-size:12px">${BK._pendingInvite?'You were invited to a review. Log in or create an account to join it.':'Your reviews are stored in your account and shared only with collaborators you invite.'}</div>
+      </section>
+    </div>
+    ${pramanaFooter()}
+  </div>`;
+}
+let AUTH_TAB='login';
+function authTab(t){ AUTH_TAB=t;
+  document.getElementById('au-tl').classList.toggle('on',t==='login');
+  document.getElementById('au-tr').classList.toggle('on',t==='reg');
+  document.getElementById('au-name-fg').style.display = t==='reg'?'':'none';
+  document.getElementById('au-submit').textContent = t==='reg'?'Create account':'Log in';
+  const fg=document.getElementById('au-forgot'); if(fg)fg.style.display=t==='reg'?'none':'';
+  hideAuthErr();
+}
+function showAuthErr(m){ const e=document.getElementById('au-err'); if(e){e.style.display='';document.getElementById('au-err-t').textContent=m;} }
+function hideAuthErr(){ const e=document.getElementById('au-err'); if(e)e.style.display='none'; }
+async function authSubmit(){
+  hideAuthErr();
+  const email=document.getElementById('au-email').value.trim();
+  const pass=document.getElementById('au-pass').value;
+  const name=(document.getElementById('au-name')||{}).value;
+  const btn=document.getElementById('au-submit'); btn.disabled=true; btn.textContent='…';
+  try{
+    const path = AUTH_TAB==='reg'?'/api/auth/register':'/api/auth/login';
+    const r = await BK.api('POST', path, AUTH_TAB==='reg'?{email,name,password:pass}:{email,password:pass});
+    BK.user=r.user; await afterLogin();
+  }catch(e){ showAuthErr(e.message); btn.disabled=false; btn.textContent=AUTH_TAB==='reg'?'Create account':'Log in'; }
+}
+/* ---- forgot password ---- */
+function showForgot(){
+  const el=document.getElementById('auth-screen'); if(!el)return;
+  el.innerHTML=`<div style="width:100%;max-width:400px">
+    <div style="text-align:center;margin-bottom:24px">
+      <div class="mk" style="width:46px;height:46px;font-size:24px;margin:0 auto 12px">⊹</div>
+      <h1 style="font-size:22px;font-weight:800;margin:0">Reset your password</h1>
+      <div class="muted">We'll send a reset link to your email.</div></div>
+    <div class="card" style="margin:0">
+      <div id="fp-err" class="banner warn" style="display:none;margin-bottom:12px"><span class="bi">⚠</span><div id="fp-err-t"></div></div>
+      <div id="fp-ok" class="banner info" style="display:none;margin-bottom:12px"><span class="bi">✓</span><div id="fp-ok-t"></div></div>
+      <div class="fg"><label class="fl">Email</label><input class="inp" id="fp-email" type="email" placeholder="you@university.edu" onkeydown="if(event.key==='Enter')submitForgot()"></div>
+      <button class="btn" style="width:100%;justify-content:center" id="fp-submit" onclick="submitForgot()">Send reset link</button>
+      <div style="text-align:center;margin-top:12px"><a href="#" onclick="showAuthScreen();return false" style="font-size:12px;color:var(--syn);text-decoration:none">← Back to log in</a></div>
+    </div></div>`;
+}
+async function submitForgot(){
+  const email=document.getElementById('fp-email').value.trim();
+  const btn=document.getElementById('fp-submit'); btn.disabled=true; btn.textContent='…';
+  try{
+    const r=await BK.api('POST','/api/auth/forgot',{email});
+    const okb=document.getElementById('fp-ok'); okb.style.display='';
+    if(r.devLink){ // email not configured — show the link directly
+      document.getElementById('fp-ok-t').innerHTML='Email isn\'t set up on this server, so use this reset link directly:<br><a href="'+esc(r.devLink)+'" style="word-break:break-all;font-size:11px">'+esc(r.devLink)+'</a>';
+    }else{
+      document.getElementById('fp-ok-t').textContent='If an account exists for '+email+', a reset link is on its way. Check your inbox.';
+    }
+    btn.style.display='none';
+  }catch(e){ const eb=document.getElementById('fp-err'); eb.style.display=''; document.getElementById('fp-err-t').textContent=e.message; btn.disabled=false; btn.textContent='Send reset link'; }
+}
+/* ---- reset password (arrived via ?reset=token) ---- */
+function showResetScreen(token){
+  document.getElementById('home').classList.remove('on');
+  document.getElementById('main').style.display='none';
+  let el=document.getElementById('auth-screen');
+  if(!el){ el=document.createElement('div'); el.id='auth-screen';
+    el.style.cssText='position:fixed;inset:0;z-index:50;display:flex;align-items:center;justify-content:center;background:linear-gradient(160deg,var(--wash),var(--wash2));overflow:auto;padding:30px';
+    document.body.appendChild(el); }
+  el.style.display='flex';
+  el.innerHTML=`<div style="width:100%;max-width:400px">
+    <div style="text-align:center;margin-bottom:24px">
+      <div class="mk" style="width:46px;height:46px;font-size:24px;margin:0 auto 12px">⊹</div>
+      <h1 style="font-size:22px;font-weight:800;margin:0">Choose a new password</h1></div>
+    <div class="card" style="margin:0">
+      <div id="rs-err" class="banner warn" style="display:none;margin-bottom:12px"><span class="bi">⚠</span><div id="rs-err-t"></div></div>
+      <div class="fg"><label class="fl">New password</label><input class="inp" id="rs-pass" type="password" placeholder="at least 6 characters" onkeydown="if(event.key==='Enter')submitReset()"></div>
+      <button class="btn" style="width:100%;justify-content:center" id="rs-submit" onclick="submitReset()">Set new password & log in</button>
+    </div></div>`;
+  RESET_TOKEN=token;
+}
+let RESET_TOKEN=null;
+async function submitReset(){
+  const pass=document.getElementById('rs-pass').value;
+  const btn=document.getElementById('rs-submit'); btn.disabled=true; btn.textContent='…';
+  try{
+    const r=await BK.api('POST','/api/auth/reset',{token:RESET_TOKEN,password:pass});
+    BK.user=r.user;
+    try{history.replaceState({},'',location.pathname);}catch(e){}
+    toast('Password updated — you\'re logged in','ok');
+    await afterLogin();
+  }catch(e){ const eb=document.getElementById('rs-err'); eb.style.display=''; document.getElementById('rs-err-t').textContent=e.message; btn.disabled=false; btn.textContent='Set new password & log in'; }
+}
+async function authSubmitEnhanced(){
+  hideAuthErr();
+  const email=document.getElementById('au-email').value.trim();
+  const pass=document.getElementById('au-pass').value;
+  const name=(document.getElementById('au-name')||{}).value;
+  const btn=document.getElementById('au-submit');
+  btn.disabled=true;
+  btn.textContent=AUTH_TAB==='reg'?'Creating account...':'Signing in...';
+  try{
+    const path = AUTH_TAB==='reg'?'/api/auth/register':'/api/auth/login';
+    const r = await BK.api('POST', path, AUTH_TAB==='reg'?{email,name,password:pass}:{email,password:pass}, 15000);
+    BK.user=r.user;
+    await afterLogin();
+    if(AUTH_TAB==='reg'){
+      if(r.emailError) toast('Account created, but welcome email failed: '+r.emailError,'err');
+      else toast(r.welcomeEmailQueued?'Account created. Welcome email queued.':'Account created. You can start your review now.','ok');
+    }
+  }catch(e){
+    showAuthErr(e.message);
+    btn.disabled=false;
+    btn.textContent=AUTH_TAB==='reg'?'Create account':'Log in';
+  }
+}
+async function submitForgotEnhanced(){
+  const email=document.getElementById('fp-email').value.trim();
+  const btn=document.getElementById('fp-submit');
+  btn.disabled=true;
+  btn.textContent='Sending...';
+  try{
+    const r=await BK.api('POST','/api/auth/forgot',{email},15000);
+    const okb=document.getElementById('fp-ok'); okb.style.display='';
+    if(r.devLink){
+      document.getElementById('fp-ok-t').innerHTML='Email is not configured on this server, so use this reset link directly:<br><a href="'+esc(r.devLink)+'" style="word-break:break-all;font-size:11px">'+esc(r.devLink)+'</a>';
+    }else if(r.emailError){
+      document.getElementById('fp-ok-t').textContent='Reset email could not be prepared on the server: '+r.emailError;
+    }else{
+      document.getElementById('fp-ok-t').textContent='If an account exists for '+email+', a reset email has been queued. Check your inbox, spam folder, and Railway email status.';
+    }
+    btn.style.display='none';
+  }catch(e){
+    const eb=document.getElementById('fp-err');
+    eb.style.display='';
+    document.getElementById('fp-err-t').textContent=e.message;
+    btn.disabled=false;
+    btn.textContent='Send reset link';
+  }
+}
+async function submitResetEnhanced(){
+  const pass=document.getElementById('rs-pass').value;
+  const btn=document.getElementById('rs-submit');
+  btn.disabled=true;
+  btn.textContent='Updating password...';
+  try{
+    const r=await BK.api('POST','/api/auth/reset',{token:RESET_TOKEN,password:pass},15000);
+    BK.user=r.user;
+    try{history.replaceState({},'',location.pathname);}catch(e){}
+    toast('Password updated. You are logged in.','ok');
+    await afterLogin();
+  }catch(e){
+    const eb=document.getElementById('rs-err');
+    eb.style.display='';
+    document.getElementById('rs-err-t').textContent=e.message;
+    btn.disabled=false;
+    btn.textContent='Set new password & log in';
+  }
+}
+authSubmit = authSubmitEnhanced;
+submitForgot = submitForgotEnhanced;
+submitReset = submitResetEnhanced;
+window.showForgot=showForgot;window.submitForgot=submitForgot;window.showResetScreen=showResetScreen;window.submitReset=submitReset;
+function initGoogle(){
+  if(document.getElementById('gsi-script')){ renderGoogleBtn(); return; }
+  const s=document.createElement('script'); s.id='gsi-script'; s.src='https://accounts.google.com/gsi/client'; s.async=true;
+  s.onload=renderGoogleBtn; document.head.appendChild(s);
+}
+function renderGoogleBtn(){
+  if(!window.google||!BK.config.googleClientId) return;
+  google.accounts.id.initialize({ client_id:BK.config.googleClientId, callback: async (resp)=>{
+    try{ const r=await BK.api('POST','/api/auth/google',{credential:resp.credential}); BK.user=r.user; await afterLogin(); }
+    catch(e){ showAuthErr(e.message); }
+  }});
+  const host=document.getElementById('gbtn'); if(host) google.accounts.id.renderButton(host,{theme:'outline',size:'large',width:368});
+}
+function userDisplayName(){
+  const raw=(BK.user&&(BK.user.name||BK.user.email))||'Doctor';
+  return raw.includes('@')?raw.split('@')[0]:raw;
+}
+function loginStorageKey(){
+  return 'pramana_last_login_'+((BK.user&&BK.user.email)||'user').toLowerCase();
+}
+function rememberLogin(){
+  const key=loginStorageKey();
+  BK.previousLoginAt=localStorage.getItem(key)||'';
+  localStorage.setItem(key,new Date().toISOString());
+}
+function fmtDateTime(v){
+  if(!v)return 'First login on this browser';
+  try{return new Date(v).toLocaleString(undefined,{month:'short',day:'numeric',year:'numeric',hour:'numeric',minute:'2-digit'});}catch(e){return 'Recently';}
+}
+async function afterLogin(){
+  const el=document.getElementById('auth-screen'); if(el)el.style.display='none';
+  rememberLogin();
+  updateUserChip();
+  // honour a pending invite link, then go home
+  if(BK._pendingInvite){
+    try{ const r=await BK.api('POST','/api/invites/accept',{token:BK._pendingInvite}); BK._pendingInvite=null;
+      try{history.replaceState({},'',location.pathname);}catch(e){}
+      toast('You joined the review','ok'); await serverOpenProject(r.projectId); return;
+    }catch(e){ toast('Invite link invalid or expired','err'); BK._pendingInvite=null; }
+  }
+  goHome();
+}
+function showProfileModal(){
+  if(!BK.user)return;
+  const initials=(BK.user.name||BK.user.email||'?').split(/\s+/).map(w=>w[0]).slice(0,2).join('').toUpperCase();
+  const credits=BK.user.aiCredits!=null?Number(BK.user.aiCredits):0;
+  
+  modal(`<div class="modal-h">User Profile<button class="x" onclick="closeModal()">x</button></div>
+    <div class="modal-b" style="max-width:340px;text-align:center">
+      <div style="width:64px;height:64px;border-radius:50%;background:var(--syn);color:#fff;font-size:24px;font-weight:700;display:flex;align-items:center;justify-content:center;margin:10px auto 16px auto">${esc(initials)}</div>
+      <div style="font-weight:700;font-size:18px;color:var(--t1)">${esc(BK.user.name||'')}</div>
+      <div class="muted" style="margin-bottom:24px">${esc(BK.user.email)}</div>
+      <div style="background:var(--wash2);border-radius:8px;padding:16px;text-align:left;margin-bottom:24px">
+         <div style="font-size:12px;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:8px">Account Status</div>
+         <div style="font-size:14px;color:var(--t1);font-weight:600;margin-bottom:16px"><span style="display:inline-block;width:8px;height:8px;background:var(--inc);border-radius:50%;margin-right:8px"></span>Trial version</div>
+         <div style="font-size:12px;color:var(--t3);text-transform:uppercase;letter-spacing:0.5px;font-weight:700;margin-bottom:4px">Viveka Credits</div>
+         <div style="font-size:28px;font-weight:700;color:var(--syn)">${credits}</div>
+      </div>
+      <button class="btn exc" style="width:100%" onclick="doLogout()">Log out</button>
+    </div>`);
+}
+async function doLogout(){ try{ await BK.api('POST','/api/auth/logout'); }catch(e){} BK.user=null; location.reload(); }
+function syncAICredits(payload){
+  if(payload&&payload.aiCredits!=null&&BK.user){
+    BK.user.aiCredits=Number(payload.aiCredits);
+    updateUserChip();
+  }
+}
+async function adminUsageModal(){
+  try{
+    const r=await BK.api('GET','/api/admin/usage');
+    const totalUsers=(r.users||[]).length;
+    const totalUsed=(r.users||[]).reduce((s,u)=>s+Number(u.credits_used||0),0);
+    const totalCalls=(r.users||[]).reduce((s,u)=>s+Number(u.ai_calls||0),0);
+    const totalBalance=(r.users||[]).reduce((s,u)=>s+Number(u.ai_credits||0),0);
+    const rows=(r.users||[]).map(u=>`<tr><td><b>${esc(u.name||'')}</b><br><span class="muted">${esc(u.email||'')}</span></td><td>${Number(u.ai_credits||0)}</td><td>${Number(u.credits_used||0)}</td><td>${Number(u.ai_calls||0)}</td><td><button class="btn gh sm" onclick="adminAddCredits('${esc(u.id)}')">Add</button></td></tr>`).join('');
+    const recent=(r.recent||[]).slice(0,30).map(x=>`<tr><td>${esc(x.email||'')}</td><td>${esc(x.feature||'')}</td><td>${esc(x.model||'')}</td><td>${Number(x.credits||0)}</td><td class="muted">${esc(new Date(x.created_at).toLocaleString())}</td></tr>`).join('');
+    modal(`<div class="modal-h">Admin Portal - Users, AI Credits & Usage Logs<button class="x" onclick="closeModal()">x</button></div>
+      <div class="modal-b" style="max-width:920px">
+        <div class="banner info" style="margin-bottom:14px"><span class="bi">i</span><div>Manual screening, imports, PRISMA, and meta-analysis are free. Only Viveka Cloud AI uses credits. New accounts start with 50 credits.</div></div>
+        <div class="welcome-stats" style="grid-template-columns:repeat(4,minmax(0,1fr));margin-bottom:16px">
+          <div class="welcome-stat"><b>${totalUsers}</b><div class="muted">registered users</div></div>
+          <div class="welcome-stat"><b>${totalBalance}</b><div class="muted">credits remaining</div></div>
+          <div class="welcome-stat"><b>${totalUsed}</b><div class="muted">AI credits used</div></div>
+          <div class="welcome-stat"><b>${totalCalls}</b><div class="muted">AI calls logged</div></div>
+        </div>
+        <h3 style="margin:0 0 10px">Users and balances</h3>
+        <table class="tbl"><thead><tr><th>User</th><th>Balance</th><th>AI credits used</th><th>AI calls</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="5">No users found.</td></tr>'}</tbody></table>
+        <h3 style="margin:18px 0 10px">Recent AI usage</h3>
+        <table class="tbl"><thead><tr><th>User</th><th>Feature</th><th>Model</th><th>Credits</th><th>Time</th></tr></thead><tbody>${recent||'<tr><td colspan="5">No AI usage yet.</td></tr>'}</tbody></table>
+      </div>`);
+  }catch(e){toast(e.message,'err');}
+}
+async function adminAddCredits(userId){
+  const n=prompt('How many Viveka AI credits to add? Example: 50');
+  const delta=Math.trunc(Number(n||0));
+  if(!delta)return;
+  try{await BK.api('POST','/api/admin/users/'+userId+'/credits',{delta,reason:'testing-topup'});toast('Credits added','ok');adminUsageModal();}
+  catch(e){toast(e.message,'err');}
+}
+function updateUserChip(){
+  let chip=document.getElementById('user-chip');
+  if(!BK.isServer()||!BK.user){if(chip)chip.remove();return;}
+  if(!chip){
+    chip=document.createElement('div');chip.id='user-chip';
+    chip.style.cssText='display:flex;align-items:center;gap:8px;margin-left:4px';
+    document.getElementById('hdr-r').prepend(chip);
+  }
+  const initials=(BK.user.name||BK.user.email||'?').split(/\s+/).map(w=>w[0]).slice(0,2).join('').toUpperCase();
+  const credits=BK.user.aiCredits!=null?Number(BK.user.aiCredits):0;
+  chip.innerHTML=`<div style="display:flex;align-items:center;gap:8px">
+    <div class="pill s" title="Manual screening, import, PRISMA, and meta-analysis are free. Only Viveka Cloud AI uses credits.">Viveka Credits: ${credits}</div>
+    ${BK.user.isAdmin?'<button class="hbtn" onclick="adminUsageModal()" title="Admin portal: users, AI credits, and usage logs">Admin Portal</button>':''}
+    <div style="width:28px;height:28px;border-radius:50%;background:var(--syn);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;cursor:pointer" title="${esc(BK.user.email)}\nClick to view profile" onclick="showProfileModal()">${esc(initials)}</div>
+  </div>`;
+}
+window.showAuthScreen=showAuthScreen;window.authTab=authTab;window.authSubmit=authSubmit;window.doLogout=doLogout;window.adminUsageModal=adminUsageModal;window.adminAddCredits=adminAddCredits;window.showProfileModal=showProfileModal;
+
+/* ---------- SERVER-BACKED PROJECT OPS ---------- */
+async function serverListProjects(){
+  const r = await BK.api('GET','/api/projects');
+  return (r.projects||[]).map(p=>({ id:p.id, title:p.title, question:'', updatedAt:p.updated_at,
+    counts:{total:Number(p.total_count||0),incl:Number(p.included_count||0),screened:Number(p.screened_count||0)},
+    role:p.role, members:p.member_count, _server:true }));
+}
+async function serverOpenProject(id){
+  const r = await BK.api('GET','/api/projects/'+id);
+  const data = r.project.data||{};
+  Object.keys(ST).forEach(k=>delete ST[k]);
+  Object.assign(ST, blankState(), data, { id });   // ensure required keys exist
+  window.ST=ST; BK.version=r.project.version; BK.role=r.role;
+  BK.myAssignmentsOnly = BK.role==='reviewer' && hasLiveAssignments();
+  updatePill();updateKeyBtn();updateAgentChip();renderTeam();
+  startServerPolling();
+  openWorkspace(ST.project&&ST.project.question?(ST.refs.length?'screen':'agents'):'protocol');
+}
+async function serverNewProject(){
+  const s=blankState(); Object.keys(ST).forEach(k=>delete ST[k]); Object.assign(ST,s); window.ST=ST;
+  const r = await BK.api('POST','/api/projects',{title:'Untitled review', data:strip(ST)});
+  ST.id=r.id; BK.version=r.version; BK.role='owner';
+  openWorkspace('protocol'); toast('New project created','ok');
+}
+async function serverDeleteProject(id){
+  if(!confirm('Delete this project for everyone? This cannot be undone.'))return;
+  try{ await BK.api('DELETE','/api/projects/'+id); toast('Project deleted','ok'); }
+  catch(e){ toast(e.message,'err'); }
+  renderHome();
+}
+// strip transient/in-memory bits before sending to server
+function strip(st){ const o=Object.assign({},st); return o; }
+
+/* server save with optimistic concurrency + debounce */
+let _srvTimer=null, _srvSaving=false, _srvDirty=false;
+let _srvPoll=null;
+function serverSaveSoon(){ if(_srvTimer)return; _srvTimer=setTimeout(()=>{_srvTimer=null;serverSaveNow();},1400); }
+async function serverSaveNow(){
+  if(!ST.id){ return; }
+  if(_srvSaving){ _srvDirty=true; return; }
+  _srvSaving=true;
+  try{
+    const r = await BK.api('PUT','/api/projects/'+ST.id, { data:strip(ST), version:BK.version });
+    BK.version = r.version; setSyncState('saved');
+  }catch(e){
+    if(e.status===409){ setSyncState('conflict'); onSaveConflict(e.body && e.body.currentVersion); }
+    else { setSyncState('error'); }
+  }finally{
+    _srvSaving=false;
+    if(_srvDirty){ _srvDirty=false; serverSaveSoon(); }
+  }
+}
+function startServerPolling(){
+  if(_srvPoll) clearInterval(_srvPoll);
+  if(!BK.isServer()||!ST.id) return;
+  _srvPoll=setInterval(async ()=>{
+    if(!ST.id||_srvSaving||_srvTimer) return;
+    if(typeof BATCH_CTRL!=='undefined'&&Object.values(BATCH_CTRL).some(x=>x&&x.running)) return;
+    try{
+      const r=await BK.api('GET','/api/projects/'+ST.id, null, 8000);
+      if(r.project && r.project.version!==BK.version){
+        const phase=(typeof CUR==='string'&&CUR)||((window.CUR&&window.CUR.id)||'screen');
+        const curId=ST.id;
+        const data=r.project.data||{};
+        Object.keys(ST).forEach(k=>delete ST[k]);
+        Object.assign(ST, blankState(), data, { id: curId||r.project.id });
+        window.ST=ST; BK.version=r.project.version; BK.role=r.role;
+        if(BK.role==='reviewer'&&hasLiveAssignments()) BK.myAssignmentsOnly=true;
+        updatePill();updateKeyBtn();updateAgentChip();renderTeam();
+        renderCurrentPhaseNoSave(phase);
+        setSyncState('saved');
+      }
+    }catch(e){}
+  },15000);
+}
+function onSaveConflict(){
+  // someone else saved since we loaded — reload to get the latest, preserving the user's view
+  if(document.getElementById('conflict-bar')) return;
+  const bar=document.createElement('div'); bar.id='conflict-bar';
+  bar.className='conflict-soft';
+  bar.innerHTML='<span>Newer team changes are available.</span> <button class="btn sm" style="background:#fff;color:var(--ink)" onclick="reloadShared()">Reload latest</button>';
+  document.body.appendChild(bar);
+}
+async function reloadShared(){ const b=document.getElementById('conflict-bar'); if(b)b.remove();
+  const cur=ST.id; if(cur) await serverOpenProject(cur); }
+function setSyncState(s){
+  const el=document.getElementById('sync-state'); if(!el)return;
+  el.textContent = s==='saved'?'✓ all changes saved':s==='conflict'?'⚠ needs reload':s==='error'?'⚠ offline — retrying':'saving…';
+  el.style.color = s==='error'?'var(--exc)':s==='conflict'?'var(--maybe)':'var(--t3)';
+}
+window.reloadShared=reloadShared;
+setSyncState=function(s){
+  const el=document.getElementById('sync-state'); if(!el)return;
+  el.textContent = s==='saved'?'Saved':s==='conflict'?'New team changes available':s==='error'?'Offline - retrying':'Saving...';
+  el.style.color = s==='error'?'var(--exc)':s==='conflict'?'var(--maybe)':'var(--t3)';
+};
+
+/* ---------- INVITE / MEMBERS UI (inside a project) ---------- */
+async function inviteCollabModal(){
+  if(!BK.isServer()){ toast('Invites work when the app is hosted on your server (see deployment guide).','err'); return; }
+  modal('<div class="modal-h">👥 Share this review<button class="x" onclick="closeModal()">×</button></div>'+
+  '<div class="modal-b"><div id="inv-list" class="muted">Loading members…</div>'+
+    '<div class="divider"></div>'+
+    '<div class="card-h" style="margin-bottom:8px">Invite a collaborator</div>'+
+    '<div class="row"><input class="inp" id="inv-email" type="email" placeholder="their email" style="flex:1">'+
+      '<select class="inp" id="inv-role" style="width:auto"><option value="reviewer">Reviewer</option><option value="editor">Editor</option></select>'+
+      '<button class="btn" onclick="sendInvite()">Invite</button></div>'+
+    '<div id="inv-result" class="muted" style="margin-top:8px"></div>'+
+  '</div><div class="modal-f"><button class="btn gh" onclick="closeModal()">Done</button></div>');
+  loadMembers();
+}
+async function loadMembers(){
+  try{
+    const r=await BK.api('GET','/api/projects/'+ST.id+'/members');
+    const me=BK.user&&BK.user.id;
+    const rows=(r.members||[]).map(m=>`<div class="row" style="margin-bottom:6px"><b>${esc(m.name||m.email)}</b>`+
+      `<span class="pill ${m.role==='owner'?'f':'s'}">${m.role}</span><span class="muted">${esc(m.email)}</span>`+
+      (BK.role==='owner'&&m.id!==me?`<span class="spacer"></span><button class="pc-act del" onclick="removeMember('${m.id}')">remove</button>`:'')+`</div>`).join('');
+    const pend=(r.pending||[]).map(p=>`<div class="row" style="margin-bottom:6px;opacity:.7"><b>${esc(p.email)}</b><span class="pill">invited · ${p.role}</span><span class="muted">pending</span></div>`).join('');
+    document.getElementById('inv-list').innerHTML='<div class="card-h" style="margin-bottom:8px">People with access</div>'+rows+pend;
+  }catch(e){ document.getElementById('inv-list').textContent=e.message; }
+}
+async function sendInvite(){
+  const email=document.getElementById('inv-email').value.trim(); const role=document.getElementById('inv-role').value;
+  if(!email){ toast('Enter an email','err'); return; }
+  try{
+    const r=await BK.api('POST','/api/projects/'+ST.id+'/invite',{email,role});
+    const out=document.getElementById('inv-result');
+    out.innerHTML = (r.emailed?'✓ Invite emailed to '+esc(email)+'. ':(r.alreadyUser?'✓ Added '+esc(email)+' (they already have an account). ':'✓ Invite created. '))+
+      'Share this link if needed:<br><code style="font-size:11px;word-break:break-all">'+esc(r.link)+'</code>';
+    document.getElementById('inv-email').value=''; loadMembers();
+  }catch(e){ toast(e.message,'err'); }
+}
+async function removeMember(uid){ if(!confirm('Remove this person from the project?'))return;
+  try{ await BK.api('DELETE','/api/projects/'+ST.id+'/members/'+uid); loadMembers(); }catch(e){ toast(e.message,'err'); } }
+window.inviteCollabModal=inviteCollabModal;window.sendInvite=sendInvite;window.removeMember=removeMember;window.loadMembers=loadMembers;
+async function sendInviteEnhanced(){
+  const email=document.getElementById('inv-email').value.trim();
+  const role=document.getElementById('inv-role').value;
+  if(!email){ toast('Enter an email','err'); return; }
+  try{
+    const r=await BK.api('POST','/api/projects/'+ST.id+'/invite',{email,role},15000);
+    const out=document.getElementById('inv-result');
+    let msg='';
+    if(r.emailQueued) msg='Invite email queued for '+esc(email)+'. ';
+    else if(r.alreadyUser) msg='Added '+esc(email)+' because they already have an account. ';
+    else if(r.pendingAlreadyExists) msg='An invite for '+esc(email)+' is already pending. ';
+    else if(r.emailError) msg='Invite created, but the email could not be sent from the server. ';
+    else msg='Invite created. ';
+    out.innerHTML = '✓ '+msg+'Share this link if needed:<br><code style="font-size:11px;word-break:break-all">'+esc(r.link)+'</code>';
+    document.getElementById('inv-email').value='';
+    loadMembers();
+  }catch(e){ toast(e.message,'err'); }
+}
+sendInvite = sendInviteEnhanced;
+window.sendInvite = sendInvite;
+
+function renderHomeServer(){
+  const home=document.getElementById('home');
+  const name=esc(userDisplayName());
+  const last=esc(fmtDateTime(BK.previousLoginAt));
+  home.innerHTML=`<div class="home-wrap">
+    <div class="welcome-card">
+      <h2>Welcome, ${name}</h2>
+      <div class="muted">Last login: ${last}</div>
+      <div class="welcome-stats">
+        <div class="welcome-stat"><b id="dash-reviews">-</b><div class="muted">active reviews</div></div>
+        <div class="welcome-stat"><b id="dash-progress">-</b><div class="muted">overall screening progress</div><div class="prog-mini" style="max-width:none;margin-top:8px"><i id="dash-progress-bar" style="width:0%"></i></div></div>
+        <div class="welcome-stat"><b id="dash-done">-</b><div class="muted">screened records</div></div>
+        <div class="welcome-stat"><b id="dash-updated">-</b><div class="muted">last project update</div></div>
+      </div>
+    </div>
+    <div class="home-hero">
+      <div><h1>Your reviews</h1>
+        <p class="lead">Reviews are saved to your account and shared live with everyone you invite. Create one, or open a shared review below.</p></div>
+      <div class="spacer"></div>
+      <div class="row" style="align-items:center">
+        <span class="muted">${esc((BK.user&&(BK.user.name||BK.user.email))||'')}</span>
+        <button class="btn" onclick="newProject()">+ New review</button>
+        <button class="btn gh" onclick="doLogout()">Log out</button>
+      </div>
+    </div>
+    <div id="home-grid" class="proj-grid">
+      <div class="proj-card new-card" onclick="newProject()"><div class="plus">+</div><div style="margin-top:8px;font-weight:600">Start a new review</div></div>
+      <div class="muted" style="padding:20px">Loading your reviews…</div>
+    </div></div>`;
+  serverListProjects().then(projs=>{
+    const total=projs.reduce((s,p)=>s+(p.counts&&p.counts.total||0),0);
+    const screened=projs.reduce((s,p)=>s+(p.counts&&p.counts.screened||0),0);
+    const pct=total?Math.round(screened/total*100):0;
+    const lastUpdate=projs[0]&&projs[0].updatedAt?fmtDateTime(projs[0].updatedAt):'No project yet';
+    const setDash=(id,val)=>{const el=document.getElementById(id);if(el)el.textContent=val;};
+    setDash('dash-reviews',projs.length);setDash('dash-progress',pct+'%');setDash('dash-done',screened+' / '+total);setDash('dash-updated',lastUpdate);
+    const dashBar=document.getElementById('dash-progress-bar');if(dashBar)dashBar.style.width=pct+'%';
+    const cards=projs.map(p=>{
+      const when=p.updatedAt?new Date(p.updatedAt).toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'}):'';
+      const c=p.counts||{total:0,incl:0,screened:0};
+      const prog=c.total?Math.round(c.screened/Math.max(1,c.total)*100):0;
+      return `<div class="proj-card" onclick="openProject('${p.id}')">
+        <div class="pc-title">${esc(p.title||'Untitled review')}</div>
+        <div class="pc-q">${esc(p.question||'Open to view the protocol and studies')}</div>
+        <div class="pc-meta"><span class="pill ${p.role==='owner'?'f':'s'}">${p.role}</span>
+          ${p.members>1?`<span class="pill">👥 ${p.members} members</span>`:''}</div>
+        <div class="pc-foot" onclick="event.stopPropagation()">
+          <span class="pc-date" style="flex:1">${when}</span>
+          ${p.role==='owner'?`<button class="pc-act del" title="Delete for everyone" onclick="deleteProject('${p.id}')">🗑</button>`:''}
+        </div></div>`;
+    }).join('');
+    const grid=document.getElementById('home-grid');
+    if(grid)grid.innerHTML=`<div class="proj-card new-card" onclick="newProject()"><div class="plus">+</div><div style="margin-top:8px;font-weight:600">Start a new review</div></div>`+cards
+      +(!projs.length?'<div class="muted" style="padding:20px">No reviews yet — create your first.</div>':'');
+  }).catch(e=>{ const grid=document.getElementById('home-grid'); if(grid)grid.innerHTML='<div class="banner warn"><span class="bi">⚠</span><div>Could not load reviews: '+esc(e.message)+'</div></div>'; });
+}
+window.renderHomeServer=renderHomeServer;
+function serverReviewProgress(p){
+  const c=p.counts||{};
+  const total=Number(c.total||0);
+  const screened=Number(c.screened||0);
+  const included=Number(c.incl||0);
+  const pct=total?Math.round(screened/total*100):0;
+  return {total,screened,included,pct};
+}
+function setHomeText(id,value){const el=document.getElementById(id);if(el)el.textContent=value;}
+renderHomeServer=function(){
+  const home=document.getElementById('home');
+  const name=esc(userDisplayName());
+  const last=esc(fmtDateTime(BK.previousLoginAt));
+  home.innerHTML=`<div class="home-wrap">
+    <div class="welcome-card">
+      <h2>Welcome, ${name}</h2>
+      <div class="muted">Last login: ${last}</div>
+      <div class="welcome-stats">
+        <div class="welcome-stat"><b id="dash-reviews">-</b><div class="muted">active reviews</div></div>
+        <div class="welcome-stat"><b id="dash-progress">-</b><div class="muted">overall title/abstract progress</div><div class="prog-mini" style="max-width:none;margin-top:8px"><i id="dash-progress-bar" style="width:0%"></i></div></div>
+        <div class="welcome-stat"><b id="dash-done">-</b><div class="muted">screened records</div></div>
+        <div class="welcome-stat"><b id="dash-included">-</b><div class="muted">full-text included</div></div>
+      </div>
+    </div>
+    ${BK.user&&BK.user.isAdmin?`<div class="welcome-card" style="background:linear-gradient(135deg,#fff,#eefafa);border-color:#b8dedf">
+      <div class="row" style="align-items:flex-start">
+        <div>
+          <div class="muted" style="text-transform:uppercase;letter-spacing:.08em;font-size:11px;font-weight:800;color:var(--flow)">Admin Portal</div>
+          <h2 style="margin-top:4px">Users, AI credits, and usage logs</h2>
+          <p class="lead" style="margin:0;max-width:720px">Open this to see registered users, remaining Viveka credits, AI-credit usage patterns, recent AI logs, and to manually add testing credits.</p>
+        </div>
+        <span class="spacer"></span>
+        <button class="btn" onclick="adminUsageModal()">Open Admin Portal</button>
+      </div>
+    </div>`:''}
+    <div class="home-hero">
+      <div><h1>Your reviews</h1>
+        <p class="lead">Reviews are saved to your account and shared live with everyone you invite. Create one, or open a shared review below.</p></div>
+      <div class="spacer"></div>
+      <div class="row" style="align-items:center">
+        <span class="muted">${esc((BK.user&&(BK.user.name||BK.user.email))||'')}</span>
+        ${BK.user&&BK.user.isAdmin?'<button class="btn gh" onclick="adminUsageModal()">Admin Portal</button>':''}
+        <button class="btn" onclick="newProject()">+ New review</button>
+        <button class="btn gh" onclick="doLogout()">Log out</button>
+      </div>
+    </div>
+    <div id="home-grid" class="proj-grid">
+      <div class="proj-card new-card" onclick="newProject()"><div class="plus">+</div><div style="margin-top:8px;font-weight:600">Start a new review</div></div>
+      <div class="muted" style="padding:20px">Loading your reviews...</div>
+    </div></div>`;
+  serverListProjects().then(projs=>{
+    const totals=projs.reduce((a,p)=>{const v=serverReviewProgress(p);a.total+=v.total;a.screened+=v.screened;a.included+=v.included;return a;},{total:0,screened:0,included:0});
+    const pct=totals.total?Math.round(totals.screened/totals.total*100):0;
+    setHomeText('dash-reviews',projs.length);
+    setHomeText('dash-progress',pct+'%');
+    setHomeText('dash-done',totals.screened+' / '+totals.total);
+    setHomeText('dash-included',totals.included);
+    const dashBar=document.getElementById('dash-progress-bar');if(dashBar)dashBar.style.width=pct+'%';
+    const cards=projs.map(p=>{
+      const when=p.updatedAt?new Date(p.updatedAt).toLocaleDateString(undefined,{month:'short',day:'numeric',year:'numeric'}):'';
+      const v=serverReviewProgress(p);
+      return `<div class="proj-card" onclick="openProject('${p.id}')">
+        <div class="pc-title">${esc(p.title||'Untitled review')}</div>
+        <div class="pc-q">${v.total?`${v.screened} of ${v.total} records screened`:'Open to view the protocol and studies'}</div>
+        <div class="pc-meta"><span class="pill ${p.role==='owner'?'f':'s'}">${esc(p.role||'member')}</span>
+          ${p.members>1?`<span class="pill">${p.members} members</span>`:''}
+          ${v.included?`<span class="pill f">${v.included} included</span>`:''}</div>
+        <div class="prog-mini" style="max-width:none;margin-top:12px"><i style="width:${v.pct}%"></i></div>
+        <div class="muted" style="margin-top:6px">${v.pct}% title/abstract complete</div>
+        <div class="pc-foot" onclick="event.stopPropagation()">
+          <span class="pc-date" style="flex:1">${esc(when)}</span>
+          ${p.role==='owner'?`<button class="pc-act del" title="Delete for everyone" onclick="deleteProject('${p.id}')">x</button>`:''}
+        </div></div>`;
+    }).join('');
+    const grid=document.getElementById('home-grid');
+    if(grid)grid.innerHTML=`<div class="proj-card new-card" onclick="newProject()"><div class="plus">+</div><div style="margin-top:8px;font-weight:600">Start a new review</div></div>`+cards
+      +(!projs.length?'<div class="muted" style="padding:20px">No reviews yet - create your first.</div>':'');
+  }).catch(e=>{ const grid=document.getElementById('home-grid'); if(grid)grid.innerHTML='<div class="banner warn"><span class="bi">!</span><div>Could not load reviews: '+esc(e.message)+'</div></div>'; });
+};
+window.renderHomeServer=renderHomeServer;
+
+let _booted=false;
+async function boot(){
+  if(_booted)return; _booted=true;
+  // capture an invite token from the URL (?invite=...)
+  const params=new URLSearchParams(location.search);
+  if(params.get('invite')) BK._pendingInvite=params.get('invite');
+  await BK.detect();
+  if(BK.isServer())purgeBrowserAIKeys();
+  window.ST=ST; updateKeyBtn();
+  if(BK.isServer()){
+    // add a sync indicator + share button into the header (once)
+    injectServerHeaderBits();
+    // arriving via a password-reset link takes priority
+    if(params.get('reset')){ showResetScreen(params.get('reset')); return; }
+    try{ const me=await BK.api('GET','/api/me'); BK.user=me.user; }
+    catch(e){ BK.user=null; }
+    if(!BK.user){ showAuthScreen(); return; }
+    await afterLogin();      // handles pending invite, else goHome()
+    return;
+  }
+  // ----- LOCAL mode (unchanged) -----
+  const loaded=load();
+  if(loaded && ST.project && (ST.project.question||ST.refs.length)){
+    updatePill();updateAgentChip();renderTeam();
+    openWorkspace(ST.project.question?(ST.refs.length?'screen':'agents'):'protocol');
+  }else{ goHome(); }
+}
+function injectServerHeaderBits(){
+  if(document.getElementById('sync-state'))return;
+  const header=document.querySelector('header'); if(!header)return;
+  const wrap=document.createElement('div'); wrap.className='row'; wrap.style.cssText='gap:10px;align-items:center';
+  wrap.innerHTML='<span id="sync-state" class="muted" style="font-size:11px"></span>'+
+    '<button class="btn gh sm" id="share-btn" onclick="inviteCollabModal()" style="display:none">👥 Share</button>';
+  header.appendChild(wrap);
+}
+window.SAMPLE_RIS=SAMPLE_RIS;window.boot=boot;
+document.addEventListener('DOMContentLoaded',boot);
+if(document.readyState!=='loading')boot();
+
+
