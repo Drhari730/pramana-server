@@ -761,7 +761,7 @@ app.post('/api/auth/register', async (req, res) => {
   const id = uid('u_');
   const hash = await bcrypt.hash(password, 10);
   await db.q('INSERT INTO users (id,email,name,password_hash) VALUES ($1,$2,$3,$4)', [id, email.toLowerCase(), name || email.split('@')[0], hash]);
-  const user = { id, email: email.toLowerCase(), name: name || email.split('@')[0], ai_credits: 50 };
+  const user = { id, email: email.toLowerCase(), name: name || email.split('@')[0], ai_credits: 200 };
   await autoAcceptInvites(user);
   setAuthCookie(res, user);
   let welcomeEmailQueued = false, emailError;
@@ -801,7 +801,7 @@ app.post('/api/auth/google', async (req, res) => {
     if (!user) {
       const id = uid('u_');
       await db.q('INSERT INTO users (id,email,name,google_id) VALUES ($1,$2,$3,$4)', [id, email, p.name || email.split('@')[0], p.sub]);
-      user = { id, email, name: p.name || email.split('@')[0], ai_credits: 50 };
+      user = { id, email, name: p.name || email.split('@')[0], ai_credits: 200 };
     }
     await autoAcceptInvites(user);
     setAuthCookie(res, user);
