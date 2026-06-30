@@ -904,7 +904,7 @@ Return ONLY JSON:
  "glossary":[{"term":"...","meaning":"short"}],   // 6-8 key domain terms a screener must know
  "synonyms":["...","..."],                          // 10-15 alternate terms/spellings for the Population & Intervention (for highlighting & search)
  "tricky":["...","..."]}                            // 3-5 borderline situations that commonly cause wrong include/exclude calls`;
-    const dom=parseJSON(await LLM(dPrompt,1000));
+    const dom=parseJSON(await LLM(dPrompt,1500));
     ST.agent.glossary=dom.glossary||[];ST.agent.synonyms=dom.synonyms||[];
     setStep(0,'done');await sleep(150);
 
@@ -917,7 +917,7 @@ FRAMEWORK VALUES — 1:${p.p}|2:${p.i}|3:${p.c}|4:${p.o}
 INCLUSION: ${p.inc||'must match PICO'}
 EXCLUSION: ${p.exc||'outside PICO'}
 Return ONLY JSON: {"persona":"<150-220 words, second person, methodologically rigorous, Cochrane/JBI/PRISMA-aligned, names the specific expertise needed, states that title/abstract uncertainty should become MAYBE rather than false exclusion, and says full-text exclusion needs an explicit reason>"}`;
-    ST.agent.persona=(parseJSON(await LLM(persPrompt,700)).persona)||'';
+    ST.agent.persona=(parseJSON(await LLM(persPrompt,1000)).persona)||'';
     setStep(1,'done');await sleep(150);
 
     // 3. Decision rubric
@@ -926,7 +926,7 @@ Return ONLY JSON: {"persona":"<150-220 words, second person, methodologically ri
 ${reviewCtx}
 QUESTION:${p.question}; FRAMEWORK 1:${p.p}|2:${p.i}|3:${p.c}|4:${p.o}; INC:${p.inc}; EXC:${p.exc}
 Return ONLY JSON: {"rubric":[ "<8-12 short, testable decision rules; include hard-exclude rules, uncertainty/MAYBE rules for incomplete abstracts, and full-text exclusion categories; each starts with INCLUDE if / EXCLUDE if / MAYBE if>" ]}`;
-    ST.agent.rubric=(parseJSON(await LLM(rubPrompt,800)).rubric)||[];
+    ST.agent.rubric=(parseJSON(await LLM(rubPrompt,1500)).rubric)||[];
     setStep(2,'done');await sleep(150);
 
     // 4. Synthetic gold standard
@@ -935,7 +935,7 @@ Return ONLY JSON: {"rubric":[ "<8-12 short, testable decision rules; include har
 ${reviewCtx}
 QUESTION:${p.question}; FRAMEWORK 1:${p.p}|2:${p.i}|3:${p.c}|4:${p.o}; INC:${p.inc}; EXC:${p.exc}
 Return ONLY JSON: {"cases":[{"title":"...","abstract":"2-4 sentences","gold":"include|exclude|maybe","why":"short"}]}`;
-    const gold=(parseJSON(await LLM(goldPrompt,1600)).cases)||[];
+    const gold=(parseJSON(await LLM(goldPrompt,4000)).cases)||[];
     setStep(3,'done');await sleep(150);
 
     // 5. Self-calibration — agent screens its own gold set
