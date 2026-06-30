@@ -1387,7 +1387,7 @@ function parseAndAdd(text,fname){
         save();toast('Project file loaded','ok');updatePill();updateAgentChip();renderTeam();renderImport();renderSpine();return;}
       recs=Array.isArray(j)?j:[];}
     else if(low.endsWith('.xml')||/<records>|<xml>|EndNote/.test(text.slice(0,400)))recs=parseEndNoteXML(text);
-    else if(/^TY  -|^PMID-|^\nTY  -/m.test(text)||low.endsWith('.ris'))recs=parseRIS(text);
+    else if(/^TY  -|^\nTY  -/m.test(text)||low.endsWith('.ris'))recs=parseRIS(text);
     else if(/^@\w+\s*{/m.test(text)||low.endsWith('.bib'))recs=parseBibTeX(text);
     else if(/^PMID-|^TI  -|^AB  -/m.test(text)||low.endsWith('.nbib'))recs=parseNBIB(text);
     else if(low.endsWith('.csv')||text.includes(',')&&text.includes('\n'))recs=parseCSV(text);
