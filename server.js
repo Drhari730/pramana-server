@@ -1002,7 +1002,7 @@ app.delete('/api/projects/:id/members/:userId', requireAuth(async (req, res) => 
 app.post('/api/ai/generate', requireAuth(async (req, res) => {
   const { prompt, maxTok, model } = req.body || {};
   const selectedModel = model || 'gemini-flash';
-  const creditCost = 5;
+  const creditCost = Number(req.body.creditCost) || 1;
   if (!prompt || typeof prompt !== 'string') return res.status(400).json({ error: 'Prompt required' });
   if (prompt.length > 30000) return res.status(413).json({ error: 'Prompt is too large for this Phase 1 server endpoint' });
   const balance = await aiBalance(req.user.id);
