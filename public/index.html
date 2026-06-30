@@ -1421,7 +1421,7 @@ function parseRIS(t){const recs=[];let cur=null;
   });
   if(cur)recs.push(cur);return recs.filter(r=>r.title);
 }
-function parseNBIB(t){const recs=[];t.replace(/\r/g,'').split(/\n(?=PMID-\s|PMID -\s)/).forEach(block=>{
+function parseNBIB(t){const recs=[];t.replace(/\r/g,'').split(/(?:\n\s*\n|\n(?=PMID-\s|PMID -\s))/).forEach(block=>{
   if(!block.trim())return;const r={authors:''};const lines=block.split(/\n/);let lastTag='';
   lines.forEach(l=>{const m=l.match(/^([A-Z]{2,4})\s*-\s?(.*)$/);
     if(m){lastTag=m[1];const v=m[2];
@@ -1431,7 +1431,7 @@ function parseNBIB(t){const recs=[];t.replace(/\r/g,'').split(/\n(?=PMID-\s|PMID
       else if(lastTag==='DP')r.year=v.replace(/[^0-9]/g,'').slice(0,4);
       else if(lastTag==='JT'||lastTag==='TA')r.journal=r.journal||v;
       else if(lastTag==='LID'||lastTag==='AID'){const d=v.match(/(10\.\d{4,}\/[^\s\[]+)/);if(d)r.doi=d[1];}
-    }else if(/^\s{4,}/.test(l)&&lastTag){
+    }else if(/^\s+/.test(l)&&lastTag){
       if(lastTag==='TI')r.title+=l.trim()+' ';
       else if(lastTag==='AB')r.abstract=(r.abstract||'')+l.trim()+' ';
       else if(lastTag==='JT'||lastTag==='TA')r.journal=(r.journal||'')+' '+l.trim();
