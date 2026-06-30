@@ -1357,11 +1357,31 @@ function renderImport(){
       <button class="btn gh sm" onclick="document.getElementById('paste-in').value=SAMPLE_RIS">Insert sample RIS</button></div>
   </div>
 
+  const files = {};
+  ST.refs.forEach(r => {
+    if(!files[r.source]) files[r.source] = { count: 0, db: r.db || 'Unknown' };
+    files[r.source].count++;
+  });
+  const fileRows = Object.entries(files).map(([src, info]) => {
+    const dbOptions = ['Unknown', 'PubMed', 'Scopus', 'Web of Science', 'Embase', 'Cochrane', 'Ovid', 'Other'].map(db => 
+      `<option value="${db}" ${info.db === db ? 'selected' : ''}>${db}</option>`
+    ).join('');
+    return `<div style="display:flex;align-items:center;justify-content:space-between;padding:10px 14px;border-bottom:1px solid var(--line);background:#fff">
+      <div style="flex:1;font-weight:600;font-size:13px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${esc(src)}">${esc(src)} <span class="muted" style="font-weight:400;margin-left:6px">(${info.count} records)</span></div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <select class="inp" style="padding:4px 8px;font-size:12px;height:auto;min-width:120px" onchange="window.updateSourceDb('${esc(src)}', this.value)">${dbOptions}</select>
+        <button class="btn danger gh sm" onclick="window.deleteSource('${esc(src)}')">Delete</button>
+      </div>
+    </div>`;
+  }).join('');
+  const fileListHTML = fileRows ? `<div class="card" style="padding:0;overflow:hidden;border-radius:12px;margin-bottom:16px">${fileRows}</div>` : '';
+
   ${n?`<div class="tiles">
     <div class="tile flow"><div class="v">${n}</div><div class="k">records imported</div></div>
     <div class="tile"><div class="v">${new Set(ST.refs.map(r=>r.source)).size}</div><div class="k">sources</div></div>
     <div class="tile maybe"><div class="v">${ST.refs.filter(r=>!r.abstract).length}</div><div class="k">missing abstract</div></div>
   </div>
+  ${fileListHTML}
   <div class="row"><button class="btn flow" onclick="ASRMA.go('dedup')">De-duplicate →</button>
     <button class="btn danger gh sm" onclick="if(confirm('Remove all imported studies?')){ST.refs=[];ST.effects=[];save();renderImport();renderSpine()}">Clear all</button></div>`:''}`;
   wireDrop();
@@ -1377,6 +1397,8 @@ function wireDrop(){
 function readFile(file){const r=new FileReader();r.onload=()=>parseAndAdd(r.result,file.name);r.readAsText(file);}
 function doImportText(){const t=document.getElementById('paste-in').value;if(!t.trim()){toast('Nothing to parse','err');return;}parseAndAdd(t,'pasted');}
 function doImportFile(){}
+window.updateSourceDb = function(src, db) { ST.refs.forEach(r => { if(r.source === src) r.db = db; }); save(); renderImport(); };
+window.deleteSource = function(src) { if(!confirm('Delete all records imported from ' + src + '?')) return; ST.refs = ST.refs.filter(r => r.source !== src); ST.effects = []; save(); renderImport(); renderSpine(); };
 
 /* ---------- PARSERS ---------- */
 function parseAndAdd(text,fname){
@@ -1402,7 +1424,7 @@ function normalizeRef(r){
   return{id:r.id,title:(r.title||'').trim(),abstract:(r.abstract||'').trim(),
     authors:(r.authors||'').trim(),year:(r.year||'').toString().slice(0,4),
     journal:(r.journal||'').trim(),doi:(r.doi||'').replace(/^https?:\/\/(dx\.)?doi\.org\//,'').trim(),
-    source:r.source,dup:false,ta:null,ft:null,extract:null,quality:null};
+    source:r.source,db:r.db||'Unknown',dup:false,ta:null,ft:null,extract:null,quality:null};
 }
 function parseRIS(t){const recs=[];let cur=null;
   t.split(/\r?\n/).forEach(line=>{
@@ -3626,6 +3648,7 @@ ASRMA.runMeta=runMeta;ASRMA.addEffect=addEffect;ASRMA.removeEffect=removeEffect;
 /* ===================== REPORT / PRISMA / EXPORT ===================== */
 function prismaCounts(){
   const total=ST.refs.length;
+  const sources={}; ST.refs.forEach(r => { sources[r.db || 'Unknown'] = (sources[r.db || 'Unknown'] || 0) + 1; });
   const dups=ST.refs.filter(r=>r.dup).length;
   const uniq=ST.refs.filter(r=>!r.dup);
   const screened=uniq.filter(r=>r.ta).length;
@@ -3634,7 +3657,7 @@ function prismaCounts(){
   const ftExcl=sought.filter(r=>r.ft&&r.ft.decision==='exclude');
   const included=sought.filter(r=>r.ft&&r.ft.decision==='include').length;
   const reasons={};ftExcl.forEach(r=>{const c=r.ft.exclCat||'other';reasons[c]=(reasons[c]||0)+1;});
-  return{total,dups,uniqN:uniq.length,screened,taExcl,sought:sought.length,ftExclN:ftExcl.length,included,reasons};
+  return{total,dups,uniqN:uniq.length,screened,taExcl,sought:sought.length,ftExclN:ftExcl.length,included,reasons,sources};
 }
 function renderReport(){
   const c=prismaCounts();
@@ -3669,25 +3692,28 @@ function prismaSVG(c){
   const W=640,H=560;const cx=170,bw=250,bh=52;
   const reasons=Object.entries(c.reasons).map(a=>a[0]+': '+a[1]);
   const exH=Math.max(bh,30+reasons.length*13);
-  return '<svg id="prisma-svg" width="'+W+'" height="'+H+'" viewBox="0 0 '+W+' '+H+'" style="background:#fff;max-width:100%" xmlns="http://www.w3.org/2000/svg">'+
+  const sourceArr=Object.entries(c.sources||{}).map(a=>a[0]+' (n='+a[1]+')');
+  const dbH=Math.max(bh,30+sourceArr.length*14);
+  const dy = dbH - bh;
+  return '<svg id="prisma-svg" width="'+W+'" height="'+(H+dy)+'" viewBox="0 0 '+W+' '+(H+dy)+'" style="background:#fff;max-width:100%" xmlns="http://www.w3.org/2000/svg">'+
   '<defs><marker id="ah" markerWidth="9" markerHeight="9" refX="7" refY="3" orient="auto"><path d="M0,0 L7,3 L0,6" fill="var(--t3)"/></marker></defs>'+
-  box(cx,20,bw,bh,['Records identified from databases','n = '+c.total],'rgba(13,148,136,.07)')+
-  arrow(cx+bw/2,72,cx+bw/2,108)+
-  box(cx,108,bw,bh,['Records after duplicates removed','n = '+c.uniqN],'#fff')+
-  box(cx+bw+40,108,170,bh,['Duplicates removed','n = '+c.dups],'var(--exc-w)')+
-  arrow(cx+bw,134,cx+bw+40,134)+
-  arrow(cx+bw/2,160,cx+bw/2,196)+
-  box(cx,196,bw,bh,['Records screened (title/abstract)','n = '+c.screened],'#fff')+
-  box(cx+bw+40,196,170,bh,['Excluded at screening','n = '+c.taExcl],'var(--exc-w)')+
-  arrow(cx+bw,222,cx+bw+40,222)+
-  arrow(cx+bw/2,248,cx+bw/2,284)+
-  box(cx,284,bw,bh,['Full-text assessed for eligibility','n = '+c.sought],'#fff')+
-  box(cx+bw+40,284,170,exH,['Excluded at full text','n = '+c.ftExclN].concat(reasons),'var(--exc-w)')+
-  arrow(cx+bw,310,cx+bw+40,310)+
-  arrow(cx+bw/2,336,cx+bw/2,372)+
-  box(cx,372,bw,bh,['Studies included in review','n = '+c.included],'rgba(79,70,229,.1)')+
-  arrow(cx+bw/2,424,cx+bw/2,460)+
-  box(cx,460,bw,bh,['Studies in meta-analysis','n = '+ST.effects.filter(e=>isFinite(e.es)&&isFinite(e.se)).length],'rgba(13,148,136,.1)')+
+  box(cx,20,bw,dbH,['Databases (n = '+c.total+')'].concat(sourceArr),'rgba(13,148,136,.07)')+
+  arrow(cx+bw/2,72+dy,cx+bw/2,108+dy)+
+  box(cx,108+dy,bw,bh,['Records after duplicates removed','n = '+c.uniqN],'#fff')+
+  box(cx+bw+40,108+dy,170,bh,['Duplicates removed','n = '+c.dups],'var(--exc-w)')+
+  arrow(cx+bw,134+dy,cx+bw+40,134+dy)+
+  arrow(cx+bw/2,160+dy,cx+bw/2,196+dy)+
+  box(cx,196+dy,bw,bh,['Records screened (title/abstract)','n = '+c.screened],'#fff')+
+  box(cx+bw+40,196+dy,170,bh,['Excluded at screening','n = '+c.taExcl],'var(--exc-w)')+
+  arrow(cx+bw,222+dy,cx+bw+40,222+dy)+
+  arrow(cx+bw/2,248+dy,cx+bw/2,284+dy)+
+  box(cx,284+dy,bw,bh,['Full-text assessed for eligibility','n = '+c.sought],'#fff')+
+  box(cx+bw+40,284+dy,170,exH,['Excluded at full text','n = '+c.ftExclN].concat(reasons),'var(--exc-w)')+
+  arrow(cx+bw,310+dy,cx+bw+40,310+dy)+
+  arrow(cx+bw/2,336+dy,cx+bw/2,372+dy)+
+  box(cx,372+dy,bw,bh,['Studies included in review','n = '+c.included],'rgba(79,70,229,.1)')+
+  arrow(cx+bw/2,424+dy,cx+bw/2,460+dy)+
+  box(cx,460+dy,bw,bh,['Studies in meta-analysis','n = '+ST.effects.filter(e=>isFinite(e.es)&&isFinite(e.se)).length],'rgba(13,148,136,.1)')+
   '</svg>';
 }
 function exportProject(){const b=new Blob([JSON.stringify(Object.assign({},ST,{_app:'asrma',_v:1}),null,2)],{type:'application/json'});
