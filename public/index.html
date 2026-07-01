@@ -5625,6 +5625,7 @@ function compactDecisionPatch(r){
 }
 let _srvPatchQueue=new Map();
 let _srvPatchTimer=null,_srvPatchSaving=false,_srvPatchRetry=null,_srvPatchBackoff=2000;
+const SERVER_PATCH_BATCH_SIZE=100;
 function loadServerPatchQueue(){
   _srvPatchQueue=new Map();
   if(!window.BK||!BK.isServer||!BK.isServer()||!ST.id)return;
@@ -5682,7 +5683,7 @@ async function serverFlushPatchesNow(){
   if(_srvPatchSaving){return;}
   if(_srvPatchTimer){clearTimeout(_srvPatchTimer);_srvPatchTimer=null;}
   _srvPatchSaving=true;
-  const patches=[..._srvPatchQueue.values()];
+  const patches=[..._srvPatchQueue.values()].slice(0,SERVER_PATCH_BATCH_SIZE);
   try{
     const r=await BK.api('POST','/api/projects/'+ST.id+'/refs/patch',{patches},20000);
     if(r.version)BK.version=r.version;

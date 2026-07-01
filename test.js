@@ -229,6 +229,13 @@ async function run() {
   ok('patched title decision persists after reload', r.body.project.data.refs[0].ta.final==='exclude');
   r = await lead('POST','/api/projects/'+pid+'/refs/patch',{patches:[{id:'r1',ta:{final:'include',by:'human',comment:'restored'}}]});
   ok('decision patch can update an existing decision', r.status===200 && r.body.patched===1);
+  const manyRefs = Array.from({length:260}, (_,i)=>({id:'m'+i,title:'Mass '+i}));
+  r = await lead('POST','/api/projects',{title:'Mass patch review', data:{project:{title:'Mass patch review'},refs:manyRefs}});
+  const massPid = r.body.id;
+  r = await lead('POST','/api/projects/'+massPid+'/refs/patch',{patches:manyRefs.slice(0,250).map((x,i)=>({id:x.id,ta:{final:i%2?'exclude':'include',by:'human'}}))});
+  ok('decision patch handles hundreds of reviewer decisions', r.status===200 && r.body.patched===250);
+  r = await lead('GET','/api/projects/'+massPid);
+  ok('hundreds of patched decisions persist after reload', r.body.project.data.refs.filter(x=>x.ta&&x.ta.final).length===250);
 
   console.log('\n=== SERVER JOBS ===');
   r = await lead('POST','/api/projects/'+pid+'/jobs',{type:'extract-all',refIds:[],fields:[]});
