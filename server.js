@@ -77,7 +77,14 @@ function requireAuth(handler) {
     const u = await currentUser(req);
     if (!u) return res.status(401).json({ error: 'Not logged in' });
     req.user = u;
-    return handler(req, res);
+    try {
+      await handler(req, res);
+    } catch (err) {
+      console.error('Unhandled error in route:', err);
+      if (!res.headersSent) {
+        res.status(500).json({ error: 'Internal server error: ' + err.message });
+      }
+    }
   };
 }
 async function requireAuthMiddleware(req, res, next) {

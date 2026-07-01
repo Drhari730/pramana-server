@@ -2093,7 +2093,7 @@ function trainLocalEngine(){
   const topInc=idxs.slice().sort((a,b)=>b[1]-a[1]).slice(0,12).map(p=>eng.vocab[p[0]]);
   const topExc=idxs.slice().sort((a,b)=>a[1]-b[1]).slice(0,12).map(p=>eng.vocab[p[0]]);
   let correct=0;samples.forEach(s=>{if((lrPredict(s.v,model)>=0.5?1:0)===s.y)correct++;});
-  const incCentroid=centroid(samples,1),excCentroid=centroid(samples,0);
+  const incCentroid=Array.from(centroid(samples,1)),excCentroid=Array.from(centroid(samples,0));
   const tmpEngine={vocab:eng.vocab,vidx:eng.vidx,idf:eng.idf,w:model.w,b:model.b,incCentroid,excCentroid};
   const autoThr=recallThreshold(samples,tmpEngine,0.97);
   ST.settings.localThr=autoThr;
@@ -5015,7 +5015,7 @@ const BK = {
   mode:'local', user:null, config:{}, version:null, role:null, _pendingInvite:null, members:null, myAssignmentsOnly:false,
   async api(method, path, body, timeoutMs){
     const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 20000);
+    const timer = setTimeout(() => ctrl.abort(), timeoutMs || 120000);
     let r;
     try{
       r = await fetch(path, {method, headers:{'Content-Type':'application/json'},
