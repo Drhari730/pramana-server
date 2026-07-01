@@ -1942,6 +1942,7 @@ function renderScreen(){
       ${['all','pending','include','maybe','exclude'].map(f=>`<button class="${SCREEN_FILTER===f?'on':''}" onclick="setScreenFilter('${f}')">${f[0].toUpperCase()+f.slice(1)}</button>`).join('')}
       ${mode==='local'&&ST.engine?`<button class="${SCREEN_FILTER==='al'?'on':''}" onclick="setScreenFilter('al')" title="Most uncertain papers">Uncertain</button>`:''}
       ${tbConflicts().length?`<button class="${SCREEN_FILTER==='conflict'?'on':''}" onclick="setScreenFilter('conflict')" title="Reviewer disagreements" style="color:var(--exc)">⚠ Conflicts (${tbConflicts().length})</button>`:''}
+      ${ensureAudit().filter(x=>x.stage==='ta').length?`<button class="${SCREEN_FILTER==='disc'?'on':''}" onclick="setScreenFilter('disc')" title="AI Discrepancies" style="color:var(--maybe)">🎯 Discrepancies (${ensureAudit().filter(x=>x.stage==='ta').length})</button>`:''}
     </div>
     <div class="search-box"><input placeholder="Search title, abstract, text..." value="${esc(SCREEN_Q)}" oninput="onSearchInput(this.value)"></div>
   </div>
@@ -2059,7 +2060,7 @@ function localTrainable(){
   return {inc,exc,total:lab.length,ok:inc>=5&&exc>=5};
 }
 function crossValLocal(samples,dim){
-  const k=Math.min(5,Math.floor(samples.length/2));
+  const k=Math.min(3,Math.floor(samples.length/2));
   if(k<2)return null;
   const idx=samples.map((_,i)=>i);for(let i=idx.length-1;i>0;i--){const j=(Math.random()*(i+1))|0;[idx[i],idx[j]]=[idx[j],idx[i]];}
   let tp=0,fp=0,fn=0,tn=0;
@@ -2067,7 +2068,7 @@ function crossValLocal(samples,dim){
     const test=new Set(idx.filter((_,i)=>i%k===f));
     const tr=[],te=[];samples.forEach((s,i)=>{(test.has(i)?te:tr).push(s);});
     if(!tr.some(s=>s.y===1)||!tr.some(s=>s.y===0))continue;
-    const m=trainLR(tr.map(s=>({v:s.v,y:s.y})),dim,220);
+    const m=trainLR(tr.map(s=>({v:s.v,y:s.y})),dim,120);
     const tmp={w:m.w,b:m.b,incCentroid:centroid(tr,1),excCentroid:centroid(tr,0)};
     const thr=recallThreshold(tr,tmp,0.97);
     te.forEach(s=>{const p=localProbability(s.v,tmp)>=thr?1:0;
@@ -2087,7 +2088,7 @@ function trainLocalEngine(){
   const samples=localTrainingLabels().map(x=>({v:vmap[x.r.id],y:x.label==='include'?1:0}));
   // honest performance estimate BEFORE fitting the final model
   const val=crossValLocal(samples,eng.vocab.length);
-  const model=trainLR(samples,eng.vocab.length);
+  const model=trainLR(samples,eng.vocab.length,250);
   const idxs=model.w.map((wt,i)=>[i,wt]);
   const topInc=idxs.slice().sort((a,b)=>b[1]-a[1]).slice(0,12).map(p=>eng.vocab[p[0]]);
   const topExc=idxs.slice().sort((a,b)=>a[1]-b[1]).slice(0,12).map(p=>eng.vocab[p[0]]);
@@ -2320,7 +2321,7 @@ function renderScreenStats(){
     ${local?`<div class="tile syn"><div class="v">${byHuman}</div><div class="k">you confirmed</div></div>
       <div class="tile flow"><div class="v">${byEngine}</div><div class="k">engine-scored</div></div>`
       :`<div class="tile"><div class="v">${pend}</div><div class="k">pending</div></div>`}
-    ${disc?`<div class="tile maybe"><div class="v">${disc}</div><div class="k">AI discrepancies logged</div></div>`:''}
+    ${disc?`<div class="tile maybe" style="cursor:pointer" onclick="setScreenFilter('disc')"><div class="v">${disc}</div><div class="k">AI discrepancies logged</div></div>`:''}
   </div>${(inc||maybe)?`<div class="row" style="margin-bottom:6px"><button class="btn" onclick="ASRMA.go('fulltext')">Full-text screening (${inc+maybe}) →</button></div>`:''}`;
   if(scopeNote)el.insertAdjacentHTML('beforeend',scopeNote);
 }
@@ -2340,6 +2341,7 @@ function filteredRefs(){
   let u=ST.refs.filter(r=>!r.dup);
   if(SCREEN_FILTER==='al'){const s=window._alSet||new Set();u=u.filter(r=>s.has(r.id));}
   else if(SCREEN_FILTER==='conflict'){u=u.filter(r=>r._conflict);}
+  else if(SCREEN_FILTER==='disc'){const ids=new Set(ensureAudit().filter(x=>x.stage==='ta').map(x=>x.refId));u=u.filter(r=>ids.has(r.id));}
   else if(SCREEN_FILTER==='pending')u=u.filter(r=>{
     const ta=(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())?myStageReview(r,'ta'):anyStageDecision(r,'ta');
     return !ta||ta.by==='local';
