@@ -2301,7 +2301,7 @@ function renderScreenStats(){
   const pool=assignedOnly?allUnique.filter(r=>isAssignedToMe(r)):allUnique;
   let total=0,inc=0,maybe=0,exc=0,pend=0,byHuman=0,byEngine=0;
   for(const r of pool){total++;
-    const ta=(assignedOnly&&splitOn)?myStageReview(r,'ta'):visibleStageDecision(r,'ta');
+    const ta=(assignedOnly&&splitOn)?myStageReview(r,'ta'):anyStageDecision(r,'ta');
     if(!ta){pend++;continue;}
     const f=ta.final;if(f==='include')inc++;else if(f==='maybe')maybe++;else if(f==='exclude')exc++;
     if(ta.by==='human')byHuman++;else if(ta.by==='local')byEngine++;}
@@ -2327,16 +2327,25 @@ function renderScreenStats(){
 let SCREEN_PAGE=1;const PAGE_SIZE=50;
 function setScreenFilter(f){SCREEN_FILTER=f;SCREEN_PAGE=1;document.querySelectorAll('#screen-seg button').forEach(b=>b.classList.remove('on'));
   const btn=document.querySelector(`#screen-seg button[onclick*="'${f}'"]`);if(btn)btn.classList.add('on');renderScreenList();}
+function anyStageDecision(r, stage){
+  const v = visibleStageDecision(r, stage);
+  if (v) return v;
+  if (r.reviews && r.reviews[stage]) {
+    const vals = Object.values(r.reviews[stage]);
+    if (vals.length > 0) return vals[0];
+  }
+  return null;
+}
 function filteredRefs(){
   let u=ST.refs.filter(r=>!r.dup);
   if(SCREEN_FILTER==='al'){const s=window._alSet||new Set();u=u.filter(r=>s.has(r.id));}
   else if(SCREEN_FILTER==='conflict'){u=u.filter(r=>r._conflict);}
   else if(SCREEN_FILTER==='pending')u=u.filter(r=>{
-    const ta=(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())?myStageReview(r,'ta'):visibleStageDecision(r,'ta');
+    const ta=(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())?myStageReview(r,'ta'):anyStageDecision(r,'ta');
     return !ta||ta.by==='local';
   });
   else if(SCREEN_FILTER!=='all')u=u.filter(r=>{
-    const ta=(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())?myStageReview(r,'ta'):visibleStageDecision(r,'ta');
+    const ta=(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())?myStageReview(r,'ta'):anyStageDecision(r,'ta');
     return ta&&ta.final===SCREEN_FILTER;
   });
   if(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())u=u.filter(r=>isAssignedToMe(r));
