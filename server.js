@@ -697,6 +697,20 @@ async function sendInviteEmail(to, project, link, inviter) {
   });
   return sendTransactionalEmail({ to, subject, html });
 }
+async function sendReminderEmail(to, project, inviter) {
+  const subject = `Reminder: Screening pending for ${project}`;
+  const html = emailFrame({
+    pretitle: 'Pramana Evidence Synthesis',
+    title: 'Screening reminder',
+    body: `<p>Hello,</p>
+           <p><b>${escapeHtml(inviter)}</b> has sent a gentle reminder to complete your assigned screening queue for the review <b>${escapeHtml(project)}</b>.</p>
+           <p>Open the workspace below to jump into your assigned queue and continue screening.</p>`,
+    ctaLabel: 'Continue screening',
+    ctaLink: APP_URL,
+    note: 'This is a transactional reminder email from Pramana.'
+  });
+  return sendTransactionalEmail({ to, subject, html });
+}
 async function sendResetEmail(to, link) {
   const subject = 'Reset your Pramana password';
   const html = emailFrame({
@@ -873,7 +887,7 @@ app.get('/api/projects', requireAuth(async (req, res) => {
     `SELECT p.id,p.title,p.version,p.updated_at,m.role,
             COALESCE(jsonb_array_length(CASE WHEN jsonb_typeof(p.data->'refs')='array' THEN p.data->'refs' ELSE '[]'::jsonb END),0) AS total_count,
             (SELECT count(*) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p.data->'refs')='array' THEN p.data->'refs' ELSE '[]'::jsonb END) AS r(ref)
-              WHERE NOT COALESCE((r.ref->>'dup')::boolean,false) AND (r.ref->'ta'->>'final') IS NOT NULL) AS screened_count,
+              WHERE NOT COALESCE((r.ref->>'dup')::boolean,false) AND ( (r.ref->'ta'->>'final') IS NOT NULL OR (jsonb_typeof(r.ref->'reviews'->'ta') = 'object' AND r.ref->'reviews'->'ta' != '{}'::jsonb) )) AS screened_count,
             (SELECT count(*) FROM jsonb_array_elements(CASE WHEN jsonb_typeof(p.data->'refs')='array' THEN p.data->'refs' ELSE '[]'::jsonb END) AS r(ref)
               WHERE NOT COALESCE((r.ref->>'dup')::boolean,false) AND (r.ref->'ft'->>'decision')='include') AS included_count,
             (SELECT count(*) FROM members mm WHERE mm.project_id=p.id) AS member_count
@@ -990,6 +1004,22 @@ app.post('/api/invites/accept', requireAuth(async (req, res) => {
     [rows[0].project_id, req.user.id, rows[0].role]);
   await db.q('UPDATE invites SET accepted=true WHERE token=$1', [token]);
   res.json({ ok: true, projectId: rows[0].project_id });
+}));
+
+app.post('/api/projects/:id/remind', requireAuth(async (req, res) => {
+  const role = await memberRole(req.params.id, req.user.id);
+  if (role !== 'owner' && role !== 'editor') return res.status(403).json({ error: 'Only owner/editor can send reminders' });
+  const { email } = req.body || {};
+  if (!email) return res.status(400).json({ error: 'Email required' });
+  const normalizedEmail = email.toLowerCase();
+  const proj = await db.q('SELECT title FROM projects WHERE id=$1', [req.params.id]);
+  
+  if (emailConfigured()) {
+    queueEmail('Reminder email', normalizedEmail, () => sendReminderEmail(normalizedEmail, (proj[0]||{}).title || 'review', req.user.name || req.user.email));
+    return res.json({ ok: true, sent: true });
+  } else {
+    return res.json({ ok: false, error: 'Email server is not configured on this instance' });
+  }
 }));
 
 app.delete('/api/projects/:id/members/:userId', requireAuth(async (req, res) => {

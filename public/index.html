@@ -1262,7 +1262,7 @@ function renderSearchResults(){
     <span class="spacer"></span>
     <button class="btn" onclick="importSearchResults()">⇲ Import ${novel.length} new records</button></div>
     ${SEARCH_RESULTS.slice(0,40).map(r=>`<div class="study" style="padding:11px 14px">
-      <div class="st-title" style="font-size:13.5px">${esc(r.title)}</div>
+      <div class="st-title" style="font-size:13.5px">${highlightKw(r.title)}</div>
       <div class="st-meta"><span>${esc((r.authors||'').split(';')[0]||'—')}</span><span>${esc(r.year||'')}</span>
         <span>${esc(r.journal||'')}</span><span style="color:var(--flow)">${esc(r.source)}</span>
         ${r.doi?`<span style="color:var(--t3)">doi:${esc(r.doi)}</span>`:''}
@@ -1382,7 +1382,7 @@ function renderImport(){
     <div class="tile maybe"><div class="v">${ST.refs.filter(r=>!r.abstract).length}</div><div class="k">missing abstract</div></div>
   </div>
   ${fileListHTML}
-  <div class="row"><button class="btn flow" onclick="ASRMA.go('dedup')">De-duplicate →</button>
+  <div class="row"><button class="btn flow" onclick="ASRMA.go(\'dedup\')">De-duplicate →</button>
     <button class="btn danger gh sm" onclick="if(confirm('Remove all imported studies?')){ST.refs=[];ST.effects=[];save();renderImport();renderSpine()}">Clear all</button></div>`:''}`;
   wireDrop();
 }
@@ -1540,7 +1540,7 @@ window.unflag=unflag;
 
 
 /* ===================== SCREENING ENGINE ===================== */
-let SCREEN_FILTER='all', SCREEN_Q='';
+let SCREEN_FILTER='all', SCREEN_Q='', _incReg=null, _excReg=null;
 function ensureLiveSplit(){ if(!ST.liveSplit)ST.liveSplit={ta:{members:[],overlap:0,updatedAt:null,updatedBy:''}}; if(!ST.liveSplit.ta)ST.liveSplit.ta={members:[],overlap:0,updatedAt:null,updatedBy:''}; return ST.liveSplit; }
 function taAssignedIds(r){ return (r._assign&&Array.isArray(r._assign.ta))?r._assign.ta:[]; }
 function hasLiveAssignments(){ return ST.refs.some(r=>!r.dup&&taAssignedIds(r).length); }
@@ -1556,9 +1556,13 @@ function myAssignedRefs(){
 function myPendingAssignedCount(){
   return ST.refs.filter(r=>!r.dup&&isAssignedToMe(r)&&!myStageReview(r,'ta')).length;
 }
-function titleAbstractScopeRefs(){
+function filteredRefs(){
   let refs=ST.refs.filter(r=>!r.dup);
   if(BK.isServer&&BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())refs=refs.filter(r=>isAssignedToMe(r));
+  if(SCREEN_FILTER==='pending')refs=refs.filter(r=>!visibleStageDecision(r,'ta'));
+  else if(SCREEN_FILTER==='include'||SCREEN_FILTER==='exclude'||SCREEN_FILTER==='maybe')refs=refs.filter(r=>(visibleStageDecision(r,'ta')||{}).final===SCREEN_FILTER);
+  else if(SCREEN_FILTER==='conflict')refs=refs.filter(r=>r._conflict);
+  if(SCREEN_Q)refs=refs.filter(r=>((r.title||'').toLowerCase()+(r.abstract||'').toLowerCase()).includes(SCREEN_Q.toLowerCase()));
   return refs;
 }
 function toggleMyAssignmentsOnly(){
@@ -1884,18 +1888,23 @@ let _statsT=null,_spineT=null;
 function statsSoon(){if(_statsT)return;_statsT=setTimeout(()=>{_statsT=null;renderScreenStats();},180);}
 function spineSoon(){if(_spineT)return;_spineT=setTimeout(()=>{_spineT=null;renderSpine();},300);}
 window.statsSoon=statsSoon;window.spineSoon=spineSoon;
-function hl(text){const syn=ST.agent.synonyms||[];if(!syn.length||!text)return esc(text);
+function escRegex(s){return s.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');}
+function setHighlightWords(){
+  ST.settings.incWords=(document.getElementById('kw-inc')||{}).value;
+  ST.settings.excWords=(document.getElementById('kw-exc')||{}).value;
+  _incReg=ST.settings.incWords?new RegExp('('+ST.settings.incWords.split(',').map(w=>escRegex(w.trim())).join('|')+')','gi'):null;
+  _excReg=ST.settings.excWords?new RegExp('('+ST.settings.excWords.split(',').map(w=>escRegex(w.trim())).join('|')+')','gi'):null;
+  saveSoon();renderScreenList();
+}
+function highlightKw(text){
   let s=esc(text);
-  syn.slice(0,18).forEach(w=>{if(w.length<3)return;
-    const re=new RegExp('('+w.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')+')','gi');
-    s=s.replace(re,'<span class="hl">$1</span>');});
+  if(_incReg)s=s.replace(_incReg,'<mark style="background:#dcfce7;color:#166534">$1</mark>');
+  if(_excReg)s=s.replace(_excReg,'<mark style="background:#fee2e2;color:#991b1b">$1</mark>');
   return s;
 }
-const SCREEN_THRESHOLD=250; // auto-recommend local engine above this many unique papers
-function uniqueCount(){return ST.refs.filter(r=>!r.dup).length;}
-function recommendedMode(){return uniqueCount()>SCREEN_THRESHOLD?'local':'llm';}
-function currentMode(){return ST.settings.screenMode||recommendedMode();}
-function setMode(m){ST.settings.screenMode=m;save();renderScreen();}
+function onSearchInput(q){SCREEN_Q=q;renderScreenList();}
+function setScreenFilter(f){SCREEN_FILTER=f;renderScreen();}
+function tbConflicts(){return ST.refs.filter(r=>!r.dup&&r._conflict);}
 function renderScreen(){
   const n=uniqueCount();const mode=currentMode();const rec=recommendedMode();const splitOn=BK.isServer()&&hasLiveAssignments();
   const recTxt=rec==='llm'
@@ -1923,13 +1932,17 @@ function renderScreen(){
   <div class="toolbar"><button class="btn gh sm" onclick="resetTitleAbstractScreening()" title="Clear all title/abstract screening decisions">Reset title/abstract screening</button></div>
   ${mode==='llm'?renderLLMControls():renderLocalControls()}
   ${mode==='local'?`<div class="toolbar"><span class="muted" id="screen-time">Timer appears after Viveka Local scores or re-thresholds.</span></div>`:''}
+  <div class="toolbar" style="margin-bottom:14px; gap: 8px;">
+    <div class="search-box" style="flex:1"><input id="kw-inc" placeholder="Highlight green (e.g. RCT, adult)" value="${esc(ST.settings.incWords||'')}" onchange="setHighlightWords()"></div>
+    <div class="search-box" style="flex:1"><input id="kw-exc" placeholder="Highlight red (e.g. animal, review)" value="${esc(ST.settings.excWords||'')}" onchange="setHighlightWords()"></div>
+  </div>
   <div class="toolbar">
     <div class="seg" id="screen-seg">
       ${['all','pending','include','maybe','exclude'].map(f=>`<button class="${SCREEN_FILTER===f?'on':''}" onclick="setScreenFilter('${f}')">${f[0].toUpperCase()+f.slice(1)}</button>`).join('')}
       ${mode==='local'&&ST.engine?`<button class="${SCREEN_FILTER==='al'?'on':''}" onclick="setScreenFilter('al')" title="Most uncertain papers">Uncertain</button>`:''}
       ${tbConflicts().length?`<button class="${SCREEN_FILTER==='conflict'?'on':''}" onclick="setScreenFilter('conflict')" title="Reviewer disagreements" style="color:var(--exc)">⚠ Conflicts (${tbConflicts().length})</button>`:''}
     </div>
-    <div class="search-box"><input placeholder="Search titles…" value="${esc(SCREEN_Q)}" oninput="onSearchInput(this.value)"></div>
+    <div class="search-box"><input placeholder="Search title, abstract, text..." value="${esc(SCREEN_Q)}" oninput="onSearchInput(this.value)"></div>
   </div>
   <div id="screen-list"></div>`;
   renderScreenStats();renderScreenList();
@@ -2028,6 +2041,13 @@ function localTrainingLabels(){
     }
     const mine=myStageReview(r,'ta');
     if(mine&&['include','exclude'].includes(mine.final)){rows.push({r,label:mine.final});return;}
+    if(r.reviews && r.reviews.ta) {
+      const reviewers = Object.keys(r.reviews.ta);
+      if(reviewers.length > 0) {
+        const teamFinal = r.reviews.ta[reviewers[0]].final;
+        if(['include','exclude'].includes(teamFinal)){rows.push({r,label:teamFinal});return;}
+      }
+    }
     if(r.ta&&r.ta.by==='human'&&['include','exclude'].includes(r.ta.final))rows.push({r,label:r.ta.final});
   });
   return rows;
@@ -2319,7 +2339,7 @@ function filteredRefs(){
     return ta&&ta.final===SCREEN_FILTER;
   });
   if(BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())u=u.filter(r=>isAssignedToMe(r));
-  if(SCREEN_Q){const q=SCREEN_Q.toLowerCase();u=u.filter(r=>(r.title+' '+r.authors).toLowerCase().includes(q));}
+  if(SCREEN_Q){const q=SCREEN_Q.toLowerCase();u=u.filter(r=>(r.title+' '+r.authors+' '+(r.abstract||'')+' '+(r.ft&&r.ft.pdfText||'')).toLowerCase().includes(q));}
   if(currentMode()==='local'&&ST.engine)u=u.slice().sort((a,b)=>((b.ta&&b.ta.prob)||0)-((a.ta&&a.ta.prob)||0));
   return u;
 }
@@ -2338,49 +2358,48 @@ function moreCards(){SCREEN_PAGE++;renderScreenList();
 let _searchDeb=null;
 function onSearchInput(v){SCREEN_Q=v;clearTimeout(_searchDeb);_searchDeb=setTimeout(()=>{SCREEN_PAGE=1;renderScreenList();},220);}
 window.moreCards=moreCards;window.onSearchInput=onSearchInput;
-function studyCard(r){
-  const ta=visibleStageDecision(r,'ta');const dec=ta?ta.final:'';
-  let chip='';
-  if(ta){
-    if(ta.by==='agent')chip=`<span class="dchip ai" title="Screening reviewer">⊹ Viveka ${ta.conf}%</span>`;
-    else if(ta.by==='local')chip=`<span class="dchip ai" title="Viveka Local score">⚙ Viveka Local ${Math.round((ta.prob||0)*100)}%</span>`;
-    else chip='<span class="dchip ai">👤 you'+(ta.seeded?' · seed':'')+'</span>';
+
+function escRegex(str){ return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+function setHighlightWords(){
+  if(!ST.settings) ST.settings = {};
+  ST.settings.incWords = document.getElementById('kw-inc').value;
+  ST.settings.excWords = document.getElementById('kw-exc').value;
+  save();
+  renderScreenList();
+}
+window.setHighlightWords=setHighlightWords;
+function highlightKw(text){
+  if(!text) return '';
+  let res = esc(text);
+  if(ST.settings.incWords){
+    ST.settings.incWords.split(',').map(s=>s.trim()).filter(Boolean).forEach(w=>{
+      res = res.replace(new RegExp('('+escRegex(w)+')', 'gi'), '<mark style="background-color:#d1fae5;color:#065f46;font-weight:bold">$1</mark>');
+    });
   }
-  return`<div class="study ${dec}" data-id="${r.id}">
-    <div class="st-title">${hl(r.title)}</div>
-    <div class="st-meta"><span>${esc(r.authors?r.authors.split(';')[0]+(r.authors.includes(';')?' et al.':''):'—')}</span>
-      <span>${esc(r.year||'n.d.')}</span><span>${esc(r.journal||'')}</span>
-      ${r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi ↗</a>`:''}
-      <span style="color:var(--t3)">${esc(r.source)}</span>
-      ${taAssignedIds(r).length?`<span style="color:var(--flow)">assigned: ${esc(taAssignedIds(r).length>1?'double-screened':'single reviewer')}</span>`:''}</div>
-    ${r.abstract?`<div class="st-abs" onclick="this.classList.toggle('open')">${hl(r.abstract)}</div>`:'<div class="muted">No abstract — consider fetching it in Full text.</div>'}
-    <div class="st-foot">
-      ${ta?`<span class="dchip ${dec} ">${dec==='include'?'✓ Include':dec==='exclude'?'✗ Exclude':'? Maybe'}</span>
-        ${chip}
-        <div class="conf-bar"><i style="width:${ta.conf||0}%"></i></div>
-        <span class="muted" style="flex:1">${esc(ta.reason||'')}</span>`:'<span class="dchip pend">pending</span><span class="spacer"></span>'}
-      <button class="vbtn maybe ${dec==='maybe'?'act-maybe':''}" title="Maybe" onclick="ASRMA.setDecision('${r.id}','maybe',event)">?</button>
-      <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" title="Exclude" onclick="ASRMA.setDecision('${r.id}','exclude',event)">✗</button>
-      <button class="vbtn inc ${dec==='include'?'act-inc':''}" title="Include" onclick="ASRMA.setDecision('${r.id}','include',event)">✓</button>
-      ${currentMode()==='llm'?`<button class="vbtn" title="Re-ask Viveka (advanced model)" onclick="reAsk('${r.id}')">⊹</button>`:''}
-    </div></div>`;
+  if(ST.settings.excWords){
+    ST.settings.excWords.split(',').map(s=>s.trim()).filter(Boolean).forEach(w=>{
+      res = res.replace(new RegExp('('+escRegex(w)+')', 'gi'), '<mark style="background-color:#fee2e2;color:#991b1b;font-weight:bold">$1</mark>');
+    });
+  }
+  return res;
 }
 async function reAsk(id){agentBusy(true);try{await screenOne(id,true);saveSoon();patchCard(id);renderScreenStats();toast('Re-screened (advanced)','ok');}catch(e){toast(e.message,'err')}agentBusy(false);}
 window.setScreenFilter=setScreenFilter;window.reAsk=reAsk;window.setDecisionComment=setDecisionComment;
 function studyCard(r){
   const ta=visibleStageDecision(r,'ta');const dec=ta?ta.final:'';let chip='';
   if(ta){
-    if(ta.by==='agent')chip=`<span class="dchip ai" title="Screening reviewer">⊹ Viveka ${ta.conf}%</span>`;
-    else if(ta.by==='local')chip=`<span class="dchip ai" title="Viveka Local score">⚙ Viveka Local ${Math.round((ta.prob||0)*100)}%</span>`;
-    else chip='<span class="dchip ai">Reviewer'+(ta.seeded?' · seed':'')+'</span>';
+    if(ta.by==='agent')chip=`<span class="dchip ai" title="Screening reviewer">🤖 Viveka ${ta.conf}%</span>`;
+    else if(ta.by==='local')chip=`<span class="dchip ai" title="Viveka Local score">🤖 Viveka Local ${Math.round((ta.prob||0)*100)}%</span>`;
+    else chip='<span class="dchip ai">Reviewer'+(ta.seeded?' — seed':'')+'</span>';
   }
   return`<div class="study ${dec}" data-id="${r.id}">
-    <div class="st-title">${hl(r.title)}</div>
+    <div class="st-title">${highlightKw(r.title)}</div>
     <div class="st-meta"><span>${esc(r.authors?r.authors.split(';')[0]+(r.authors.includes(';')?' et al.':''):'—')}</span>
       <span>${esc(r.year||'n.d.')}</span><span>${esc(r.journal||'')}</span>
       ${r.doi?`<a href="https://doi.org/${esc(r.doi)}" target="_blank">doi ↗</a>`:''}
-      <span style="color:var(--t3)">${esc(r.source)}</span></div>
-    ${r.abstract?`<div class="st-abs" onclick="this.classList.toggle('open')">${hl(r.abstract)}</div>`:'<div class="muted">No abstract — consider fetching it in Full text.</div>'}
+      <span style="color:var(--t3)">${esc(r.source)}</span>
+      ${taAssignedIds(r).length?`<span style="color:var(--flow)">assigned: ${esc(taAssignedIds(r).length>1?'double-screened':'single reviewer')}</span>`:''}</div>
+    ${r.abstract?`<div class="st-abs" onclick="this.classList.toggle('open')">${highlightKw(r.abstract)}</div>`:'<div class="muted">No abstract - consider fetching it in Full text.</div>'}
     <div class="st-foot">
       ${ta?`<span class="dchip ${dec} ">${dec==='include'?'✓ Include':dec==='exclude'?'✗ Exclude':'? Maybe'}</span>
         ${chip}
@@ -2389,7 +2408,7 @@ function studyCard(r){
       <button class="vbtn maybe ${dec==='maybe'?'act-maybe':''}" title="Maybe" onclick="ASRMA.setDecision('${r.id}','maybe',event)">?</button>
       <button class="vbtn exc ${dec==='exclude'?'act-exc':''}" title="Exclude" onclick="ASRMA.setDecision('${r.id}','exclude',event)">✗</button>
       <button class="vbtn inc ${dec==='include'?'act-inc':''}" title="Include" onclick="ASRMA.setDecision('${r.id}','include',event)">✓</button>
-      ${currentMode()==='llm'?`<button class="vbtn" title="Re-ask Viveka (advanced model)" onclick="reAsk('${r.id}')">⊹</button>`:''}
+      ${currentMode()==='llm'?`<button class="vbtn" title="Re-ask Viveka (advanced model)" onclick="reAsk('${r.id}')">↻</button>`:''}
     </div>
     ${ta?`<div class="muted" style="margin-top:8px;font-size:11.5px">Reviewed by ${esc(reviewedMeta(ta))}</div>`:''}
     ${reviewSummaryHTML(r,'ta')}
@@ -4760,7 +4779,7 @@ async function serverTeamSplitModal(){
   const wf=ensureReviewWorkflow().ta;
   const irr=calcIRR('ta');
   const progress=reviewerProgress('ta');
-  const progressRows=progress.map(p=>'<tr><td><b>'+esc(p.name||'')+'</b><div class="muted">'+esc(p.email||'')+'</div></td><td>'+p.assigned+'</td><td>'+p.reviewed+'</td><td>'+p.pending+'</td><td>'+p.counts.include+'/'+p.counts.maybe+'/'+p.counts.exclude+'</td></tr>').join('');
+  const progressRows=progress.map(p=>'<tr><td><b>'+esc(p.name||'')+'</b><div class="muted">'+esc(p.email||'')+'</div></td><td>'+p.assigned+'</td><td>'+p.reviewed+'</td><td>'+p.pending+'</td><td>'+p.counts.include+'/'+p.counts.maybe+'/'+p.counts.exclude+'</td><td>'+(editable&&p.pending>0?'<button class="btn sm" onclick="remindReviewer(\''+esc(p.email)+'\')">Remind</button>':'')+'</td></tr>').join('');
   const conflictCount=uniq.filter(r=>r._conflict).length;
   modal('<div class="modal-h">👥 Team allocation<button class="x" onclick="closeModal()">×</button></div>'+
   '<div class="modal-b">'+
@@ -4786,13 +4805,23 @@ async function serverTeamSplitModal(){
       '<button class="btn gh sm" onclick="showConsensusModal(&quot;ta&quot;)">Open consensus & IRR</button>'+
     '</div>'+
     '<div class="row" style="margin-bottom:10px"><span class="pill '+(conflictCount?'x':'')+'">Conflicts: '+conflictCount+'</span><span class="pill s">Agreement: '+irr.agreePct+'%</span><span class="pill">Kappa: '+(irr.kappa==null?'-':irr.kappa)+'</span><span class="pill">Pairs: '+irr.pairs+'</span></div>'+
-    '<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>Reviewer</th><th>Assigned</th><th>Reviewed</th><th>Pending</th><th>I/M/E</th></tr></thead><tbody>'+(progressRows||'<tr><td colspan="5">No reviewer progress yet.</td></tr>')+'</tbody></table></div>'+
+    '<div style="overflow-x:auto"><table class="tbl"><thead><tr><th>Reviewer</th><th>Assigned</th><th>Reviewed</th><th>Pending</th><th>I/M/E</th><th>Action</th></tr></thead><tbody>'+(progressRows||'<tr><td colspan="6">No reviewer progress yet.</td></tr>')+'</tbody></table></div>'+
     '<div id="alloc-msg" style="margin-top:12px">'+renderServerAllocationSummary(active)+'</div>'+
   '</div>'+
   '<div class="modal-f">'+
     (editable?'<button class="btn gh" onclick="serverAutoBalance()">Auto-balance</button><button class="btn" onclick="applyServerSplit()">Apply live split</button>':'<span class="muted">Only owners and editors can change allocation.</span>')+
     '<button class="btn gh" onclick="closeModal()">Close</button></div>');
 }
+async function remindReviewer(email){
+  if(!confirm('Send reminder email to '+email+' to complete screening?'))return;
+  toast('Sending...');
+  try{
+    const r=await req('/api/projects/'+ST.id+'/remind',{method:'POST',body:JSON.stringify({email})});
+    if(r.ok)toast('Reminder sent','ok');
+    else toast(r.error||'Failed','err');
+  }catch(e){toast(e.message,'err');}
+}
+window.remindReviewer=remindReviewer;
 function renderServerAllocationSummary(active){
   const plan=ensureLiveSplit().ta;
   if(!(plan.members||[]).length)return '<div class="muted">No live percentage plan saved yet.</div>';
