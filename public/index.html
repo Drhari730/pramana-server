@@ -2369,30 +2369,7 @@ let _searchDeb=null;
 function onSearchInput(v){SCREEN_Q=v;clearTimeout(_searchDeb);_searchDeb=setTimeout(()=>{SCREEN_PAGE=1;renderScreenList();},220);}
 window.moreCards=moreCards;window.onSearchInput=onSearchInput;
 
-function escRegex(str){ return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-function setHighlightWords(){
-  if(!ST.settings) ST.settings = {};
-  ST.settings.incWords = document.getElementById('kw-inc').value;
-  ST.settings.excWords = document.getElementById('kw-exc').value;
-  save();
-  renderScreenList();
-}
-window.setHighlightWords=setHighlightWords;
-function highlightKw(text){
-  if(!text) return '';
-  let res = esc(text);
-  if(ST.settings.incWords){
-    ST.settings.incWords.split(',').map(s=>s.trim()).filter(Boolean).forEach(w=>{
-      res = res.replace(new RegExp('('+escRegex(w)+')', 'gi'), '<mark style="background-color:#d1fae5;color:#065f46;font-weight:bold">$1</mark>');
-    });
-  }
-  if(ST.settings.excWords){
-    ST.settings.excWords.split(',').map(s=>s.trim()).filter(Boolean).forEach(w=>{
-      res = res.replace(new RegExp('('+escRegex(w)+')', 'gi'), '<mark style="background-color:#fee2e2;color:#991b1b;font-weight:bold">$1</mark>');
-    });
-  }
-  return res;
-}
+
 async function reAsk(id){agentBusy(true);try{await screenOne(id,true);saveSoon();patchCard(id);renderScreenStats();toast('Re-screened (advanced)','ok');}catch(e){toast(e.message,'err')}agentBusy(false);}
 window.setScreenFilter=setScreenFilter;window.reAsk=reAsk;window.setDecisionComment=setDecisionComment;
 function studyCard(r){
