@@ -5606,27 +5606,62 @@ function startServerPolling(){
     try{
       const r=await BK.api('GET','/api/projects/'+ST.id, null, 8000);
       if(r.project && r.project.version!==BK.version){
-        const phase=(typeof CUR==='string'&&CUR)||((window.CUR&&window.CUR.id)||'screen');
-        const curId=ST.id;
-        const data=r.project.data||{};
-        Object.keys(ST).forEach(k=>delete ST[k]);
-        Object.assign(ST, blankState(), data, { id: curId||r.project.id });
-        window.ST=ST; BK.version=r.project.version; BK.role=r.role;
-        if(BK.role==='reviewer'&&hasLiveAssignments()) BK.myAssignmentsOnly=true;
-        updatePill();updateKeyBtn();updateAgentChip();renderTeam();
-        renderCurrentPhaseNoSave(phase);
-        setSyncState('saved');
+        autoResolveConflict();
       }
     }catch(e){}
   },15000);
 }
+function mergeProjectData(serverData) {
+  const myId = reviewerKey();
+  if (!myId || myId === 'local' || !ST.refs || !serverData.refs) return serverData;
+  ST.refs.forEach(localRef => {
+    const sRef = serverData.refs.find(x => x.id === localRef.id);
+    if (!sRef) return;
+    if (localRef.reviews) {
+      Object.keys(localRef.reviews).forEach(stage => {
+        if (localRef.reviews[stage] && localRef.reviews[stage][myId]) {
+          sRef.reviews = sRef.reviews || {};
+          sRef.reviews[stage] = sRef.reviews[stage] || {};
+          const localRev = localRef.reviews[stage][myId];
+          const serverRev = sRef.reviews[stage][myId];
+          if (!serverRev || new Date(localRev.reviewedAt).getTime() > new Date(serverRev.reviewedAt).getTime()) {
+            sRef.reviews[stage][myId] = localRev;
+          }
+        }
+      });
+    }
+  });
+  if (ST.audit && serverData.audit) {
+    const sIds = new Set(serverData.audit.map(a => a.id));
+    ST.audit.forEach(a => { if(!sIds.has(a.id)) serverData.audit.push(a); });
+  }
+  return serverData;
+}
+
+async function autoResolveConflict() {
+  if (window._resolvingConflict) return;
+  window._resolvingConflict = true;
+  try {
+    const r = await BK.api('GET', '/api/projects/' + ST.id);
+    if (!r.project) return;
+    const phase=(typeof CUR==='string'&&CUR)||((window.CUR&&window.CUR.id)||'screen');
+    const curId=ST.id;
+    const data=mergeProjectData(r.project.data||{});
+    Object.keys(ST).forEach(k=>delete ST[k]);
+    Object.assign(ST, blankState(), data, { id: curId||r.project.id });
+    window.ST=ST; BK.version=r.project.version; BK.role=r.role;
+    if(BK.role==='reviewer'&&hasLiveAssignments()) BK.myAssignmentsOnly=true;
+    updatePill();updateKeyBtn();updateAgentChip();renderTeam();
+    renderCurrentPhaseNoSave(phase);
+    const b=document.getElementById('conflict-bar'); if(b)b.remove();
+    setSyncState('saved');
+    serverSaveSoon();
+  } catch(e) {}
+  finally { window._resolvingConflict = false; }
+}
+
 function onSaveConflict(){
-  // someone else saved since we loaded — reload to get the latest, preserving the user's view
-  if(document.getElementById('conflict-bar')) return;
-  const bar=document.createElement('div'); bar.id='conflict-bar';
-  bar.className='conflict-soft';
-  bar.innerHTML='<span>Newer team changes are available.</span> <button class="btn sm" style="background:#fff;color:var(--ink)" onclick="reloadShared()">Reload latest</button>';
-  document.body.appendChild(bar);
+  autoResolveConflict();
 }
 async function reloadShared(){ const b=document.getElementById('conflict-bar'); if(b)b.remove();
   const cur=ST.id; if(cur) await serverOpenProject(cur); }
