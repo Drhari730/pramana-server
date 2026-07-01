@@ -1556,13 +1556,9 @@ function myAssignedRefs(){
 function myPendingAssignedCount(){
   return ST.refs.filter(r=>!r.dup&&isAssignedToMe(r)&&!myStageReview(r,'ta')).length;
 }
-function filteredRefs(){
+function titleAbstractScopeRefs(){
   let refs=ST.refs.filter(r=>!r.dup);
   if(BK.isServer&&BK.isServer()&&BK.myAssignmentsOnly&&hasLiveAssignments())refs=refs.filter(r=>isAssignedToMe(r));
-  if(SCREEN_FILTER==='pending')refs=refs.filter(r=>!visibleStageDecision(r,'ta'));
-  else if(SCREEN_FILTER==='include'||SCREEN_FILTER==='exclude'||SCREEN_FILTER==='maybe')refs=refs.filter(r=>(visibleStageDecision(r,'ta')||{}).final===SCREEN_FILTER);
-  else if(SCREEN_FILTER==='conflict')refs=refs.filter(r=>r._conflict);
-  if(SCREEN_Q)refs=refs.filter(r=>((r.title||'').toLowerCase()+(r.abstract||'').toLowerCase()).includes(SCREEN_Q.toLowerCase()));
   return refs;
 }
 function toggleMyAssignmentsOnly(){
