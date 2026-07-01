@@ -4805,9 +4805,8 @@ async function remindReviewer(email){
   if(!confirm('Send reminder email to '+email+' to complete screening?'))return;
   toast('Sending...');
   try{
-    const r=await req('/api/projects/'+ST.id+'/remind',{method:'POST',body:JSON.stringify({email})});
-    if(r.ok)toast('Reminder sent','ok');
-    else toast(r.error||'Failed','err');
+    await BK.api('POST', '/api/projects/'+ST.id+'/remind', {email});
+    toast('Reminder sent','ok');
   }catch(e){toast(e.message,'err');}
 }
 window.remindReviewer=remindReviewer;
