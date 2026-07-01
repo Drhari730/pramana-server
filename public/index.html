@@ -1905,6 +1905,7 @@ function highlightKw(text){
 function onSearchInput(q){SCREEN_Q=q;renderScreenList();}
 function setScreenFilter(f){SCREEN_FILTER=f;renderScreen();}
 function tbConflicts(){return ST.refs.filter(r=>!r.dup&&r._conflict);}
+const SCREEN_THRESHOLD=250; // auto-recommend local engine above this many unique papers
 function uniqueCount(){return ST.refs.filter(r=>!r.dup).length;}
 function recommendedMode(){return uniqueCount()>SCREEN_THRESHOLD?'local':'llm';}
 function currentMode(){return ST.settings.screenMode||recommendedMode();}
