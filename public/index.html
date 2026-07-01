@@ -2193,10 +2193,19 @@ async function vivekaSeed(){ // optional: one small LLM batch to seed labels
   const pend=titleAbstractScopeRefs().filter(r=>!r.ta||r.ta.by==='local').slice(0,40);
   if(!pend.length){toast('No unlabelled papers to seed from','err');return;}
   agentBusy(true);const bar=document.getElementById('seed-bar');let done=0;
-  for(const r of pend){try{const res=parseJSON(await LLM(buildScreenPrompt(r.title,r.abstract,'seed'),300));
-    const dec=normDecision(res.v);r.ta={a:dec,final:dec,conf:res.conf||60,reason:'seed label (Viveka): '+(res.reason||''),by:'human',seeded:true};
+  for(const old_r of pend){try{const res=parseJSON(await LLM(buildScreenPrompt(old_r.title,old_r.abstract,'seed'),300));
+    const dec=normDecision(res.v);
+    const reason='seed label (Viveka): '+(res.reason||'');
+    const r=refById(old_r.id);
+    if(r){
+      if(window.BK&&BK.isServer&&BK.isServer()){
+        setReviewerStageDecision(r,'ta',dec,reason,{seeded:true});
+      }else{
+        r.ta={a:dec,final:dec,conf:res.conf||60,reason:reason,by:'human',seeded:true,reviewer:currentReviewerName(),reviewedAt:new Date().toISOString()};
+      }
+    }
   }catch(e){}done++;if(bar)bar.style.width=Math.round(done/pend.length*100)+'%';if(done%5===0)renderScreenStats();}
-  agentBusy(false);save();renderScreen();toast('Viveka labelled '+done+' seed papers — now train the local engine','ok');
+  agentBusy(false);save();renderScreen();toast('Viveka labelled '+done+' seed papers - now train the local engine','ok');
 }
 function renderLocalControls(){
   const t=localTrainable();const eng=ST.engine;const thr=ST.settings.localThr!=null?ST.settings.localThr:0.35;
