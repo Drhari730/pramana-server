@@ -46,7 +46,7 @@ function aiServerEnabled() {
 }
 
 const app = express();
-app.use(express.json({ limit: '12mb' }));   // project data can be large
+app.use(express.json({ limit: '50mb' }));   // project data can be large
 app.use(cookieParser());
 const upload = multer({
   storage: multer.memoryStorage(),
