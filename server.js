@@ -1018,7 +1018,7 @@ app.post('/api/projects/:id/remind', requireAuth(async (req, res) => {
     queueEmail('Reminder email', normalizedEmail, () => sendReminderEmail(normalizedEmail, (proj[0]||{}).title || 'review', req.user.name || req.user.email));
     return res.json({ ok: true, sent: true });
   } else {
-    return res.json({ ok: false, error: 'Email server is not configured on this instance' });
+    return res.status(400).json({ ok: false, error: 'Email server is not configured on this instance' });
   }
 }));
 
