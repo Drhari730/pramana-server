@@ -222,6 +222,14 @@ async function run() {
   r = await lead('PUT','/api/projects/'+pid,{version, data:{refs:[]}});
   ok('stale save => 409 conflict', r.status===409 && r.body.currentVersion===version+1);
 
+  console.log('\n=== DECISION PATCH SAVE ===');
+  r = await lead('POST','/api/projects/'+pid+'/refs/patch',{patches:[{id:'r1',ta:{final:'exclude',by:'human',comment:'test patch'}}]});
+  ok('decision patch saves without full project upload', r.status===200 && r.body.patched===1);
+  r = await lead('GET','/api/projects/'+pid);
+  ok('patched title decision persists after reload', r.body.project.data.refs[0].ta.final==='exclude');
+  r = await lead('POST','/api/projects/'+pid+'/refs/patch',{patches:[{id:'r1',ta:{final:'include',by:'human',comment:'restored'}}]});
+  ok('decision patch can update an existing decision', r.status===200 && r.body.patched===1);
+
   console.log('\n=== SERVER JOBS ===');
   r = await lead('POST','/api/projects/'+pid+'/jobs',{type:'extract-all',refIds:[],fields:[]});
   ok('create server extraction job', r.status===200 && r.body.job && r.body.job.id);

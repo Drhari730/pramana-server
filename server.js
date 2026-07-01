@@ -46,7 +46,7 @@ function aiServerEnabled() {
 }
 
 const app = express();
-app.use(express.json({ limit: '50mb' }));   // project data can be large
+app.use(express.json({ limit: '50mb' }));   // project data can be large; screening uses small patch saves
 app.use(cookieParser());
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -573,6 +573,30 @@ async function saveProjectDataDirect(projectId, data, userId) {
   return newV;
 }
 
+function mergeDecisionPatch(ref, patch) {
+  if (!ref || !patch) return false;
+  let changed = false;
+  const copy = (key) => {
+    if (Object.prototype.hasOwnProperty.call(patch, key)) {
+      ref[key] = patch[key];
+      changed = true;
+    }
+  };
+  copy('ta');
+  if (Object.prototype.hasOwnProperty.call(patch, 'ft')) {
+    ref.ft = Object.assign({}, ref.ft || {}, patch.ft || {});
+    changed = true;
+  }
+  if (patch.reviews) {
+    ref.reviews = Object.assign({}, ref.reviews || {});
+    if (patch.reviews.ta) ref.reviews.ta = Object.assign({}, ref.reviews.ta || {}, patch.reviews.ta);
+    if (patch.reviews.ft) ref.reviews.ft = Object.assign({}, ref.reviews.ft || {}, patch.reviews.ft);
+    changed = true;
+  }
+  ['_conflict', '_ftConflict', '_assign', '_aiDiscrepancies'].forEach(copy);
+  return changed;
+}
+
 function getMailer() {
   if (mailer) return mailer;
   if (!smtpEmailConfigured()) return null;
@@ -935,6 +959,29 @@ app.put('/api/projects/:id', requireAuth(async (req, res) => {
   await db.q('UPDATE projects SET data=$1, version=$2, updated_at=now(), updated_by=$3, title=$4 WHERE id=$5',
     [JSON.stringify(data || {}), newV, req.user.id, (data && data.project && data.project.title) || 'Untitled review', req.params.id]);
   res.json({ version: newV, updated_at: new Date().toISOString() });
+}));
+
+app.post('/api/projects/:id/refs/patch', requireAuth(async (req, res) => {
+  const role = await memberRole(req.params.id, req.user.id);
+  if (!role) return res.status(403).json({ error: 'Not a member' });
+  const patches = Array.isArray(req.body && req.body.patches) ? req.body.patches : [];
+  if (!patches.length) return res.json({ ok: true, patched: 0 });
+  if (patches.length > 500) return res.status(413).json({ error: 'Too many decision patches at once' });
+  const project = await projectDataForMember(req.params.id, req.user.id);
+  if (!project) return res.status(404).json({ error: 'Project not found' });
+  const data = project.data || {};
+  data.refs = Array.isArray(data.refs) ? data.refs : [];
+  const byId = new Map(data.refs.map(r => [r && r.id, r]).filter(x => x[0]));
+  let patched = 0;
+  for (const patch of patches) {
+    if (!patch || !patch.id) continue;
+    const ref = byId.get(patch.id);
+    if (!ref) continue;
+    if (mergeDecisionPatch(ref, patch)) patched++;
+  }
+  if (!patched) return res.json({ ok: true, patched: 0, version: project.version });
+  const version = await saveProjectDataDirect(req.params.id, data, req.user.id);
+  res.json({ ok: true, patched, version });
 }));
 
 app.delete('/api/projects/:id', requireAuth(async (req, res) => {

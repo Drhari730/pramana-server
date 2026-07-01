@@ -1631,6 +1631,7 @@ function setStageFinalObj(r,stage,val){
       r.ft=Object.keys(keep).length?keep:null;
     }else r.ft=Object.assign({},r.ft||{},val);
   }else r.ta=val;
+  queueDecisionPatch(r);
 }
 function conflictFlag(stage){return stage==='ft'?'_ftConflict':'_conflict';}
 function visibleStageDecision(r,stage){
@@ -1653,6 +1654,7 @@ function setReviewerStageDecision(r,stage,dec,comment,prev){
   const store=stageStore(r,stage);
   store[info.id]={final:dec,by:'human',reviewerId:info.id,reviewer:info.name,email:info.email,comment:comment||'',reason:comment||'human decision',conf:100,reviewedAt:new Date().toISOString(),seeded:prev&&prev.seeded};
   computeStageConsensus(r,stage);
+  queueDecisionPatch(r);
   return store[info.id];
 }
 function computeStageConsensus(r,stage){
@@ -1683,6 +1685,7 @@ function resolveConsensus(stage,id,dec){
   const info=reviewerInfo();
   setStageFinalObj(r,stage,{final:dec,by:'arbitrator',conf:100,reason:'Consensus resolved by '+info.name,comment:'Consensus resolved by '+info.name,reviewer:info.name,reviewerId:info.id,reviewedAt:new Date().toISOString(),reviewedBy:stageReviews(r,stage).map(x=>x.reviewer||x.email||x.reviewerId).join(', ')});
   r[conflictFlag(stage)]=false;
+  queueDecisionPatch(r);
   saveNow();showConsensusModal(stage);
   if(stage==='ft'){renderFTStats();renderFulltextList();}else{renderScreenStats();renderScreenList();}
   renderSpine();
@@ -1701,6 +1704,7 @@ function setDecisionComment(stage,id,val){
   if(mine)mine.comment=val;
   else if(stage==='ft'){r.ft=r.ft||{};r.ft.comment=val;}
   else{r.ta=r.ta||{};r.ta.comment=val;}
+  queueDecisionPatch(r);
   saveSoon();
 }
 function ftEstimateMinutes(r){
@@ -1817,11 +1821,13 @@ async function screenOne(id,useAdv){
     syncAICredits(res);
     const dec=normDecision(res.decision||res.v);
     r.ta={a:dec,b:null,final:dec,conf:res.conf||50,reason:res.reason||'',comment:(r.ta&&r.ta.comment)||'',pico:res.pico||{},by:'agent',model:res.model||model,reviewer:'Viveka',reviewedAt:new Date().toISOString(),ms:Date.now()-started,server:true};
+    queueDecisionPatch(r);
     return r;
   }
   const res=parseJSON(await LLM(buildScreenPrompt(r.title,r.abstract,'screen'),320,model));
   const dec=normDecision(res.v);
   r.ta={a:dec,b:null,final:dec,conf:res.conf||50,reason:res.reason||'',comment:(r.ta&&r.ta.comment)||'',pico:res.pico||{},by:'agent',model,reviewer:'Viveka',reviewedAt:new Date().toISOString(),ms:Date.now()-started};
+  queueDecisionPatch(r);
   return r;
 }
 async function screenAll(resume){
@@ -2492,6 +2498,7 @@ async function ftScreen(id,mode){
       syncAICredits(res);
       r.ft=r.ft||{};r.ft.decision=normDecision(res.decision||res.v);
       r.ft.reason=res.reason||'';r.ft.exclCat=res.exclCat||'';r.ft.by='agent';r.ft.model=res.model||ST.agent.advModel;r.ft.reviewer='Viveka';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';r.ft.ms=Date.now()-started;r.ft.server=true;
+      queueDecisionPatch(r);
       if(!silent){save();renderFulltext();renderSpine();}
       agentBusy(false);
       return r;
@@ -2511,6 +2518,7 @@ Assess as a full-text eligibility reviewer. Use the full paper text when availab
 Return ONLY JSON: {"v":"include|exclude|maybe","reason":"<specific full-text eligibility rationale>","excl_cat":"<if exclude: wrong population|wrong intervention|wrong comparator|wrong outcome|wrong design|no usable data|other>"}`,450,ST.agent.advModel));
     r.ft=r.ft||{};r.ft.decision=normDecision(res.v);
     r.ft.reason=res.reason;r.ft.exclCat=res.excl_cat||'';r.ft.by='agent';r.ft.model=ST.agent.advModel;r.ft.reviewer='Viveka';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';r.ft.ms=Date.now()-started;
+    queueDecisionPatch(r);
     if(!silent){save();renderFulltext();renderSpine();}
   }catch(e){toast(e.message,'err')}
   agentBusy(false);
@@ -2528,6 +2536,7 @@ async function ftScreenLocal(id,silent){
   r.ft=r.ft||{};
   r.ft.decision=dec;r.ft.reason='Viveka Local full-text score '+(p*100).toFixed(0)+'% at '+Math.round(thr*100)+'% threshold'+(dec==='maybe'?' (borderline - human review)':'');
   r.ft.exclCat=dec==='exclude'?'other':'';r.ft.by='local';r.ft.reviewer='Viveka Local';r.ft.reviewedAt=new Date().toISOString();r.ft.comment=r.ft.comment||'';r.ft.prob=p;r.ft.ms=Date.now()-started;
+  queueDecisionPatch(r);
   if(!silent)save();return r;
 }
 async function screenAllFullText(mode,resume){
@@ -2566,12 +2575,13 @@ function ftDecide(id,dec,cat){const r=ST.refs.find(x=>x.id===id);if(!r)return;
     setReviewerStageDecision(r,'ft',dec,comment,prev);
     r.ft=r.ft||{};
     if(cat!==undefined)r.ft.exclCat=cat;
+    queueDecisionPatch(r);
   }else{
     r.ft=r.ft||{};r.ft.decision=dec;r.ft.final=dec;r.ft.by='human';r.ft.reviewer=currentReviewerName();r.ft.reviewedAt=new Date().toISOString();r.ft.comment=comment||r.ft.comment||'';if(cat!==undefined)r.ft.exclCat=cat;
     if(r._ftConflict)r._ftConflict=false;
   }
   if(learned&&prev.by==='local')scheduleLocalRetrain();
-  save();renderFulltextList();renderFTStats();renderSpine();}
+  saveSoon();renderFulltextList();renderFTStats();renderSpine();}
 function renderFulltext(){
   if(typeof FT_PAGE!=='undefined')FT_PAGE=1;
   document.getElementById('pane-fulltext').innerHTML=`
@@ -5567,6 +5577,13 @@ async function serverOpenProject(id){
   Object.keys(ST).forEach(k=>delete ST[k]);
   Object.assign(ST, blankState(), data, { id });   // ensure required keys exist
   window.ST=ST; BK.version=r.project.version; BK.role=r.role;
+  loadServerPatchQueue();
+  if(hasPendingServerPatches()){
+    applyQueuedPatchesToCurrentProject();
+    setSyncState('error');
+    serverPatchSoon();
+    toast('Recovered pending reviewer decisions and retrying save','ok');
+  }
   BK.myAssignmentsOnly = BK.role==='reviewer' && hasLiveAssignments();
   updatePill();updateKeyBtn();updateAgentChip();renderTeam();
   startServerPolling();
@@ -5587,12 +5604,110 @@ async function serverDeleteProject(id){
 // strip transient/in-memory bits before sending to server
 function strip(st){ const o=Object.assign({},st); return o; }
 
+function serverPatchKey(){
+  const user=(BK&&BK.user&&(BK.user.id||BK.user.email))||'user';
+  return 'pramana_patch_queue_'+user+'_'+(ST&&ST.id?ST.id:'no_project');
+}
+function compactDecisionPatch(r){
+  if(!r||!r.id)return null;
+  const patch={id:r.id};
+  if(r.ta)patch.ta=r.ta;
+  if(r.ft){
+    patch.ft=Object.assign({},r.ft);
+    delete patch.ft.pdfText;
+  }
+  if(r.reviews)patch.reviews=r.reviews;
+  if(r._conflict!=null)patch._conflict=r._conflict;
+  if(r._ftConflict!=null)patch._ftConflict=r._ftConflict;
+  if(r._assign)patch._assign=r._assign;
+  if(r._aiDiscrepancies)patch._aiDiscrepancies=r._aiDiscrepancies;
+  return patch;
+}
+let _srvPatchQueue=new Map();
+let _srvPatchTimer=null,_srvPatchSaving=false,_srvPatchRetry=null,_srvPatchBackoff=2000;
+function loadServerPatchQueue(){
+  _srvPatchQueue=new Map();
+  if(!window.BK||!BK.isServer||!BK.isServer()||!ST.id)return;
+  try{
+    const rows=JSON.parse(localStorage.getItem(serverPatchKey())||'[]');
+    (rows||[]).forEach(p=>{if(p&&p.id)_srvPatchQueue.set(p.id,p);});
+  }catch(e){}
+}
+function persistServerPatchQueue(){
+  if(!window.BK||!BK.isServer||!BK.isServer()||!ST.id)return;
+  try{localStorage.setItem(serverPatchKey(),JSON.stringify([..._srvPatchQueue.values()]));}catch(e){}
+}
+function clearServerPatchQueue(){
+  if(!ST.id)return;
+  _srvPatchQueue.clear();
+  try{localStorage.removeItem(serverPatchKey());}catch(e){}
+}
+function hasPendingServerPatches(){return _srvPatchQueue&&_srvPatchQueue.size>0;}
+function applyDecisionPatchLocal(patch){
+  const r=patch&&patch.id?refById(patch.id):null;
+  if(!r)return;
+  if(Object.prototype.hasOwnProperty.call(patch,'ta'))r.ta=patch.ta;
+  if(Object.prototype.hasOwnProperty.call(patch,'ft'))r.ft=Object.assign({},r.ft||{},patch.ft||{});
+  if(patch.reviews){
+    r.reviews=Object.assign({},r.reviews||{});
+    if(patch.reviews.ta)r.reviews.ta=Object.assign({},r.reviews.ta||{},patch.reviews.ta);
+    if(patch.reviews.ft)r.reviews.ft=Object.assign({},r.reviews.ft||{},patch.reviews.ft);
+  }
+  ['_conflict','_ftConflict','_assign','_aiDiscrepancies'].forEach(k=>{if(Object.prototype.hasOwnProperty.call(patch,k))r[k]=patch[k];});
+}
+function applyQueuedPatchesToCurrentProject(){
+  if(!hasPendingServerPatches())return;
+  [..._srvPatchQueue.values()].forEach(applyDecisionPatchLocal);
+}
+function queueDecisionPatch(r){
+  if(!window.BK||!BK.isServer||!BK.isServer()||!ST.id||!r)return;
+  const patch=compactDecisionPatch(r);
+  if(!patch)return;
+  _srvPatchQueue.set(patch.id,patch);
+  persistServerPatchQueue();
+  setSyncState('saving');
+  serverPatchSoon();
+}
+function serverPatchSoon(){
+  if(_srvPatchTimer)return;
+  _srvPatchTimer=setTimeout(()=>{_srvPatchTimer=null;serverFlushPatchesNow();},700);
+}
+function serverSchedulePatchRetry(){
+  if(_srvPatchRetry)return;
+  _srvPatchRetry=setTimeout(()=>{_srvPatchRetry=null;serverFlushPatchesNow();},_srvPatchBackoff);
+  _srvPatchBackoff=Math.min(30000,Math.round(_srvPatchBackoff*1.7));
+}
+async function serverFlushPatchesNow(){
+  if(!ST.id||!hasPendingServerPatches())return;
+  if(_srvPatchSaving){return;}
+  if(_srvPatchTimer){clearTimeout(_srvPatchTimer);_srvPatchTimer=null;}
+  _srvPatchSaving=true;
+  const patches=[..._srvPatchQueue.values()];
+  try{
+    const r=await BK.api('POST','/api/projects/'+ST.id+'/refs/patch',{patches},20000);
+    if(r.version)BK.version=r.version;
+    patches.forEach(p=>{if(_srvPatchQueue.get(p.id)===p)_srvPatchQueue.delete(p.id);});
+    persistServerPatchQueue();
+    _srvPatchBackoff=2000;
+    setSyncState(hasPendingServerPatches()?'saving':'saved');
+  }catch(e){
+    setSyncState('error');
+    serverSchedulePatchRetry();
+  }finally{
+    _srvPatchSaving=false;
+    if(hasPendingServerPatches()&&!_srvPatchRetry)serverPatchSoon();
+  }
+}
+window.addEventListener('beforeunload',persistServerPatchQueue);
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='hidden')persistServerPatchQueue();});
+
 /* server save with optimistic concurrency + debounce */
 let _srvTimer=null, _srvSaving=false, _srvDirty=false;
 let _srvPoll=null;
-function serverSaveSoon(){ if(_srvTimer)return; _srvTimer=setTimeout(()=>{_srvTimer=null;serverSaveNow();},1400); }
+function serverSaveSoon(){ if(hasPendingServerPatches()){serverPatchSoon();return;} if(_srvTimer)return; _srvTimer=setTimeout(()=>{_srvTimer=null;serverSaveNow();},1400); }
 async function serverSaveNow(){
   if(!ST.id){ return; }
+  if(hasPendingServerPatches()){ await serverFlushPatchesNow(); return; }
   if(_srvSaving){ _srvDirty=true; return; }
   _srvSaving=true;
   try{
@@ -5610,7 +5725,7 @@ function startServerPolling(){
   if(_srvPoll) clearInterval(_srvPoll);
   if(!BK.isServer()||!ST.id) return;
   _srvPoll=setInterval(async ()=>{
-    if(!ST.id||_srvSaving||_srvTimer) return;
+    if(!ST.id||_srvSaving||_srvTimer||_srvPatchSaving||_srvPatchTimer||hasPendingServerPatches()) return;
     if(typeof BATCH_CTRL!=='undefined'&&Object.values(BATCH_CTRL).some(x=>x&&x.running)) return;
     try{
       const r=await BK.api('GET','/api/projects/'+ST.id, null, 8000);
