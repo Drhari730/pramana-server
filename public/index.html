@@ -2919,26 +2919,6 @@ const DEFAULT_FIELDS=[
   {k:'effect',label:'Effect estimate (with 95% CI)'}
 ];
 function getFields(){return ST.project.extractFields||DEFAULT_FIELDS;}
-
-async function autoGenerateFields(){
-  if(!(window.BK&&BK.isServer&&BK.isServer()&&ST.id)) return toast('Only available in server mode.','err');
-  toast('Generating appropriate extraction fields from PICO...','info');
-  try {
-    const model = serverModelFor(ST.agent.advModel || ST.agent.model);
-    const res = await BK.api('POST','/api/projects/'+ST.id+'/ai/generate-fields',{ model }, 30000);
-    if(res.aiCredits != null) syncAICredits(res);
-    if(res.fields && Array.isArray(res.fields) && res.fields.length){
-      ST.project.extractFields = res.fields;
-      saveNow();
-      renderExtract();
-      toast('Generated ' + res.fields.length + ' tailored extraction fields!','ok');
-    } else {
-      toast('Could not generate fields.','err');
-    }
-  } catch(e) {
-    toast(e.message || 'Failed to generate fields', 'err');
-  }
-}
 let EXTRACT_JOB_ID=null;
 async function refreshServerProjectPhase(phase){
   if(!(window.BK&&BK.isServer&&BK.isServer()&&ST.id))return;
@@ -3071,36 +3051,15 @@ function heuristicExtractAll(){
           if (m) { matchVal = m[0]; matchQuote = s; break; }
         }
       } else {
-        // Generic intelligent fallback for dynamic PICO fields
-        const kws = fl.split(/[\s,-]+/).filter(w => w.length > 3);
+        const kws = fl.split(' ').filter(w => w.length > 3);
         if(kws.length === 0) kws.push(fl);
-        
-        let bestScore = -1, bestSentence = null;
         for (const s of sentences) {
           const sl = s.toLowerCase();
-          let score = 0;
-          kws.forEach(kw => { if (sl.includes(kw)) score += 2; });
-          
-          if (score > 0) {
-            // Bonus points for numbers, measurements, or statistical markers if the field suggests a result
-            if (fl.includes('outcome') || fl.includes('effect') || fl.includes('result')) {
-              if (/\d/.test(s)) score += 1;
-              if (sl.includes('p=') || sl.includes('p<') || sl.includes('%') || sl.includes('ci') || sl.includes('sd')) score += 1;
-            } else if (fl.includes('intervention') || fl.includes('drug') || fl.includes('dose')) {
-              if (sl.includes('mg') || sl.includes('ml') || sl.includes('group') || sl.includes('received')) score += 1;
-            }
-            // Penalty for extremely long generic sentences
-            if (s.length > 300) score -= 1;
-            
-            if (score > bestScore) {
-              bestScore = score;
-              bestSentence = s;
-            }
+          const hasKeyword = kws.some(kw => sl.includes(kw));
+          const hasNumber = /\d/.test(s);
+          if (hasKeyword && hasNumber && (sl.includes('p=') || sl.includes('p<') || sl.includes('%') || sl.includes('ci') || sl.includes('sd') || sl.includes('or='))) {
+            matchVal = ''; matchQuote = s; break;
           }
-        }
-        if (bestSentence && bestScore >= 2) {
-          matchVal = ''; // We don't auto-fill a rigid value, we just suggest the quote
-          matchQuote = bestSentence;
         }
       }
       if (matchVal) { r.extract[f.k] = matchVal; r.extractEvidence[f.k] = { quote: matchQuote, confidence: 80 }; }
@@ -3155,7 +3114,6 @@ function renderExtract(){
     <button class="btn gh sm" id="ext-stop-btn" onclick="cancelExtractJob()" disabled>Stop server job</button>
     <span class="muted" id="ext-job-status" style="font-size:12px">Server jobs keep running outside the browser tab.</span>
     <button class="btn gh sm" onclick="addField()">+ Add field</button>
-    <button class="btn gh sm" onclick="autoGenerateFields()">✨ Auto-generate fields from Protocol</button>
     <button class="btn gh sm" style="color:var(--exc)" onclick="resetExtraction()" title="Clear all extracted data and start fresh">↺ Reset extraction</button>
     <span class="spacer"></span>
     <button class="btn gh sm" onclick="exportExtractCSV()">⬇ Export CSV</button>
