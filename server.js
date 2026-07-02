@@ -1144,7 +1144,7 @@ ${contextStr}`;
     const raw = await serverLLM(prompt, 600, selectedModel);
     let fields = [];
     try {
-      const clean = raw.replace(/^[`s]+(?:json)?/, '').replace(/[`s]+$/, '').trim();
+      const clean = raw.replace(/^[\\`\\s]+(?:json)?/i, '').replace(/[\\`\\s]+$/i, '').trim();
       fields = JSON.parse(clean);
       if (!Array.isArray(fields)) throw new Error('Not an array');
       fields = fields.map(f => ({ k: f.k || `f_${Math.random().toString(36).slice(2, 7)}`, label: f.label || 'Unnamed Field' }));
