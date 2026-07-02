@@ -1105,6 +1105,63 @@ app.post('/api/ai/generate', requireAuth(async (req, res) => {
   }
 }));
 
+app.post('/api/projects/:id/ai/generate-fields', requireAuth(async (req, res) => {
+  const { model } = req.body || {};
+  const project = await projectDataForMember(req.params.id, req.user.id);
+  if (!project) return res.status(403).json({ error: 'Not a member' });
+  
+  const p = project.data && project.data.project ? project.data.project : {};
+  let contextStr = `Title: ${p.title || ''}
+Question: ${p.question || ''}
+Population: ${p.p || ''}
+Intervention: ${p.i || ''}
+Comparator: ${p.c || ''}
+Outcomes: ${p.o || ''}
+Inclusion: ${p.inc || ''}
+Exclusion: ${p.exc || ''}`;
+
+  const prompt = `You are an expert systematically reviewing evidence. Based on the following systematic review PICO and protocol, generate a set of essential data extraction variables (fields) that should be extracted from the included full-text studies.
+Return ONLY a valid JSON array of objects. Each object must have:
+- 'k': a short, unique lowercase string key (e.g. 'population_age', 'primary_outcome')
+- 'label': a human-readable label for the UI (e.g. 'Mean Age', 'Primary Outcome Measure')
+
+Provide between 5 and 15 fields.
+Do not include markdown blocks, just the JSON array.
+
+PROTOCOL:
+${contextStr}`;
+
+  const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0];
+  const rl = rateLimit('ai-gen-fields:' + req.user.id + ':' + ip, 20, 60 * 60 * 1000);
+  if (!rl.ok) return res.status(429).json({ error: `AI limit reached. Try again later.` });
+
+  try {
+    const selectedModel = model || 'gemini-flash';
+    const creditCost = 2;
+    const balance = await aiBalance(req.user.id);
+    if (balance < creditCost) return res.status(402).json({ error: `Not enough Viveka AI credits.`, aiCredits: balance });
+
+    const raw = await serverLLM(prompt, 600, selectedModel);
+    let fields = [];
+    try {
+      const clean = raw.replace(/^[`s]+(?:json)?/, '').replace(/[`s]+$/, '').trim();
+      fields = JSON.parse(clean);
+      if (!Array.isArray(fields)) throw new Error('Not an array');
+      fields = fields.map(f => ({ k: f.k || `f_${Math.random().toString(36).slice(2, 7)}`, label: f.label || 'Unnamed Field' }));
+    } catch (err) {
+      console.error('Failed to parse fields JSON:', raw);
+      return res.status(500).json({ error: 'Failed to generate fields properly. Try again.' });
+    }
+
+    const aiCredits = await chargeAICredits(req.user.id, creditCost, 'generate-fields', selectedModel, req.params.id);
+    res.json({ ok: true, fields, aiCredits, creditsUsed: creditCost });
+  } catch (e) {
+    const msg = e && e.message ? e.message : 'AI server failed';
+    const status = e.status || (/not configured/i.test(msg) ? 503 : 502);
+    res.status(status).json({ error: msg, aiCredits: e.balance });
+  }
+}));
+
 app.post('/api/projects/:id/ai/screen', requireAuth(async (req, res) => {
   const { refId, stage } = req.body || {};
   const normalizedStage = stage === 'fulltext' ? 'fulltext' : 'ta';
